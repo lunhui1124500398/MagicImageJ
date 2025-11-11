@@ -1,0 +1,15 @@
+# 虚拟环境
+.venv/
+venv/
+*.venv
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# VS Code 本地设置
+.vscode/
+
+# 临时文件
+*.log
+*.tmp
