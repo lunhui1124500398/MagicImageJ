@@ -381,7 +381,7 @@ class ExportWidget(QWidget):
             self.export_btn.setEnabled(True)
             
             # If not in archive mode, save settings
-            archive_path = self.viewer.metadata.get('archive_path')
+            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
             if not (archive_path and str(Path(archive_path)) in path):
                 self.settings.setValue("last_output", path)
                 p = Path(path)

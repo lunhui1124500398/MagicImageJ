@@ -12,9 +12,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 def export_to_video(image_stack: np.ndarray,
                    output_path: str,
-                   fps: int = 30,
+                   fps: int = 60,
                    codec: str = 'mp4v',
-                   quality: int = 95,
+                   quality: int = 100,
                    scale_bar_config: Optional[dict] = None,
                    timestamp_config: Optional[dict] = None,
                    ) -> bool:

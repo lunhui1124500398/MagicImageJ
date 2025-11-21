@@ -336,8 +336,8 @@ class ImportWidget(QWidget):
         h3.addWidget(QLabel("Gaus σ:")); h3.addWidget(self.sigma_spin)
         l_exp.addLayout(h3)
 
-        # Buffer Info
-        l_exp.addWidget(QLabel("Buffer Info (Saved to txt):"))
+        # Additional Info
+        l_exp.addWidget(QLabel("Additional Info (Saved to txt):"))
         self.buffer_edit = QTextEdit()
         self.buffer_edit.setPlaceholderText("e.g. 50mM Tris, pH 7.5...")
         self.buffer_edit.setMaximumHeight(45) # Reduce height slightly
