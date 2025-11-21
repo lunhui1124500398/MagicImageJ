@@ -5,7 +5,7 @@
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QSpinBox, QHBoxLayout, QComboBox,
                             QCheckBox, QSlider, QGroupBox, QDoubleSpinBox,
-                            QMessageBox, QProgressBar)
+                            QMessageBox, QProgressBar, QScrollArea)
 from qtpy.QtCore import Qt, Signal, QThread
 import numpy as np
 import matplotlib.pyplot as plt
@@ -55,6 +55,18 @@ class EnhanceWidget(QWidget):
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
     
     def _setup_ui(self):
+        # 1. 创建最外层布局 (用于放滚动条)
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 2. 创建滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True) # 关键：让内容自适应宽度
+        # 去掉滚动区域的边框，使其看起来像原生界面
+        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+
+        # 3. 创建内容容器 (原本的控件都加到这里面)
+        content_widget = QWidget()
         layout = QVBoxLayout()
         
         # 标题
@@ -222,8 +234,11 @@ class EnhanceWidget(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         
-        layout.addStretch()
-        self.setLayout(layout)
+        layout.addStretch() # 建议在最后加一个弹簧，防止内容分散
+        content_widget.setLayout(layout)
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll)
+        self.setLayout(main_layout)
         
         # 初始化
         self._refresh_layers()

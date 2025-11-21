@@ -5,7 +5,7 @@
 2. 裁剪：画框后自动切换工具，应用后只显示结果图层，隐藏所有干扰项。
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
-                            QLabel, QHBoxLayout, QComboBox, QGroupBox, QDoubleSpinBox)
+                            QLabel, QHBoxLayout, QComboBox, QGroupBox, QDoubleSpinBox,QScrollArea)
 import numpy as np
 # 假设 core.geometry 已经存在于项目中
 from core.geometry import (calculate_rotation_angle, rotate_image_stack, 
@@ -21,6 +21,18 @@ class GeometryWidget(QWidget):
         self._setup_ui()
     
     def _setup_ui(self):
+        # 1. 创建最外层布局 (用于放滚动条)
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 2. 创建滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True) # 关键：让内容自适应宽度
+        # 去掉滚动区域的边框，使其看起来像原生界面
+        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+
+        # 3. 创建内容容器 (原本的控件都加到这里面)
+        content_widget = QWidget()
         layout = QVBoxLayout()
         
         title = QLabel("<h3>📐 Geometry Tools</h3>")
@@ -87,8 +99,11 @@ class GeometryWidget(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         
-        layout.addStretch()
-        self.setLayout(layout)
+        layout.addStretch() # 建议在最后加一个弹簧，防止内容分散
+        content_widget.setLayout(layout)
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll)
+        self.setLayout(main_layout)
         self._refresh_layers()
         
     def _refresh_layers(self):

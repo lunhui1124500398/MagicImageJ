@@ -16,7 +16,7 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
                             QLabel, QSpinBox, QHBoxLayout, QComboBox,
                             QCheckBox, QGroupBox, QDoubleSpinBox, QLineEdit,
                             QColorDialog, QTabWidget, QMessageBox, QSlider, QGridLayout,
-                            QProgressDialog, QApplication)
+                            QProgressDialog, QApplication,QScrollArea)
 from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QColor
 import numpy as np
@@ -57,6 +57,19 @@ class AnnotationWidget(QWidget):
                 self.layer_combo.setCurrentIndex(idx)
 
     def _setup_ui(self):
+        # === 布局重构：使用 QScrollArea 包裹内容 ===
+        # 外层主布局
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 创建滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True) # 让内容自适应宽度
+        # 移除滚动区域的边框，使其无缝融入
+        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+
+        # 内部容器 (承载原来的所有控件)
+        content_widget = QWidget()
         layout = QVBoxLayout()
         
         title = QLabel("<h3>📏 ImageJ-Style Annotation (Lazy & Smart)</h3>")
@@ -103,8 +116,11 @@ class AnnotationWidget(QWidget):
         self.status_label.setStyleSheet("color: gray; font-style: italic;")
         layout.addWidget(self.status_label)
         
-        layout.addStretch()
-        self.setLayout(layout)
+        layout.addStretch() # 建议在最后加一个弹簧，防止内容分散
+        content_widget.setLayout(layout)
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll)
+        self.setLayout(main_layout)
         self._refresh_layers()
 
     def _create_scale_bar_tab(self):
