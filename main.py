@@ -1,10 +1,11 @@
 """
 TEM Data Processing Workflow - Napari GUI
 统一的TEM数据处理平台
+[Fix] 增加了 resize 初始化，防止界面在启动时过大。
 """
 import napari
 from qtpy.QtWidgets import QTabWidget, QDockWidget
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import Qt, QTimer, QSettings
 from widgets.import_widget import ImportWidget
 from widgets.drift_widget import DriftCorrectionWidget
 from widgets.geometry_widget import GeometryWidget
@@ -15,6 +16,10 @@ from widgets.export_widget import ExportWidget
 class TEMWorkflow:
     def __init__(self):
         self.viewer = napari.Viewer(title="TEM Data Processing Workflow")
+        QSettings("NapariUser", "Global").remove("archive_path")
+        # === Fix: Set a reasonable default size to prevent layout overflow ===
+        self.viewer.window.resize(1200, 800)
+        
         self._setup_widgets()
         # 使用 QTimer.singleShot 确保在 Napari 界面完全加载后执行初始化隐藏
         QTimer.singleShot(100, self._setup_hotkeys_and_init_view)
@@ -22,7 +27,6 @@ class TEMWorkflow:
     def _setup_widgets(self):
         """设置所有控制面板"""
         self.tab_widget = QTabWidget()
-        
         # === 界面美化：全局样式表 (增加留白与现代感) ===
         self.tab_widget.setStyleSheet("""
             QWidget {
@@ -82,31 +86,31 @@ class TEMWorkflow:
                 min-height: 12px;
             }
         """)
-        
+
         # 1. 数据导入
         self.import_widget = ImportWidget(self.viewer)
         self.tab_widget.addTab(self.import_widget, "📂 Import")
-        
+
         # 2. 漂移矫正
         self.drift_widget = DriftCorrectionWidget(self.viewer)
         self.tab_widget.addTab(self.drift_widget, "🔧 Drift Correction")
-        
+
         # 3. 几何变换
         self.geometry_widget = GeometryWidget(self.viewer)
         self.tab_widget.addTab(self.geometry_widget, "📐 Geometry")
-        
+
         # 4. 图像增强
         self.enhance_widget = EnhanceWidget(self.viewer)
         self.tab_widget.addTab(self.enhance_widget, "✨ Enhancement")
-        
+
         # 5. 标注工具
         self.annotation_widget = AnnotationWidget(self.viewer)
         self.tab_widget.addTab(self.annotation_widget, "📝 Annotation")
-        
+
         # 6. 导出
         self.export_widget = ExportWidget(self.viewer)
         self.tab_widget.addTab(self.export_widget, "💾 Export")
-        
+
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         self.viewer.window.add_dock_widget(
@@ -117,7 +121,6 @@ class TEMWorkflow:
 
     def _setup_hotkeys_and_init_view(self):
         """设置快捷键并初始化视图状态 (隐藏不必要的面板)"""
-        
         # 定义需要管理的面板标题关键词
         left_target = ['layer list', 'layer controls']
         bottom_target = ['console'] 
@@ -148,7 +151,6 @@ class TEMWorkflow:
                 should_hide = any(dock.isVisible() for dock in left_docks)
                 for dock in left_docks:
                     dock.setVisible(not should_hide)
-                
                 status = "Hidden" if should_hide else "Shown"
                 viewer.status = f"{status} layer controls"
 
@@ -161,11 +163,9 @@ class TEMWorkflow:
                     dock.hide()
 
         # === 初始化执行：隐藏不需要的面板 ===
-        
         # 1. 隐藏左侧 (Layer List & Controls)
         for dock in get_docks(left_target):
             dock.hide()
-            
         # 2. 隐藏底部 (Console)
         for dock in get_docks(bottom_target):
             dock.hide()
