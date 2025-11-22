@@ -15,7 +15,7 @@ from widgets.export_widget import ExportWidget
 
 class TEMWorkflow:
     def __init__(self):
-        self.viewer = napari.Viewer(title="TEM Data Processing Workflow")
+        self.viewer = napari.Viewer(title="TEM Data Processing Workflow-YSImageJ")
         QSettings("NapariUser", "Global").remove("archive_path")
         # === Fix: Set a reasonable default size to prevent layout overflow ===
         self.viewer.window.resize(1200, 800)

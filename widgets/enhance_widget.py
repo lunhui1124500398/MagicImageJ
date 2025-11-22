@@ -1,11 +1,10 @@
 """
-图像增强控件 - 增强版
-包含：高斯模糊、滚动平均（自动裁切边缘）、仿ImageJ对比度调节（直方图+曲线）
-[Update] 归档集成：自动记录增强参数和对比度参数到 processing_log.json。
+图像增强控件 - 完整版
+包含：高斯模糊、滚动平均（带进度条）、仿ImageJ对比度调节（直方图+曲线）
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QSpinBox, QHBoxLayout, QComboBox,
-                            QCheckBox, QSlider, QGroupBox, QDoubleSpinBox,
+                            QCheckBox, QGroupBox, QDoubleSpinBox, QSlider,
                             QMessageBox, QProgressBar, QScrollArea)
 from qtpy.QtCore import Qt, Signal, QThread, QSettings
 import numpy as np
@@ -27,8 +26,9 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 class EnhanceThread(QThread):
-    """增强处理线程"""
+    """增强处理线程 (带进度条)"""
     finished = Signal(np.ndarray)
+    progress = Signal(int) # 0-100%
     error = Signal(str)
     def __init__(self, image_stack, **kwargs):
         super().__init__()
@@ -36,7 +36,10 @@ class EnhanceThread(QThread):
         self.params = kwargs
     def run(self):
         try:
-            result = enhance_image_stack(self.image_stack, **self.params)
+            def cb(percent):
+                self.progress.emit(percent)
+            
+            result = enhance_image_stack(self.image_stack, **self.params, progress_callback=cb)
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -53,7 +56,7 @@ class EnhanceWidget(QWidget):
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
 
     def _setup_ui(self):
-        # 1. 创建最外层布局 (用于放滚动条)
+        # 1. 创建最外层布局
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
@@ -122,15 +125,10 @@ class EnhanceWidget(QWidget):
         self.window_spin.valueChanged.connect(self._update_frame_loss_info)
         avg_layout.addWidget(self.window_spin)
         
-        self.crop_edges_check = QCheckBox("Auto-drop black edges")
-        self.crop_edges_check.setChecked(True)
-        self.crop_edges_check.setToolTip("Remove empty frames at the beginning and end.")
-        avg_layout.addWidget(self.crop_edges_check)
-        filter_layout.addLayout(avg_layout)
-        
         self.frame_loss_label = QLabel("")
         self.frame_loss_label.setStyleSheet("color: gray; font-size: 10px;")
-        filter_layout.addWidget(self.frame_loss_label)
+        avg_layout.addWidget(self.frame_loss_label)
+        filter_layout.addLayout(avg_layout)
 
         # --- 线程数 ---
         thread_layout = QHBoxLayout()
@@ -201,8 +199,10 @@ class EnhanceWidget(QWidget):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("QProgressBar { height: 10px; }")
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
         layout.addWidget(self.progress_bar)
+        
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -259,14 +259,10 @@ class EnhanceWidget(QWidget):
     def _toggle_average(self):
         enabled = self.use_average_check.isChecked()
         self.window_spin.setEnabled(enabled)
-        self.crop_edges_check.setEnabled(enabled)
         self._update_frame_loss_info()
 
     def _on_layer_changed(self, text):
         self._update_histogram()
-
-    def _on_layer_selection_changed(self, event=None):
-        pass 
 
     def _update_frame_loss_info(self):
         if not self.use_average_check.isChecked():
@@ -276,13 +272,9 @@ class EnhanceWidget(QWidget):
         if not layer_name or layer_name not in self.viewer.layers: return
         total_frames = len(self.viewer.layers[layer_name].data)
         window_size = self.window_spin.value()
-        cut_one_side = (window_size - 1) // 2
-        lost_frames = cut_one_side * 2
-        if self.crop_edges_check.isChecked():
-            output_frames = total_frames - lost_frames
-            self.frame_loss_label.setText(f"ℹ️ Cropping: {total_frames} → {output_frames} frames")
-        else:
-            self.frame_loss_label.setText(f"⚠️ Keeping Edges: first/last {cut_one_side} frames black")
+        # Core逻辑: output = T - window + 1
+        output_frames = max(0, total_frames - window_size + 1)
+        self.frame_loss_label.setText(f"Output: {output_frames} frames (Loss: {window_size-1})")
 
     def _get_enhancement_params(self):
         return {
@@ -304,10 +296,12 @@ class EnhanceWidget(QWidget):
             return
         
         self.status_label.setText("⏳ Running filters...")
-        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.apply_btn.setEnabled(False)
+        
         self.enhance_thread = EnhanceThread(image_stack, **params)
+        self.enhance_thread.progress.connect(self.progress_bar.setValue)
         self.enhance_thread.finished.connect(lambda res: self._on_enhance_finished(res, params))
         self.enhance_thread.error.connect(self._on_enhance_error)
         self.enhance_thread.start()
@@ -341,7 +335,6 @@ class EnhanceWidget(QWidget):
         self.apply_btn.setEnabled(True)
         self.status_label.setText(f"❌ Filter Error: {error_msg}")
 
-    # ... [Histogram methods unchanged, omitting for brevity] ...
     def _update_histogram(self):
         layer = self.viewer.layers.selection.active
         if not isinstance(layer, napari.layers.Image):
@@ -430,7 +423,9 @@ class EnhanceWidget(QWidget):
         c_min = self.contrast_min_spin.value()
         c_max = self.contrast_max_spin.value()
         self.status_label.setText("⏳ Applying contrast...")
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+        
         try:
             data = layer.data
             range_width = c_max - c_min
@@ -438,6 +433,8 @@ class EnhanceWidget(QWidget):
             normalized = (data - c_min) / range_width
             normalized = np.clip(normalized, 0, 1)
             dtype = data.dtype
+            
+            # 映射回原类型范围 (如 uint8 0-255)
             if np.issubdtype(dtype, np.integer):
                 info = np.iinfo(dtype)
                 burnt_data = (normalized * info.max).astype(dtype)
@@ -447,7 +444,6 @@ class EnhanceWidget(QWidget):
             new_layer_name = f"Contrast_{layer.name}"
             new_layer = self.viewer.add_image(burnt_data, name=new_layer_name, colormap='gray')
             
-            # === Log Params ===
             self._log_action("contrast_adjustment", {
                 "source": layer.name,
                 "min": c_min,

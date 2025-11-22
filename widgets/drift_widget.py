@@ -1,9 +1,9 @@
 """
-漂移矫正控件 (完整版 - 交互优化)
-包含功能：
+漂移矫正控件 (完整版)
+功能：
 1. 自动切换绘制工具
-2. 鼠标释放后触发计算
-3. [Update] 归档集成：应用矫正后，自动将 ROI、Template、Kernel 等参数写入 processing_log.json。
+2. 鼠标释放后触发计算 (带进度条)
+3. 归档集成：应用矫正后，自动将 ROI、Template、Kernel 等参数写入 processing_log.json。
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QSpinBox, QHBoxLayout, QComboBox,
@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 import datetime
 
-# 请确保您的项目中存在 core.drift_correction 模块
+# 导入核心算法
 from core.drift_correction import (calculate_drift_curve, 
                                    apply_drift_correction,
                                    validate_roi)
@@ -33,7 +33,9 @@ class NumpyEncoder(json.JSONEncoder):
 class DriftCalculationThread(QThread):
     """漂移计算线程"""
     finished = Signal(np.ndarray)  # drifts
+    progress = Signal(int, int)    # current, total
     error = Signal(str)
+    
     def __init__(self, image_stack, roi_bbox, template_idx, max_workers, kernel_size):
         super().__init__()
         self.image_stack = image_stack
@@ -41,16 +43,49 @@ class DriftCalculationThread(QThread):
         self.template_idx = template_idx
         self.max_workers = max_workers
         self.kernel_size = kernel_size
+        
     def run(self):
         try:
+            # 进度回调适配器
+            def cb(c, t):
+                self.progress.emit(c, t)
+                
             drifts = calculate_drift_curve(
                 self.image_stack,
                 self.roi_bbox,
                 self.template_idx,
                 self.max_workers,
-                self.kernel_size
+                self.kernel_size,
+                progress_callback=cb
             )
             self.finished.emit(drifts)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class DriftApplyThread(QThread):
+    """漂移应用线程"""
+    finished = Signal(np.ndarray)
+    progress = Signal(int, int)
+    error = Signal(str)
+    
+    def __init__(self, image_stack, drifts, max_workers):
+        super().__init__()
+        self.image_stack = image_stack
+        self.drifts = drifts
+        self.max_workers = max_workers
+        
+    def run(self):
+        try:
+            def cb(c, t):
+                self.progress.emit(c, t)
+                
+            corrected = apply_drift_correction(
+                self.image_stack,
+                self.drifts,
+                self.max_workers,
+                progress_callback=cb
+            )
+            self.finished.emit(corrected)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -60,14 +95,20 @@ class DriftCorrectionWidget(QWidget):
         super().__init__()
         self.viewer = viewer
         self.current_drifts = None
-        self.drift_thread = None
+        self.calc_thread = None
+        self.apply_thread = None
         self._setup_ui()
+        
+        # 监听图层事件
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
+        self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
 
     def _setup_ui(self):
         # 1. 创建最外层布局 (用于放滚动条)
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
-        # 2. 创建滚动区域
+        
         scroll = QScrollArea()
         scroll.setWidgetResizable(True) 
         scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
@@ -123,11 +164,13 @@ class DriftCorrectionWidget(QWidget):
 
         # 步骤2：预览漂移曲线
         layout.addWidget(QLabel("<b>Step 2: Preview Drift</b>"))
+        
+        # 进度条
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0) 
-        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
         self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("QProgressBar { height: 10px; }")
         layout.addWidget(self.progress_bar)
 
         ctrl_layout = QHBoxLayout()
@@ -168,7 +211,7 @@ class DriftCorrectionWidget(QWidget):
         self.setLayout(main_layout)
         self._refresh_layers()
 
-    def _refresh_layers(self):
+    def _refresh_layers(self, event=None):
         current_text = self.layer_combo.currentText()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
@@ -195,6 +238,7 @@ class DriftCorrectionWidget(QWidget):
         if layer_name:
             layer = self.viewer.layers[layer_name]
             self.template_spin.setMaximum(len(layer.data) - 1)
+            # 默认中间帧
             self.template_spin.setValue((len(layer.data) - 1) // 2)
 
     def _add_shapes_layer(self):
@@ -248,22 +292,24 @@ class DriftCorrectionWidget(QWidget):
             self.status_label.setText("❌ Draw ROI first.")
             return
         if not validate_roi(image_stack.shape[1:], roi_bbox):
-            self.status_label.setText("❌ Invalid ROI.")
+            self.status_label.setText("❌ Invalid ROI (too small or out of bounds).")
             return
         
         self.status_label.setText("⏳ Calculating drift...")
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.drift_canvas.setVisible(False)
         self.apply_btn.setEnabled(False)
         self.auto_calc_cb.setEnabled(False)
         
-        self.drift_thread = DriftCalculationThread(
+        self.calc_thread = DriftCalculationThread(
             image_stack, roi_bbox, self.template_spin.value(),
             self.max_workers_spin.value(), self.kernel_spin.value()
         )
-        self.drift_thread.finished.connect(self._on_drift_calculated)
-        self.drift_thread.error.connect(self._on_drift_error)
-        self.drift_thread.start()
+        self.calc_thread.progress.connect(lambda c, t: self.progress_bar.setValue(int(c/t*100)))
+        self.calc_thread.finished.connect(self._on_drift_calculated)
+        self.calc_thread.error.connect(self._on_drift_error)
+        self.calc_thread.start()
 
     def _on_drift_calculated(self, drifts):
         self.progress_bar.setVisible(False)
@@ -295,14 +341,21 @@ class DriftCorrectionWidget(QWidget):
         layer_name = self.layer_combo.currentText()
         layer = self.viewer.layers[layer_name]
         
-        self.status_label.setText("⏳ Applying...")
+        self.status_label.setText("⏳ Applying correction...")
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+        self.apply_btn.setEnabled(False)
         
+        self.apply_thread = DriftApplyThread(layer.data, self.current_drifts, self.max_workers_spin.value())
+        self.apply_thread.progress.connect(lambda c, t: self.progress_bar.setValue(int(c/t*100)))
+        self.apply_thread.finished.connect(lambda res: self._on_apply_finished(res, layer_name))
+        self.apply_thread.error.connect(self._on_drift_error)
+        self.apply_thread.start()
+
+    def _on_apply_finished(self, corrected_stack, layer_name):
+        self.progress_bar.setVisible(False)
+        self.apply_btn.setEnabled(True)
         try:
-            corrected_stack = apply_drift_correction(layer.data, self.current_drifts, self.max_workers_spin.value())
-            if not corrected_stack.flags['C_CONTIGUOUS']:
-                corrected_stack = np.ascontiguousarray(corrected_stack)
-            
             new_layer_name = f"Corrected_{layer_name}"
             self.viewer.add_image(corrected_stack, name=new_layer_name, colormap='gray', metadata={'source': layer_name})
             
@@ -311,6 +364,7 @@ class DriftCorrectionWidget(QWidget):
 
             self.status_label.setText(f"✅ Done! Layer: {new_layer_name}")
             
+            # 自动切换
             for l in self.viewer.layers:
                 if isinstance(l, napari.layers.Image) and l.name != new_layer_name: l.visible = False
             self.viewer.layers.selection.active = self.viewer.layers[new_layer_name]
@@ -320,8 +374,6 @@ class DriftCorrectionWidget(QWidget):
             
         except Exception as e:
             self.status_label.setText(f"❌ Apply Error: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
 
     def _log_drift_action(self, source_layer):
         """Save parameters to processing_log.json"""
@@ -331,19 +383,20 @@ class DriftCorrectionWidget(QWidget):
             
             log_path = Path(archive_path) / "processing_log.json"
             if log_path.exists():
-                with open(log_path, 'r') as f: data = json.load(f)
+                try:
+                    with open(log_path, 'r') as f: data = json.load(f)
+                except: data = {}
             else: data = {}
 
             if "drift_correction" not in data: data["drift_correction"] = []
             
-            # Calculate stats for log
             max_drift = np.max(np.abs(self.current_drifts), axis=0)
             
             entry = {
                 "timestamp": str(datetime.datetime.now()),
                 "source_layer": source_layer,
                 "template_frame": self.template_spin.value(),
-                "roi_bbox": self._get_roi_bbox(), # (x1, y1, x2, y2)
+                "roi_bbox": self._get_roi_bbox(),
                 "kernel_size": self.kernel_spin.value(),
                 "max_shift_x": max_drift[0],
                 "max_shift_y": max_drift[1]

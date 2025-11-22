@@ -1,9 +1,11 @@
 """
-导出控件 - 增强版 (支持归档系统集成)
-功能：
-1. 视频/图像序列/TIFF导出
-2. [Update] 归档集成：自动检测 Import 模块生成的归档路径。
-3. [Update] 自动记录：导出完成后将参数写入 processing_log.json。
+导出控件 - 完整修复版
+包含：
+1. 视频/序列/TIFF 导出
+2. 帧范围选择 (Frame Range) - [修复]
+3. 视频参数设置 (FPS, Codec, Quality) - [确认]
+4. 导出前安全检查 (Missing Annotations)
+5. 归档路径自动集成
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QSpinBox, QHBoxLayout, QComboBox,
@@ -12,17 +14,19 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
 from qtpy.QtCore import Signal, QThread, QSettings
 import numpy as np
 from pathlib import Path
-import os
 import json
 import datetime
-from utils.video_export import (export_to_video, export_to_tiff_stack, 
-                                get_available_codecs)
+import cv2
+
+# 引入工具函数
+from utils.video_export import export_to_video, export_to_tiff_stack, get_available_codecs
 
 class ExportThread(QThread):
-    """导出线程"""
+    """导出后台线程"""
     progress = Signal(int, int)
     finished = Signal(str)
     error = Signal(str)
+    
     def __init__(self, image_stack, output_path, export_type, params):
         super().__init__()
         self.image_stack = image_stack
@@ -33,45 +37,51 @@ class ExportThread(QThread):
     def run(self):
         try:
             success = False
-            # Ensure directory exists
+            # 确保父目录存在
             Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
             
             if self.export_type == 'video':
+                # Video 导出
                 success = export_to_video(
-                    self.image_stack,
-                    str(self.output_path),
-                    **self.params
+                    self.image_stack, str(self.output_path), **self.params
                 )
+                # 视频导出进度目前封装在 utils 里，这里发送完成信号
+                self.progress.emit(100, 100)
+                
             elif self.export_type == 'tiff':
-                success = export_to_tiff_stack(
-                    self.image_stack,
-                    str(self.output_path)
-                )
+                # TIFF Stack 导出
+                success = export_to_tiff_stack(self.image_stack, str(self.output_path))
+                self.progress.emit(100, 100)
+                
             elif self.export_type == 'image_sequence':
+                # 序列导出
                 success = self._export_image_sequence()
             
             if success:
                 self.finished.emit(str(self.output_path))
             else:
-                self.error.emit("Export failed (Check console for details)")
+                self.error.emit("Export function returned False.")
+                
         except Exception as e:
             self.error.emit(str(e))
 
     def _export_image_sequence(self):
-        import cv2
         output_path = Path(self.output_path)
-        # For sequence, output_path is treated as a folder if no extension, or we make a folder
-        if output_path.suffix:
-            output_path = output_path.parent / output_path.stem
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        format_ext = self.params.get('format', 'png')
-        name_pattern = self.params.get('name_pattern', 'frame_{:04d}')
-        
-        total = len(self.image_stack)
-        for i, frame in enumerate(self.image_stack):
-            filename = output_path / f"{name_pattern.format(i)}.{format_ext}"
+        # 如果路径有后缀（如 .png），则视为文件名模板的父文件夹；
+        # 或者我们在上一级创建一个同名文件夹
+        if output_path.suffix: 
+            folder = output_path.parent / output_path.stem
+        else:
+            folder = output_path
             
+        folder.mkdir(parents=True, exist_ok=True)
+        
+        fmt = self.params.get('format', 'png')
+        pat = self.params.get('name_pattern', 'frame_{:04d}')
+        total = len(self.image_stack)
+        
+        for i, frame in enumerate(self.image_stack):
+            # 简单的 RGB 处理
             if frame.ndim == 3 and frame.shape[2] in [3, 4]:
                 if frame.shape[2] == 4:
                     frame_out = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
@@ -79,13 +89,17 @@ class ExportThread(QThread):
                     frame_out = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             else:
                 frame_out = frame
+            
+            fname = folder / f"{pat.format(i)}.{fmt}"
+            cv2.imwrite(str(fname), frame_out)
+            
+            if i % 10 == 0: 
+                self.progress.emit(i + 1, total)
                 
-            cv2.imwrite(str(filename), frame_out)
-            self.progress.emit(i + 1, total)
+        self.progress.emit(total, total)
         return True
 
 class ExportWidget(QWidget):
-    """导出控件"""
     def __init__(self, viewer):
         super().__init__()
         self.viewer = viewer
@@ -93,168 +107,188 @@ class ExportWidget(QWidget):
         self.output_path = None
         self.settings = QSettings("NapariUser", "ExportSettings")
         self.annotation_settings = QSettings("NapariUser", "AnnotationParams")
+        
         self._setup_ui()
         self._restore_last_path()
         
         # 监听图层变化
-        self.viewer.layers.events.inserted.connect(self._refresh_layers_silently)
-        self.viewer.layers.events.removed.connect(self._refresh_layers_silently)
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
 
     def _setup_ui(self):
+        # 主布局
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
+        
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         
         content_widget = QWidget()
         layout = QVBoxLayout()
         
-        title = QLabel("<h3>💾 Export Data</h3>")
-        layout.addWidget(title)
-
-        # 图层选择
-        layer_layout = QHBoxLayout()
-        layer_layout.addWidget(QLabel("Source Layer:"))
+        layout.addWidget(QLabel("<h3>💾 Export Data</h3>"))
+        
+        # 1. Source Layer
+        h_lay = QHBoxLayout()
+        h_lay.addWidget(QLabel("Source:"))
         self.layer_combo = QComboBox()
-        self.layer_combo.currentTextChanged.connect(self._on_combo_changed)
-        layer_layout.addWidget(self.layer_combo)
-        layout.addLayout(layer_layout)
+        self.layer_combo.currentTextChanged.connect(self._on_layer_changed)
+        h_lay.addWidget(self.layer_combo)
+        layout.addLayout(h_lay)
         
-        refresh_btn = QPushButton("🔄 Refresh Layers")
-        refresh_btn.clicked.connect(self._refresh_layers)
-        layout.addWidget(refresh_btn)
+        # 刷新按钮
+        btn_refresh = QPushButton("🔄 Refresh Layers")
+        btn_refresh.clicked.connect(self._refresh_layers)
+        layout.addWidget(btn_refresh)
+        
+        # 2. Frame Range (修复：找回了遗漏的帧范围选择)
+        self.g_range = QGroupBox("Frame Range")
+        l_range = QHBoxLayout()
+        self.radio_all = QRadioButton("All Frames")
+        self.radio_all.setChecked(True)
+        self.radio_range = QRadioButton("Range")
+        
+        self.spin_start = QSpinBox(); self.spin_start.setEnabled(False)
+        self.spin_end = QSpinBox(); self.spin_end.setEnabled(False)
+        
+        # 联动逻辑
+        self.radio_range.toggled.connect(lambda c: (self.spin_start.setEnabled(c), self.spin_end.setEnabled(c)))
+        
+        l_range.addWidget(self.radio_all)
+        l_range.addWidget(self.radio_range)
+        l_range.addWidget(QLabel("From:"))
+        l_range.addWidget(self.spin_start)
+        l_range.addWidget(QLabel("To:"))
+        l_range.addWidget(self.spin_end)
+        self.g_range.setLayout(l_range)
+        layout.addWidget(self.g_range)
 
-        # Type
-        type_group = QGroupBox("Export Type")
-        type_layout = QVBoxLayout()
-        self.export_type_group = QButtonGroup()
+        # 3. Export Format Type
+        g_type = QGroupBox("Export Format")
+        l_type = QVBoxLayout()
+        self.bg_type = QButtonGroup()
         
-        self.video_radio = QRadioButton("Video File (.mp4, .avi)")
-        self.video_radio.setChecked(True)
-        self.video_radio.toggled.connect(self._on_type_changed)
-        self.export_type_group.addButton(self.video_radio, 0)
-        type_layout.addWidget(self.video_radio)
+        self.radio_vid = QRadioButton("Video (.mp4, .avi)")
+        self.radio_vid.setChecked(True)
+        self.radio_tiff = QRadioButton("TIFF Stack (.tiff)")
+        self.radio_seq = QRadioButton("Image Sequence (Folder)")
         
-        self.tiff_radio = QRadioButton("TIFF Stack (.tiff)")
-        self.tiff_radio.toggled.connect(self._on_type_changed)
-        self.export_type_group.addButton(self.tiff_radio, 1)
-        type_layout.addWidget(self.tiff_radio)
+        self.bg_type.addButton(self.radio_vid)
+        self.bg_type.addButton(self.radio_tiff)
+        self.bg_type.addButton(self.radio_seq)
         
-        self.sequence_radio = QRadioButton("Image Sequence (folder)")
-        self.sequence_radio.toggled.connect(self._on_type_changed)
-        self.export_type_group.addButton(self.sequence_radio, 2)
-        type_layout.addWidget(self.sequence_radio)
+        l_type.addWidget(self.radio_vid)
+        l_type.addWidget(self.radio_tiff)
+        l_type.addWidget(self.radio_seq)
         
-        type_group.setLayout(type_layout)
-        layout.addWidget(type_group)
-
-        # Video Settings
-        self.video_settings_group = QGroupBox("Video Settings")
-        video_layout = QVBoxLayout()
-        fps_layout = QHBoxLayout()
-        fps_layout.addWidget(QLabel("FPS:"))
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(1, 120); self.fps_spin.setValue(30)
-        fps_layout.addWidget(self.fps_spin)
-        video_layout.addLayout(fps_layout)
+        self.radio_vid.toggled.connect(self._toggle_settings)
+        self.radio_tiff.toggled.connect(self._toggle_settings)
+        self.radio_seq.toggled.connect(self._toggle_settings)
         
-        codec_layout = QHBoxLayout()
-        codec_layout.addWidget(QLabel("Codec:"))
-        self.codec_combo = QComboBox()
-        self.codec_combo.addItems(get_available_codecs())
-        codec_layout.addWidget(self.codec_combo)
-        video_layout.addLayout(codec_layout)
+        g_type.setLayout(l_type)
+        layout.addWidget(g_type)
         
-        q_layout = QHBoxLayout()
-        q_layout.addWidget(QLabel("Quality:"))
-        self.quality_spin = QSpinBox()
-        self.quality_spin.setRange(0, 100); self.quality_spin.setValue(95)
-        q_layout.addWidget(self.quality_spin)
-        video_layout.addLayout(q_layout)
+        # 4. Video Settings (FPS, Codec, Quality)
+        self.g_vid_set = QGroupBox("Video Options")
+        l_vid = QVBoxLayout()
         
-        self.video_settings_group.setLayout(video_layout)
-        layout.addWidget(self.video_settings_group)
-
-        # Sequence Settings
-        self.sequence_settings_group = QGroupBox("Sequence Settings")
-        seq_layout = QVBoxLayout()
-        self.image_format_combo = QComboBox()
-        self.image_format_combo.addItems(['png', 'jpg', 'bmp', 'tiff'])
-        seq_layout.addWidget(QLabel("Format:"))
-        seq_layout.addWidget(self.image_format_combo)
+        h_fps = QHBoxLayout()
+        h_fps.addWidget(QLabel("FPS:"))
+        self.spin_fps = QSpinBox()
+        self.spin_fps.setRange(1, 120)
+        self.spin_fps.setValue(30)
+        h_fps.addWidget(self.spin_fps)
+        l_vid.addLayout(h_fps)
         
-        self.name_pattern_edit = QLineEdit("frame_{:04d}")
-        seq_layout.addWidget(QLabel("Pattern:"))
-        seq_layout.addWidget(self.name_pattern_edit)
+        h_codec = QHBoxLayout()
+        h_codec.addWidget(QLabel("Codec:"))
+        self.combo_codec = QComboBox()
+        self.combo_codec.addItems(get_available_codecs())
+        h_codec.addWidget(self.combo_codec)
+        l_vid.addLayout(h_codec)
         
-        self.sequence_settings_group.setLayout(seq_layout)
-        self.sequence_settings_group.setVisible(False)
-        layout.addWidget(self.sequence_settings_group)
-
-        # Output Path
-        path_layout = QHBoxLayout()
-        self.path_label = QLabel("Output: Not selected")
-        self.path_label.setStyleSheet("color: gray; font-size: 10px;")
-        self.path_label.setWordWrap(True)
-        browse_btn = QPushButton("📂 Browse...")
-        browse_btn.clicked.connect(self._browse_output)
-        path_layout.addWidget(self.path_label)
-        path_layout.addWidget(browse_btn)
-        layout.addLayout(path_layout)
-
-        # Range
-        range_group = QGroupBox("Frame Range")
-        r_layout = QHBoxLayout()
-        self.export_all_radio = QRadioButton("All")
-        self.export_all_radio.setChecked(True)
-        self.export_range_radio = QRadioButton("Range")
-        r_layout.addWidget(self.export_all_radio)
-        r_layout.addWidget(self.export_range_radio)
-        self.start_frame_spin = QSpinBox(); self.start_frame_spin.setEnabled(False)
-        self.end_frame_spin = QSpinBox(); self.end_frame_spin.setEnabled(False)
-        r_layout.addWidget(self.start_frame_spin)
-        r_layout.addWidget(QLabel("-"))
-        r_layout.addWidget(self.end_frame_spin)
+        h_qual = QHBoxLayout()
+        h_qual.addWidget(QLabel("Quality (0-100):"))
+        self.spin_qual = QSpinBox()
+        self.spin_qual.setRange(1, 100)
+        self.spin_qual.setValue(95)
+        h_qual.addWidget(self.spin_qual)
+        l_vid.addLayout(h_qual)
         
-        self.export_range_radio.toggled.connect(
-            lambda c: (self.start_frame_spin.setEnabled(c), self.end_frame_spin.setEnabled(c))
-        )
-        range_group.setLayout(r_layout)
-        layout.addWidget(range_group)
-
-        # Annotations
-        self.annotation_group = QGroupBox("Overlay Annotations")
-        self.annotation_group.setCheckable(True)
-        self.annotation_group.setChecked(True)
-        a_layout = QVBoxLayout()
-        self.include_scale_bar_check = QCheckBox("Scale Bar")
-        self.include_timestamp_check = QCheckBox("Timestamp")
-        a_layout.addWidget(self.include_scale_bar_check)
-        a_layout.addWidget(self.include_timestamp_check)
-        self.annotation_info = QLabel("ℹ️ Styles loaded from Annotation tab")
-        self.annotation_info.setStyleSheet("color: gray; font-style: italic;")
-        a_layout.addWidget(self.annotation_info)
-        self.annotation_group.setLayout(a_layout)
-        layout.addWidget(self.annotation_group)
-
-        # Progress & Action
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        self.g_vid_set.setLayout(l_vid)
+        layout.addWidget(self.g_vid_set)
         
-        self.export_btn = QPushButton("🚀 Start Export")
-        self.export_btn.setEnabled(False)
-        self.export_btn.clicked.connect(self._start_export)
-        self.export_btn.setStyleSheet("font-weight: bold; padding: 5px; background-color: #2196F3; color: white;")
-        layout.addWidget(self.export_btn)
+        # 5. Sequence Settings
+        self.g_seq_set = QGroupBox("Sequence Options")
+        l_seq = QVBoxLayout()
         
-        self.status_label = QLabel("Ready")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-
+        h_fmt = QHBoxLayout()
+        h_fmt.addWidget(QLabel("Format:"))
+        self.combo_img_fmt = QComboBox()
+        self.combo_img_fmt.addItems(['png', 'jpg', 'bmp', 'tiff'])
+        h_fmt.addWidget(self.combo_img_fmt)
+        l_seq.addLayout(h_fmt)
+        
+        h_pat = QHBoxLayout()
+        h_pat.addWidget(QLabel("Pattern:"))
+        self.edit_pattern = QLineEdit("frame_{:04d}")
+        h_pat.addWidget(self.edit_pattern)
+        l_seq.addLayout(h_pat)
+        
+        self.g_seq_set.setLayout(l_seq)
+        self.g_seq_set.setVisible(False) # Default hidden
+        layout.addWidget(self.g_seq_set)
+        
+        # 6. Annotations Check
+        self.g_anno = QGroupBox("Overlay Annotations")
+        self.g_anno.setCheckable(True)
+        self.g_anno.setChecked(True)
+        l_anno = QVBoxLayout()
+        
+        self.check_sb = QCheckBox("Scale Bar")
+        self.check_sb.setChecked(True)
+        self.check_ts = QCheckBox("Timestamp")
+        self.check_ts.setChecked(True)
+        
+        l_anno.addWidget(self.check_sb)
+        l_anno.addWidget(self.check_ts)
+        l_anno.addWidget(QLabel("<i style='color:gray'>(Styles loaded from Annotation Tab)</i>"))
+        self.g_anno.setLayout(l_anno)
+        layout.addWidget(self.g_anno)
+        
+        # 7. Output Path
+        h_path = QHBoxLayout()
+        self.lbl_path = QLabel("No path selected")
+        self.lbl_path.setStyleSheet("font-size: 10px; color: gray;")
+        self.lbl_path.setWordWrap(True)
+        
+        btn_brow = QPushButton("📂 Browse")
+        btn_brow.clicked.connect(self._browse)
+        
+        h_path.addWidget(self.lbl_path)
+        h_path.addWidget(btn_brow)
+        layout.addLayout(h_path)
+        
+        # 8. Progress & Action
+        self.pbar = QProgressBar()
+        self.pbar.setVisible(False)
+        self.pbar.setFormat("%p%")
+        layout.addWidget(self.pbar)
+        
+        self.btn_run = QPushButton("🚀 Start Export")
+        self.btn_run.clicked.connect(self._start_export)
+        self.btn_run.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 6px;")
+        self.btn_run.setEnabled(False)
+        layout.addWidget(self.btn_run)
+        
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+        
         layout.addStretch()
+        
         content_widget.setLayout(layout)
         scroll.setWidget(content_widget)
         main_layout.addWidget(scroll)
@@ -262,258 +296,253 @@ class ExportWidget(QWidget):
         
         self._refresh_layers()
 
-    def _refresh_layers_silently(self, event=None):
-        current_text = self.layer_combo.currentText()
+    def _toggle_settings(self):
+        """根据选择的格式显示/隐藏对应设置"""
+        is_video = self.radio_vid.isChecked()
+        is_seq = self.radio_seq.isChecked()
+        self.g_vid_set.setVisible(is_video)
+        self.g_seq_set.setVisible(is_seq)
+        
+    def _refresh_layers(self, event=None):
+        curr = self.layer_combo.currentText()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
-        for layer in self.viewer.layers:
-            if hasattr(layer, 'data') and isinstance(layer.data, np.ndarray):
-                if layer.data.ndim in [3, 4]: # Support 3D or 4D(RGB)
-                    self.layer_combo.addItem(layer.name)
-        idx = self.layer_combo.findText(current_text)
-        if idx >= 0: self.layer_combo.setCurrentIndex(idx)
+        for l in self.viewer.layers:
+            if hasattr(l, 'data') and isinstance(l.data, np.ndarray):
+                if l.data.ndim in [3, 4]: # 3D stack or 4D RGB
+                    self.layer_combo.addItem(l.name)
+        
+        if curr: 
+            idx = self.layer_combo.findText(curr)
+            if idx >= 0: self.layer_combo.setCurrentIndex(idx)
         self.layer_combo.blockSignals(False)
-
-    def _refresh_layers(self):
-        self._refresh_layers_silently()
-        self._on_active_layer_changed()
+        self._on_layer_changed(self.layer_combo.currentText())
 
     def _on_active_layer_changed(self, event=None):
-        active_layer = self.viewer.layers.selection.active
-        if active_layer:
-            idx = self.layer_combo.findText(active_layer.name)
-            if idx >= 0:
-                self.layer_combo.blockSignals(True)
+        active = self.viewer.layers.selection.active
+        if active:
+            idx = self.layer_combo.findText(active.name)
+            if idx >= 0: 
                 self.layer_combo.setCurrentIndex(idx)
-                self.layer_combo.blockSignals(False)
-                self._check_layer_type(active_layer)
-                self._update_frame_range()
-        
-        # Check for archive path availability
-        self._check_archive_path()
 
-    def _check_archive_path(self):
-        """检查是否有归档路径，并自动设置导出路径"""
-        # === Fix: Check QSettings for global archive path ===
-        archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+    def _on_layer_changed(self, txt):
+        if not txt: return
+        if txt not in self.viewer.layers: return
+        layer = self.viewer.layers[txt]
         
-        if archive_path and Path(archive_path).exists():
-            # 如果有归档，启用自动路径模式
-            self.output_path = archive_path # Set base path, full path calc on export
-            self.path_label.setText(f"📂 Auto-save to Archive:\n{Path(archive_path).name}")
-            self.path_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
-            self.export_btn.setEnabled(True)
-        else:
-            # 回退到手动模式
-            if not self.output_path or self.path_label.text().startswith("📂 Auto-save"):
-                # If path was auto-set or empty, reset text (but keep value if valid)
-                last_output = self.settings.value("last_output", "")
-                if last_output:
-                    self.path_label.setText(last_output)
-                    self.output_path = last_output
-                else:
-                    self.path_label.setText("Output: Not selected")
-                    self.path_label.setStyleSheet("color: gray; font-size: 10px;")
-    
-    def _on_combo_changed(self, text):
-        if not text: return
-        if text in self.viewer.layers:
-            layer = self.viewer.layers[text]
-            self._check_layer_type(layer)
-            self._update_frame_range()
-
-    def _check_layer_type(self, layer):
-        is_rgb = False
-        if layer.data.ndim == 4 and layer.data.shape[-1] in [3, 4]: is_rgb = True
-        if hasattr(layer, 'rgb') and layer.rgb: is_rgb = True
+        # 更新 Frame Range 上限
+        num_frames = layer.data.shape[0]
+        self.spin_start.setMaximum(num_frames - 1)
+        self.spin_end.setMaximum(num_frames - 1)
+        self.spin_end.setValue(num_frames - 1)
+        self.spin_start.setValue(0)
         
+        # 如果是RGB层，禁用Annotation覆盖 (因为Annotation模块通常处理单通道叠加)
+        is_rgb = (layer.data.ndim == 4) or (hasattr(layer, 'rgb') and layer.rgb)
         if is_rgb:
-            self.annotation_group.setChecked(False)
-            self.annotation_group.setTitle("Overlay (Disabled: RGB Layer)")
-            self.annotation_group.setEnabled(False)
+            self.g_anno.setChecked(False)
+            self.g_anno.setTitle("Overlay (Disabled for RGB)")
+            self.g_anno.setEnabled(False)
         else:
-            self.annotation_group.setEnabled(True)
-            self.annotation_group.setTitle("Overlay Annotations")
+            self.g_anno.setEnabled(True)
+            self.g_anno.setTitle("Overlay Annotations")
 
-    def _update_frame_range(self):
-        text = self.layer_combo.currentText()
-        if not text or text not in self.viewer.layers: return
-        layer = self.viewer.layers[text]
-        n = len(layer.data)
-        self.start_frame_spin.setMaximum(n-1)
-        self.end_frame_spin.setMaximum(n-1)
-        self.end_frame_spin.setValue(n-1)
-
-    def _on_type_changed(self):
-        if self.video_radio.isChecked():
-            self.video_settings_group.setVisible(True)
-            self.sequence_settings_group.setVisible(False)
-        elif self.tiff_radio.isChecked():
-            self.video_settings_group.setVisible(False)
-            self.sequence_settings_group.setVisible(False)
+    def _browse(self):
+        d = self.settings.value("last_dir", str(Path.home()))
+        
+        if self.radio_vid.isChecked():
+            f, _ = QFileDialog.getSaveFileName(self, "Save Video", d, "Video (*.mp4 *.avi)")
+        elif self.radio_tiff.isChecked():
+            f, _ = QFileDialog.getSaveFileName(self, "Save TIFF", d, "TIFF (*.tiff)")
         else:
-            self.video_settings_group.setVisible(False)
-            self.sequence_settings_group.setVisible(True)
+            f = QFileDialog.getExistingDirectory(self, "Select Output Folder", d)
+            
+        if f:
+            self.output_path = f
+            self.lbl_path.setText(f)
+            self.lbl_path.setStyleSheet("color: #E0E0E0; font-size: 10px;")
+            
+            p = Path(f)
+            # 如果是文件，保存其父目录；如果是文件夹，保存该目录
+            save_dir = str(p.parent) if p.suffix else str(p)
+            self.settings.setValue("last_dir", save_dir)
+            self.btn_run.setEnabled(True)
 
     def _restore_last_path(self):
-        last_output = self.settings.value("last_output", "")
-        if last_output:
-            self.output_path = last_output
-            self.path_label.setText(last_output)
-            self.export_btn.setEnabled(True)
-        self._check_archive_path() # Override if archive exists
-
-    def _browse_output(self):
-        last_dir = self.settings.value("last_dir", str(Path.home()))
-        
-        # Determine mode
-        if self.video_radio.isChecked():
-            path, _ = QFileDialog.getSaveFileName(self, "Save Video", last_dir, "Video (*.mp4 *.avi)")
-        elif self.tiff_radio.isChecked():
-            path, _ = QFileDialog.getSaveFileName(self, "Save TIFF", last_dir, "TIFF (*.tiff)")
+        # 检查全局归档路径 (from Import Widget)
+        archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+        if archive_path and Path(archive_path).exists():
+            self.output_path = archive_path
+            self.lbl_path.setText(f"📂 Auto-Archive: {Path(archive_path).name}")
+            self.lbl_path.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
+            self.btn_run.setEnabled(True)
         else:
-            path = QFileDialog.getExistingDirectory(self, "Select Folder", last_dir)
-            
-        if path:
-            self.output_path = path
-            self.path_label.setText(path)
-            self.path_label.setStyleSheet("color: #E0E0E0; font-size: 10px;") # Reset style
-            self.export_btn.setEnabled(True)
-            
-            # If not in archive mode, save settings
-            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-            if not (archive_path and str(Path(archive_path)) in path):
-                self.settings.setValue("last_output", path)
-                p = Path(path)
-                save_dir = str(p.parent) if p.suffix else str(p)
-                self.settings.setValue("last_dir", save_dir)
+            # 回退到本地记忆
+            last = self.settings.value("last_output", "")
+            if last:
+                self.output_path = last
+                self.lbl_path.setText(last)
+                self.btn_run.setEnabled(True)
 
     def _get_export_params(self):
         params = {}
-        if self.video_radio.isChecked():
-            params['fps'] = self.fps_spin.value()
-            params['codec'] = self.codec_combo.currentText()
-            params['quality'] = self.quality_spin.value()
+        
+        if self.radio_vid.isChecked():
+            params['fps'] = self.spin_fps.value()
+            params['codec'] = self.combo_codec.currentText()
+            params['quality'] = self.spin_qual.value()
             
-            # Annotations
-            if self.annotation_group.isEnabled() and self.annotation_group.isChecked():
+            # Load Annotations from Settings
+            if self.g_anno.isChecked():
                 s = self.annotation_settings
-                if self.include_scale_bar_check.isChecked():
-                    params['scale_bar_config'] = {
-                        'enable': True,
-                        'ratio': float(s.value("scale/ratio", 1.0)),
-                        'unit': s.value("scale/unit", "nm"),
-                        'length': float(s.value("scale/length", 100.0)),
-                        'height': int(s.value("scale/height", 80)),
-                        'thickness': int(s.value("scale/thickness", 8)),
-                        'font_size': int(s.value("scale/font_size", 36)),
-                        'padding': int(s.value("scale/padding", 10)),
-                        'color': s.value("scale/color", (1,1,1,1)),
-                        'bg_color': s.value("scale/bg_color", (0,0,0,1)),
-                        'bg_alpha': int(s.value("scale/bg_alpha", 100)),
-                        'use_bg': s.value("scale/use_bg", "true") == "true",
-                        'position': s.value("scale/position", (50, 50))
-                    }
-                if self.include_timestamp_check.isChecked():
-                    params['timestamp_config'] = {
-                        'enable': True,
-                        'format': s.value("label/format", "0.00"),
-                        'custom_fmt': s.value("label/custom_fmt", ""),
-                        'font_size': int(s.value("label/font_size", 32)),
-                        'color': s.value("label/color", (1,1,1,1)),
-                        'position': s.value("label/position", (10, 40)),
-                        'start': float(s.value("label/start", 0.0)),
-                        'interval': float(s.value("label/interval", 1.0))
-                    }
-        elif self.sequence_radio.isChecked():
-            params['format'] = self.image_format_combo.currentText()
-            params['name_pattern'] = self.name_pattern_edit.text()
+                
+                if self.check_sb.isChecked():
+                    # 读取 AnnotationWidget 保存的配置
+                    try:
+                        params['scale_bar_config'] = {
+                            'enable': True,
+                            'ratio': float(s.value("scale/ratio", 1.0)),
+                            'unit': s.value("scale/unit", "nm"),
+                            'length': float(s.value("scale/length", 100.0)),
+                            'height': int(s.value("scale/height", 80)),
+                            'thickness': int(s.value("scale/thickness", 8)),
+                            'font_size': int(s.value("scale/font_size", 36)),
+                            'padding': int(s.value("scale/padding", 10)),
+                            'color': s.value("scale/color", (1,1,1,1)),
+                            'bg_color': s.value("scale/bg_color", (0,0,0,1)),
+                            'bg_alpha': int(s.value("scale/bg_alpha", 100)),
+                            'use_bg': s.value("scale/use_bg", "true") == "true",
+                            'position': s.value("scale/position", (50, 50))
+                        }
+                    except:
+                        print("Warning: Could not load scale bar settings.")
+
+                if self.check_ts.isChecked():
+                    try:
+                        params['timestamp_config'] = {
+                            'enable': True,
+                            'format': s.value("label/format", "0.00"),
+                            'custom_fmt': s.value("label/custom_fmt", ""),
+                            'font_size': int(s.value("label/font_size", 32)),
+                            'color': s.value("label/color", (1,1,1,1)),
+                            'position': s.value("label/position", (10, 40)),
+                            'start': float(s.value("label/start", 0.0)),
+                            'interval': float(s.value("label/interval", 1.0))
+                        }
+                    except:
+                        print("Warning: Could not load timestamp settings.")
+        
+        elif self.radio_seq.isChecked():
+            params['format'] = self.combo_img_fmt.currentText()
+            params['name_pattern'] = self.edit_pattern.text()
+            
         return params
 
     def _start_export(self):
-        layer_name = self.layer_combo.currentText()
-        if not layer_name or not self.output_path: 
-            self.status_label.setText("❌ Check inputs")
+        if not self.layer_combo.currentText() or not self.output_path: 
+            self.lbl_status.setText("❌ Check inputs")
             return
+        layer_name = self.layer_combo.currentText()
+        # === [Fix] Warning Check (Smart) ===
+        # 如果图层名包含 "Burned" 或 "Annotated"，我们假设用户已经烧录好了，跳过检查
+        # 否则，如果未启用Annotation或未勾选子项，提示警告
+        is_burned = "burned" in layer_name.lower() or "annotated" in layer_name.lower()
 
-        # === 归档路径智能处理 ===
+        # === 导出前检查 (Warning Check) ===
+        if self.radio_vid.isChecked() and not is_burned:
+            # 如果启用了Annotation Group 但并没有勾选任何子项，或者直接未启用
+            # 这里逻辑是：如果用户要做视频，通常需要比例尺和时间戳。如果都没选，提示一下。
+            has_sb = self.check_sb.isChecked()
+            has_ts = self.check_ts.isChecked()
+            anno_enabled = self.g_anno.isChecked()
+            
+            if not anno_enabled or (not has_sb and not has_ts):
+                reply = QMessageBox.question(
+                    self, "Missing Annotations",
+                    "You are exporting a video WITHOUT Scale Bar or Timestamp.\n\nAre you sure?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No: return
+        
+        self.btn_run.setEnabled(False)
+        self.pbar.setValue(0)
+        self.pbar.setVisible(True)
+        self.lbl_status.setText("⏳ Exporting...")
+        
+        # 1. 自动处理文件名 (如果使用了归档路径)
         final_path = Path(self.output_path)
-        # Fix: Read from QSettings
         archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+        layer_name = self.layer_combo.currentText()
         
         if archive_path and final_path == Path(archive_path):
-            # 构造文件名: LayerName_Timestamp.ext
+            # 自动归档模式：生成文件名
             ts = datetime.datetime.now().strftime("%H%M%S")
             safe_layer = "".join([c if c.isalnum() or c in "-_" else "_" for c in layer_name])
             fname = f"{safe_layer}_{ts}"
             
-            if self.video_radio.isChecked():
+            if self.radio_vid.isChecked():
                 final_path = final_path / "Exported_Videos" / f"{fname}.mp4"
-            elif self.tiff_radio.isChecked():
+            elif self.radio_tiff.isChecked():
                 final_path = final_path / "Exported_Stacks" / f"{fname}.tiff"
             else:
                 final_path = final_path / "Exported_Sequences" / fname
             
-            # 确保子文件夹存在
             final_path.parent.mkdir(parents=True, exist_ok=True)
         
-        self.export_btn.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.status_label.setText(f"⏳ Exporting to {final_path.name}...")
-        
+        # 2. 准备数据 (切片处理)
         layer = self.viewer.layers[layer_name]
         data = layer.data
-        if self.export_range_radio.isChecked():
-            s, e = self.start_frame_spin.value(), self.end_frame_spin.value()
-            data = data[s:e+1]
         
-        if self.video_radio.isChecked(): etype = 'video'
-        elif self.tiff_radio.isChecked(): etype = 'tiff'
-        else: etype = 'image_sequence'
-        
+        if self.radio_range.isChecked():
+            start = self.spin_start.value()
+            end = self.spin_end.value()
+            # 确保范围有效
+            if start > end: start, end = end, start
+            data_slice = data[start:end+1]
+        else:
+            data_slice = data
+            
+        etype = 'video' if self.radio_vid.isChecked() else 'tiff' if self.radio_tiff.isChecked() else 'image_sequence'
         params = self._get_export_params()
         
-        self.export_thread = ExportThread(data, str(final_path), etype, params)
-        self.export_thread.progress.connect(lambda c, t: (self.progress_bar.setMaximum(t), self.progress_bar.setValue(c)))
-        self.export_thread.finished.connect(lambda p: self._on_finished(p, params))
+        # 3. 启动线程
+        self.export_thread = ExportThread(data_slice, str(final_path), etype, params)
+        self.export_thread.progress.connect(lambda c, t: self.pbar.setValue(int(c/t*100)))
+        self.export_thread.finished.connect(lambda p: self._on_done(p, params))
         self.export_thread.error.connect(self._on_error)
         self.export_thread.start()
 
-
-    def _on_finished(self, path, params):
-        self.status_label.setText(f"✅ Done: {Path(path).name}")
-        self.progress_bar.setVisible(False)
-        self.export_btn.setEnabled(True)
+    def _on_done(self, path, params):
+        self.lbl_status.setText(f"✅ Done: {Path(path).name}")
+        self.pbar.setVisible(False)
+        self.btn_run.setEnabled(True)
         
-        # === 写入日志 (Log) ===
+        # Log to JSON
+        self._log_export(path, params)
+
+    def _on_error(self, err):
+        self.lbl_status.setText(f"❌ Error: {err}")
+        self.pbar.setVisible(False)
+        self.btn_run.setEnabled(True)
+
+    def _log_export(self, path, params):
         try:
-            # Fix: Read from QSettings
             archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
             if archive_path:
                 log_file = Path(archive_path) / "processing_log.json"
+                data = {}
                 if log_file.exists():
-                    with open(log_file, 'r') as f: log_data = json.load(f)
-                else:
-                    log_data = {}
+                    with open(log_file, 'r') as f: data = json.load(f)
                 
-                if "exports" not in log_data: log_data["exports"] = []
-                
+                if "exports" not in data: data["exports"] = []
                 entry = {
                     "timestamp": str(datetime.datetime.now()),
-                    "file": str(Path(path).relative_to(Path(archive_path)) if Path(archive_path) in Path(path).parents else path),
-                    "type": "video" if self.video_radio.isChecked() else "tiff" if self.tiff_radio.isChecked() else "sequence",
-                    "source_layer": self.layer_combo.currentText(),
+                    "file": str(Path(path).name),
+                    "type": self.export_thread.export_type,
                     "params": params
                 }
-                log_data["exports"].append(entry)
+                data["exports"].append(entry)
                 
-                with open(log_file, 'w') as f: json.dump(log_data, f, indent=2)
-                print("Log updated.")
+                with open(log_file, 'w') as f: json.dump(data, f, indent=2)
         except Exception as e:
-            print(f"Log error: {e}")
-
-    def _on_error(self, msg):
-        self.status_label.setText(f"❌ {msg}")
-        self.progress_bar.setVisible(False)
-        self.export_btn.setEnabled(True)
+            print(f"Log failed: {e}")

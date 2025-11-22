@@ -1,63 +1,57 @@
 """
 几何变换控件 (交互优化版 + 批量ROI提取)
-功能：
-1. 旋转：画线后自动计算角度，自动切换到编辑模式。
-2. 裁剪：单次裁剪模式。
-3. [NEW] 批量ROI提取：支持一次绘制多个矩形，自动命名导出 (at-NP1, at-NP2...) 并生成索引图。
-   - [Update] 支持选择导出格式：TIFF Stack 或 PNG Sequence (文件夹)。
-   - [Fix] 智能选择逻辑优化：优先选择 Contrast_Enh > Contrast_ > Enh_，并在未找到时发出警告。
-   - [Fix] 强制正方形功能 & 快速切换调整模式按钮。
-   - [Fix] 自动清理 Annotation 工具遗留的 Interaction_Box 和 Preview_Overlay。
+修复日志:
+- [Fix] draw_rect 颜色改为淡白色 [1, 1, 1, 0.01]。
+- [Fix] 旋转后自动切换 Simple Crop 的目标图层为旋转后的图层。
+- [Fix] 批量/单次裁剪时强制清理 Interaction_Box / Preview_Overlay。
+- [Fix] 增加越界检查 (Clamp to image bounds)。
+- [New] 增加 "Peek Data" 按钮，按住可临时查看 Data Layer。
+- [UX] 导出时增加模态进度条。
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QHBoxLayout, QComboBox, QGroupBox, 
-                            QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, QMessageBox, QCheckBox)
-from qtpy.QtCore import Qt
+                            QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, QMessageBox, QCheckBox, QProgressDialog)
+from qtpy.QtCore import Qt, QTimer, QSettings
 import numpy as np
 from pathlib import Path
 import cv2
 from PIL import Image, ImageDraw, ImageFont
-# 假设 core.geometry 已经存在于项目中
 from core.geometry import (calculate_rotation_angle, rotate_image_stack, 
                            crop_image_stack, validate_bbox)
-# 复用 utils 中的导出功能
 from utils.video_export import export_to_tiff_stack
 import napari
 import json
 
 class GeometryWidget(QWidget):
-    """几何变换控件"""
     def __init__(self, viewer):
         super().__init__()
         self.viewer = viewer
-        self._is_updating = False # 防止信号递归调用
+        self._is_updating = False 
+        self._force_view_active = False # 是否强制锁定视图层
         self._setup_ui()
+        
+        # 监听图层可见性变化，用于强制显示逻辑
+        self.viewer.layers.events.reordered.connect(self._enforce_view_visibility)
+        # 监听图层增减，自动刷新列表
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
+        # 监听激活图层变化 (用于自动选择)
+        self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
 
     def _setup_ui(self):
-        # 1. 创建最外层布局 (用于放滚动条)
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 2. 创建滚动区域
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-
-        # 3. 创建内容容器
         content_widget = QWidget()
         layout = QVBoxLayout()
 
         title = QLabel("<h3>📐 Geometry & Batch Crop</h3>")
         layout.addWidget(title)
 
-        # 图层选择
-        layer_layout = QHBoxLayout()
-        layer_layout.addWidget(QLabel("Target Layer:"))
-        self.layer_combo = QComboBox()
-        layer_layout.addWidget(self.layer_combo)
-        layout.addLayout(layer_layout)
-
-        refresh_btn = QPushButton("🔄 Refresh Layers")
+        # 全局图层刷新
+        refresh_btn = QPushButton("🔄 Refresh All Layers")
         refresh_btn.clicked.connect(self._refresh_layers)
         layout.addWidget(refresh_btn)
 
@@ -65,6 +59,13 @@ class GeometryWidget(QWidget):
         rotate_group = QGroupBox("1. Rotation (Horizon)")
         rotate_layout = QVBoxLayout()
         
+        # 图层选择
+        h_rot_layer = QHBoxLayout()
+        h_rot_layer.addWidget(QLabel("Target:"))
+        self.rotate_layer_combo = QComboBox()
+        h_rot_layer.addWidget(self.rotate_layer_combo)
+        rotate_layout.addLayout(h_rot_layer)
+
         rotate_layout.addWidget(QLabel("Draw a line to define horizon:"))
         draw_line_btn = QPushButton("✏️ Draw Horizon Line")
         draw_line_btn.clicked.connect(self._draw_rotation_line)
@@ -76,43 +77,91 @@ class GeometryWidget(QWidget):
         self.angle_spin.setRange(-360, 360)
         self.angle_spin.setDecimals(2)
         angle_layout.addWidget(self.angle_spin)
-        
         calc_btn = QPushButton("📐 Recalc")
         calc_btn.clicked.connect(self._calculate_angle)
         angle_layout.addWidget(calc_btn)
         rotate_layout.addLayout(angle_layout)
 
+        # Enlarge 选项
+        self.enlarge_check = QCheckBox("Enlarge Canvas (Fit All)")
+        self.enlarge_check.setToolTip("Expand image size to fit rotated content without cropping")
+        rotate_layout.addWidget(self.enlarge_check)
+
         apply_rotate_btn = QPushButton("✅ Apply Rotation")
         apply_rotate_btn.clicked.connect(self._apply_rotation)
         rotate_layout.addWidget(apply_rotate_btn)
-
         rotate_group.setLayout(rotate_layout)
         layout.addWidget(rotate_group)
 
         # ========== 2. 单次裁剪模块 ==========
         crop_group = QGroupBox("2. Simple Crop (Single)")
         crop_layout = QVBoxLayout()
+        
+        # 图层选择
+        h_crop_layer = QHBoxLayout()
+        h_crop_layer.addWidget(QLabel("Target:"))
+        self.simple_crop_combo = QComboBox()
+        h_crop_layer.addWidget(self.simple_crop_combo)
+        crop_layout.addLayout(h_crop_layer)
+        
         draw_rect_btn = QPushButton("✏️ Draw Rect")
         draw_rect_btn.clicked.connect(self._draw_crop_rect)
         crop_layout.addWidget(draw_rect_btn)
-        
         apply_crop_btn = QPushButton("✂️ Apply Crop (New Layer)")
         apply_crop_btn.clicked.connect(self._apply_crop)
         crop_layout.addWidget(apply_crop_btn)
-        
         crop_group.setLayout(crop_layout)
         layout.addWidget(crop_group)
 
-        # ========== 3. 批量ROI提取 (新功能) ==========
+        # ========== 3. 批量ROI提取 (增强版) ==========
         batch_group = QGroupBox("3. Batch Extraction (Multi-ROI)")
         batch_group.setStyleSheet("QGroupBox { border: 1px solid #4CAF50; margin-top: 10px; } QGroupBox::title { color: #4CAF50; }")
         batch_layout = QVBoxLayout()
+
+        # --- View vs Data Layer Logic ---
+        layer_grid = QVBoxLayout()
+        
+        # Row 1: Data Layer (实际裁剪的层)
+        h_data = QHBoxLayout()
+        h_data.addWidget(QLabel("Data Layer (Crop Source):"))
+        self.batch_data_combo = QComboBox()
+        h_data.addWidget(self.batch_data_combo)
+        layer_grid.addLayout(h_data)
+
+        # Row 2: View Layer (参考显示的层)
+        h_view = QHBoxLayout()
+        h_view.addWidget(QLabel("View Layer (Reference):"))
+        self.batch_view_combo = QComboBox()
+        h_view.addWidget(self.batch_view_combo)
+        layer_grid.addLayout(h_view)
+        
+        # Row 3: Controls & Peek
+        h_sync = QHBoxLayout()
+        self.sync_layers_btn = QPushButton("🔗 Sync Select")
+        self.sync_layers_btn.setToolTip("Set View Layer same as Data Layer")
+        self.sync_layers_btn.clicked.connect(self._sync_batch_layers)
+        h_sync.addWidget(self.sync_layers_btn)
+
+        # Peek Button
+        self.peek_btn = QPushButton("👁️ Peek Data (Hold)")
+        self.peek_btn.setToolTip("Hold to temporarily show Data Layer to check alignment")
+        self.peek_btn.pressed.connect(self._peek_data_layer_show)
+        self.peek_btn.released.connect(self._peek_data_layer_hide)
+        h_sync.addWidget(self.peek_btn)
+        
+        layer_grid.addLayout(h_sync)
+        
+        self.lock_view_check = QCheckBox("🔒 Lock View Layer (Prevent auto-switching)")
+        self.lock_view_check.setChecked(True)
+        layer_grid.addWidget(self.lock_view_check)
+        
+        batch_layout.addLayout(layer_grid)
+        batch_layout.addWidget(QLabel("<hr>")) 
 
         # 物质名输入
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("Substance Name:"))
         self.sample_name_edit = QLineEdit("at")
-        self.sample_name_edit.setPlaceholderText("e.g. at, Au, sample1")
         name_layout.addWidget(self.sample_name_edit)
         batch_layout.addLayout(name_layout)
 
@@ -126,28 +175,20 @@ class GeometryWidget(QWidget):
 
         # 强制正方形选项
         self.force_square_check = QCheckBox("Force Square Crops")
-        self.force_square_check.setChecked(True) # 默认开启
-        self.force_square_check.setToolTip("If checked, newly drawn rectangles will automatically snap to a square shape.")
+        self.force_square_check.setChecked(True) 
         batch_layout.addWidget(self.force_square_check)
 
-        # 工具按钮行
+        # 工具按钮
         tools_layout = QHBoxLayout()
-        
-        # 开始绘制按钮
         self.start_batch_btn = QPushButton("✏️ Start Draw")
-        self.start_batch_btn.setToolTip("Automatically selects the best layer and enters drawing mode.")
         self.start_batch_btn.clicked.connect(self._start_batch_mode)
         self.start_batch_btn.setStyleSheet("background-color: #444; font-weight: bold;")
         tools_layout.addWidget(self.start_batch_btn)
 
-        # 调整按钮 (切换到 Select 模式)
-        self.adjust_batch_btn = QPushButton("🖐️ Adjust / Select")
-        self.adjust_batch_btn.setToolTip("Switch to Select mode to move or resize ROIs.")
+        self.adjust_batch_btn = QPushButton("🖐️ Adjust")
         self.adjust_batch_btn.clicked.connect(self._switch_to_select_mode)
         tools_layout.addWidget(self.adjust_batch_btn)
-
         batch_layout.addLayout(tools_layout)
-        batch_layout.addWidget(QLabel("<i>Draw multiple rectangles. Use 'Adjust' to tweak.</i>"))
 
         # 导出按钮
         self.export_batch_btn = QPushButton("💾 Export Crops & Map")
@@ -158,295 +199,306 @@ class GeometryWidget(QWidget):
         batch_group.setLayout(batch_layout)
         layout.addWidget(batch_group)
 
-        # 状态信息
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #AAA; font-size: 11px;")
         layout.addWidget(self.status_label)
-
         layout.addStretch()
         content_widget.setLayout(layout)
         scroll.setWidget(content_widget)
         main_layout.addWidget(scroll)
         self.setLayout(main_layout)
-
-        self._refresh_layers()
-
-    def _switch_to_select_mode(self):
-        """切换到选择模式，方便用户调整"""
-        if "Batch_ROI" in self.viewer.layers:
-            self.viewer.layers["Batch_ROI"].mode = 'select'
-            self.status_label.setText("🖐️ Mode: Select/Adjust. Drag ROIs to move/resize.")
-        else:
-            self.status_label.setText("❌ No Batch ROI layer found.")
-
-    # ... [保留原有的 _refresh_layers, _on_active_layer_changed, _clear_residue, _update_layer_focus 等辅助函数不变] ...
-    def _refresh_layers(self):
-        """刷新图层列表并自动选中活跃图层"""
-        current_text = self.layer_combo.currentText()
-        self.layer_combo.blockSignals(True)
-        self.layer_combo.clear()
-        for layer in self.viewer.layers:
-            if (hasattr(layer, 'data') and isinstance(layer.data, np.ndarray) 
-                and len(layer.data.shape) == 3):
-                self.layer_combo.addItem(layer.name)
         
-        active_layer = self.viewer.layers.selection.active
-        if active_layer and self.layer_combo.findText(active_layer.name) >= 0:
-            self.layer_combo.setCurrentText(active_layer.name)
-        elif self.layer_combo.findText(current_text) >= 0:
-            self.layer_combo.setCurrentText(current_text)
-        self.layer_combo.blockSignals(False)
+        self._refresh_layers()
+        # 初始化 Batch combos
+        self._sync_batch_layers()
+
+    # --- Layer Management ---
+    def _refresh_layers(self, event=None):
+        """刷新所有下拉框，并保持当前选中项"""
+        # 过滤有效 Image 图层
+        layers = [
+            l.name for l in self.viewer.layers 
+            if hasattr(l, 'data') and isinstance(l.data, np.ndarray) and l.data.ndim == 3
+        ]
+        
+        for combo in [self.rotate_layer_combo, self.simple_crop_combo, 
+                      self.batch_data_combo, self.batch_view_combo]:
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(layers)
+            
+            # 恢复逻辑：如果原来的选中项还在，就选原来的；如果不在，尝试选 Active Layer
+            if current in layers:
+                combo.setCurrentText(current)
+            elif layers:
+                active = self.viewer.layers.selection.active
+                if active and active.name in layers:
+                    combo.setCurrentText(active.name)
+            
+            combo.blockSignals(False)
 
     def _on_active_layer_changed(self, event=None):
-        active_layer = self.viewer.layers.selection.active
-        if active_layer:
-            index = self.layer_combo.findText(active_layer.name)
-            if index >= 0:
-                self.layer_combo.setCurrentIndex(index)
+        """外部图层切换时，自动更新下拉框（除非正在操作）"""
+        if self._force_view_active: return # 批量模式下不跟随
+        active = self.viewer.layers.selection.active
+        if active and hasattr(active, 'data') and isinstance(active.data, np.ndarray) and active.data.ndim == 3:
+            name = active.name
+            # 更新 Simple Crop 和 Rotation 的目标
+            self.rotate_layer_combo.setCurrentText(name)
+            self.simple_crop_combo.setCurrentText(name)
+
+    def _sync_batch_layers(self):
+        txt = self.batch_data_combo.currentText()
+        if txt: self.batch_view_combo.setCurrentText(txt)
+
+    def _enforce_view_visibility(self, event=None):
+        """强制显示 View Layer (Batch模式下)"""
+        if not self._force_view_active: return
+        
+        view_name = self.batch_view_combo.currentText()
+        if not view_name or view_name not in self.viewer.layers: return
+        
+        try:
+            self.viewer.layers.events.reordered.disconnect(self._enforce_view_visibility)
+        except: pass
+        
+        for layer in self.viewer.layers:
+            if isinstance(layer, napari.layers.Image):
+                layer.visible = (layer.name == view_name)
+        
+        self.viewer.layers.events.reordered.connect(self._enforce_view_visibility)
 
     def _clear_residue(self, target_names):
+        """清理指定的临时图层"""
         for name in target_names:
             if name in self.viewer.layers:
                 self.viewer.layers.remove(name)
 
-    def _update_layer_focus(self, new_layer_name):
-        for layer in self.viewer.layers:
-            if isinstance(layer, napari.layers.Image):
-                layer.visible = (layer.name == new_layer_name)
-        if new_layer_name in self.viewer.layers:
-            self.viewer.layers.selection.active = self.viewer.layers[new_layer_name]
-        self._refresh_layers()
-        self.layer_combo.setCurrentText(new_layer_name)
+    # --- Peek Data Logic ---
+    def _peek_data_layer_show(self):
+        """按下 Peek 按钮：显示 Data Layer"""
+        data_name = self.batch_data_combo.currentText()
+        if not data_name or data_name not in self.viewer.layers: return
+        
+        self._force_view_active = False # 临时解锁
+        # 隐藏所有 Image，只显示 Data Layer
+        for l in self.viewer.layers:
+            if isinstance(l, napari.layers.Image):
+                l.visible = (l.name == data_name)
+                
+    def _peek_data_layer_hide(self):
+        """松开 Peek 按钮：恢复 View Layer"""
+        if self.lock_view_check.isChecked():
+            self._force_view_active = True
+            self._enforce_view_visibility() # 强制切回
+        else:
+            # 如果没锁，手动切回 View Layer
+            view_name = self.batch_view_combo.currentText()
+            if view_name in self.viewer.layers:
+                for l in self.viewer.layers:
+                    if isinstance(l, napari.layers.Image):
+                        l.visible = (l.name == view_name)
 
-    # ... [保留原有的旋转和单次裁剪函数不变] ...
+    # --- Rotation ---
     def _draw_rotation_line(self):
-        # FIX: Added Interaction_Box and Preview_Overlay to cleanup list
-        self._clear_residue(["Drift_ROI", "Crop_ROI", "Rotation_Line", "Batch_ROI", "Interaction_Box", "Preview_Overlay"])
-        layer = self.viewer.add_shapes(
-            name="Rotation_Line", shape_type='line', edge_color='cyan', edge_width=4, face_color='transparent'
-        )
+        # 清理所有不相关图层
+        self._clear_residue(["Rotation_Line", "Batch_ROI", "Crop_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
+        layer = self.viewer.add_shapes(name="Rotation_Line", shape_type='line', edge_color='cyan', edge_width=4)
         layer.events.data.connect(self._auto_calculate_angle)
-        self.viewer.layers.selection.active = layer
         layer.mode = 'add_line'
-        self.status_label.setText("✏️ Mode: Draw Line.")
+        self.status_label.setText("✏️ Draw Horizon Line.")
 
     def _auto_calculate_angle(self, event=None):
         layer = self.viewer.layers["Rotation_Line"]
         if layer.mode == 'add_line' and len(layer.data) > 0:
             layer.mode = 'select'
-        self._calculate_angle()
+        if len(layer.data) > 0:
+            line_data = layer.data[-1]
+            p1, p2 = (line_data[0][1], line_data[0][0]), (line_data[1][1], line_data[1][0])
+            angle = calculate_rotation_angle((p1, p2))
+            self.angle_spin.setValue(angle)
 
     def _calculate_angle(self):
-        if "Rotation_Line" not in self.viewer.layers: return
-        layer = self.viewer.layers["Rotation_Line"]
-        if len(layer.data) == 0: return
-        line_data = layer.data[-1]
-        p1 = (line_data[0][1], line_data[0][0])
-        p2 = (line_data[1][1], line_data[1][0])
-        angle = calculate_rotation_angle((p1, p2))
-        self.angle_spin.setValue(angle)
-        self.status_label.setText(f"ℹ️ Angle: {angle:.2f}°")
+        if "Rotation_Line" in self.viewer.layers: self._auto_calculate_angle()
 
     def _apply_rotation(self):
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.rotate_layer_combo.currentText()
         if not layer_name: return
         angle = self.angle_spin.value()
+        expand = self.enlarge_check.isChecked()
         image_stack = self.viewer.layers[layer_name].data
         try:
-            rotated = rotate_image_stack(image_stack, angle)
-            new_layer_name = f"Rotated_{layer_name}"
-            self.viewer.add_image(rotated, name=new_layer_name, colormap='gray')
-            # FIX: Cleanup extra layers
-            self._clear_residue(["Rotation_Line", "Interaction_Box", "Preview_Overlay"])
-            self._update_layer_focus(new_layer_name)
-            self.status_label.setText(f"✅ Rotated by {angle:.2f}°")
+            rotated = rotate_image_stack(image_stack, angle, expand=expand)
+            new_name = f"Rotated_{layer_name}"
+            self.viewer.add_image(rotated, name=new_name, colormap='gray')
+            
+            # 清理 Line
+            self._clear_residue(["Rotation_Line"])
+            
+            # [Fix 1.2] 自动切换 Simple Crop 的目标图层为新图层
+            self.simple_crop_combo.setCurrentText(new_name)
+            self.viewer.layers.selection.active = self.viewer.layers[new_name]
+            
+            self.status_label.setText(f"✅ Rotated {angle:.1f}° (Expand={expand})")
         except Exception as e:
-            self.status_label.setText(f"❌ Error: {str(e)}")
+            self.status_label.setText(f"Error: {e}")
 
+    # --- Simple Crop ---
     def _draw_crop_rect(self):
-        # FIX: Added Interaction_Box and Preview_Overlay to cleanup list
-        self._clear_residue(["Drift_ROI", "Rotation_Line", "Crop_ROI", "Batch_ROI", "Interaction_Box", "Preview_Overlay"])
+        self._clear_residue(["Crop_ROI", "Rotation_Line", "Batch_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
+        # [Fix 1.3] 淡白色填充
         layer = self.viewer.add_shapes(
-            name="Crop_ROI", shape_type='rectangle', edge_color='yellow', face_color=[1, 1, 0, 0.01], edge_width=3
+            name="Crop_ROI", shape_type='rectangle', 
+            edge_color='yellow', edge_width=3,
+            face_color=[1, 1, 1, 0.01] 
         )
         layer.mode = 'add_rectangle'
-        layer.events.data.connect(self._on_crop_rect_drawn)
-        self.viewer.layers.selection.active = layer
-        self.status_label.setText("✏️ Mode: Draw Crop Rectangle.")
-
-    def _on_crop_rect_drawn(self, event=None):
-        layer = self.viewer.layers["Crop_ROI"]
-        if layer.mode == 'add_rectangle' and len(layer.data) > 0:
-            layer.mode = 'select'
+        self.status_label.setText("✏️ Draw Single Crop Rect.")
 
     def _apply_crop(self):
-        target_layer = self.layer_combo.currentText()
-        if not target_layer or "Crop_ROI" not in self.viewer.layers: return
+        target = self.simple_crop_combo.currentText()
+        if not target or "Crop_ROI" not in self.viewer.layers: return
         shapes = self.viewer.layers["Crop_ROI"].data
-        if len(shapes) == 0: return
+        if not shapes: return
+        
         data = shapes[-1]
         ys, xs = data[:, 0], data[:, 1]
-        x1, x2, y1, y2 = int(min(xs)), int(max(xs)), int(min(ys)), int(max(ys))
-        image_stack = self.viewer.layers[target_layer].data
-        try:
-            cropped = crop_image_stack(image_stack, (x1, y1, x2, y2))
-            new_layer_name = f"Cropped_{target_layer}"
-            self.viewer.add_image(cropped, name=new_layer_name, colormap='gray')
-            # FIX: Cleanup extra layers
-            self._clear_residue(["Crop_ROI", "Rotation_Line", "Drift_ROI", "Batch_ROI", "Interaction_Box", "Preview_Overlay"])
-            self._update_layer_focus(new_layer_name)
-            self.status_label.setText("✅ Crop applied.")
-        except Exception as e:
-            self.status_label.setText(f"❌ Error: {str(e)}")
+        bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+        
+        stack = self.viewer.layers[target].data
+        cropped = crop_image_stack(stack, bbox)
+        new_name = f"Cropped_{target}"
+        self.viewer.add_image(cropped, name=new_name, colormap='gray')
+        
+        # [Fix 1.4] 清理 Crop ROI
+        self._clear_residue(["Crop_ROI"])
+        self.viewer.layers.selection.active = self.viewer.layers[new_name]
+        self.status_label.setText(f"✅ Crop applied: {new_name}")
 
-    # =========================================================
-    # NEW: Batch ROI Extraction Logic
-    # =========================================================
+    # --- Batch Crop Logic ---
     def _start_batch_mode(self):
-        target_layer = None
-        priorities = ["Contrast_Enh", "Contrast_", "Enh_", "Corrected_", "Rotated_"]
+        view_layer = self.batch_view_combo.currentText()
+        if not view_layer: return
         
-        all_layers = [self.layer_combo.itemText(i) for i in range(self.layer_combo.count())]
-        for p in priorities:
-            for name in all_layers:
-                if name.startswith(p):
-                    target_layer = name
-                    break
-            if target_layer: break
+        # [Fix 1.5] 清理所有干扰图层
+        self._clear_residue(["Batch_ROI", "Rotation_Line", "Crop_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
         
-        if not target_layer:
-            target_layer = self.layer_combo.currentText()
-        
-        if not target_layer:
-            self.status_label.setText("❌ No image layer found.")
-            return
+        # 1. 确保 View Layer 可见
+        if self.lock_view_check.isChecked():
+            self._force_view_active = True
+            self._enforce_view_visibility()
+        else:
+            self._force_view_active = False
+            for l in self.viewer.layers:
+                if isinstance(l, napari.layers.Image): l.visible = (l.name == view_layer)
 
-        if target_layer in self.viewer.layers:
-            self._update_layer_focus(target_layer)
-            self.layer_combo.setCurrentText(target_layer)
-            
-            if not (target_layer.startswith("Contrast_") or target_layer.startswith("Enh_") or target_layer.startswith("Contrast_Enh")):
-                reply = QMessageBox.warning(
-                    self, 
-                    "Enhancement Check", 
-                    f"Selected layer '{target_layer}' does not appear to be enhanced (Contrast/Enh).\n\n"
-                    "Do you want to continue?",
-                    QMessageBox.Yes | QMessageBox.No, 
-                    QMessageBox.No
-                )
-                if reply == QMessageBox.No:
-                    return
-        
-        # FIX: Added Interaction_Box and Preview_Overlay to cleanup list
-        self._clear_residue(["Drift_ROI", "Crop_ROI", "Rotation_Line", "Batch_ROI", "Interaction_Box", "Preview_Overlay"])
-        
+        # 2. 创建 ROI 层
         roi_layer = self.viewer.add_shapes(
             name="Batch_ROI",
             shape_type='rectangle',
             edge_color='#00FF00', 
             face_color=[0, 1, 0, 0.05],
             edge_width=2,
-            text={
-                'string': '{label}', 
-                'size': 12,
-                'color': 'white',
-                'anchor': 'upper_left',
-                'translation': [-5, -5]
-            }
+            text={'string': '{label}', 'size': 12, 'color': 'white', 'anchor': 'upper_left', 'translation': [-5, -5]}
         )
-        
         roi_layer.events.data.connect(self._on_batch_data_change)
-        
         roi_layer.mode = 'add_rectangle'
-        self.viewer.layers.selection.active = roi_layer
-        
-        self.status_label.setText(f"✏️ Batch: Draw rects on '{target_layer}'. Auto-Square: {self.force_square_check.isChecked()}")
+        self.status_label.setText(f"✏️ Drawing on '{view_layer}'. Data source: '{self.batch_data_combo.currentText()}'")
+
+    def _switch_to_select_mode(self):
+        if "Batch_ROI" in self.viewer.layers:
+            self.viewer.layers["Batch_ROI"].mode = 'select'
+            self.status_label.setText("🖐️ Adjust Mode.")
 
     def _on_batch_data_change(self, event=None):
-        """当批量ROI数据变化时：1. 强制正方形 (如果开启); 2. 更新标号"""
         if self._is_updating: return
         if "Batch_ROI" not in self.viewer.layers: return
         
+        view_layer_name = self.batch_view_combo.currentText()
+        if view_layer_name not in self.viewer.layers: return
+        
+        # 获取图像尺寸用于 Clamp
+        img_layer = self.viewer.layers[view_layer_name]
+        IMG_H, IMG_W = img_layer.data.shape[-2], img_layer.data.shape[-1]
+        
         layer = self.viewer.layers["Batch_ROI"]
-        n_shapes = len(layer.data)
-        if n_shapes == 0: return
-        
+        if len(layer.data) == 0: return
+
         self._is_updating = True
-        
         try:
-            # --- 1. 强制正方形逻辑 ---
-            if self.force_square_check.isChecked():
-                data_list = layer.data
-                new_data_list = []
-                modified = False
+            # 1. Force Square Logic & [Fix 1.6] Clamp to Bounds
+            new_data_list = []
+            modified = False
+            
+            for roi in layer.data:
+                ys, xs = roi[:, 0], roi[:, 1]
+                y1, y2 = np.min(ys), np.max(ys)
+                x1, x2 = np.min(xs), np.max(xs)
                 
-                for roi in data_list:
-                    # ROI: [[y1, x1], [y2, x1], [y2, x2], [y1, x2]] (approx)
-                    ys, xs = roi[:, 0], roi[:, 1]
-                    y1, y2 = np.min(ys), np.max(ys)
-                    x1, x2 = np.min(xs), np.max(xs)
-                    
-                    h, w = y2 - y1, x2 - x1
-                    
-                    # 允许 1px 误差
-                    if abs(w - h) > 1.0:
-                        # 取最大边长
-                        side = max(w, h)
-                        # 中心点
-                        cy, cx = (y1 + y2) / 2, (x1 + x2) / 2
-                        
-                        # 新坐标
-                        ny1, ny2 = cy - side/2, cy + side/2
-                        nx1, nx2 = cx - side/2, cx + side/2
-                        
-                        # 构造矩形 (Napari 顺序: TL, BL, BR, TR - 或类似，只要四个角对就行)
-                        new_rect = np.array([
-                            [ny1, nx1], [ny2, nx1], [ny2, nx2], [ny1, nx2]
-                        ])
-                        new_data_list.append(new_rect)
-                        modified = True
-                    else:
-                        new_data_list.append(roi)
+                h, w = y2 - y1, x2 - x1
                 
-                if modified:
-                    layer.data = new_data_list
-                    # 注意：设置 layer.data 会再次触发事件，所以必须有 _is_updating 锁
+                needs_reshape = False
+                
+                # 正方形逻辑
+                if self.force_square_check.isChecked() and abs(w - h) > 1.0:
+                    side = int(max(w, h))
+                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    ny1, ny2 = int(cy - side / 2), int(cy - side / 2) + side
+                    nx1, nx2 = int(cx - side / 2), int(cx - side / 2) + side
+                    needs_reshape = True
+                else:
+                    ny1, ny2, nx1, nx2 = y1, y2, x1, x2
+                
+                # [Fix 1.6] Clamp 越界处理
+                ny1 = max(0, min(ny1, IMG_H)); ny2 = max(0, min(ny2, IMG_H))
+                nx1 = max(0, min(nx1, IMG_W)); nx2 = max(0, min(nx2, IMG_W))
+                
+                # 如果被 Clamp 导致变形，不再是正方形，但在边界处只能妥协
+                
+                if needs_reshape or (ny1 != y1 or ny2 != y2 or nx1 != x1 or nx2 != x2):
+                    new_rect = np.array([[ny1, nx1], [ny2, nx1], [ny2, nx2], [ny1, nx2]])
+                    new_data_list.append(new_rect)
+                    modified = True
+                else:
+                    new_data_list.append(roi)
+            
+            if modified:
+                layer.data = new_data_list
 
-            # --- 2. 更新标号逻辑 ---
+            # 2. Update Labels
             labels = [str(i+1) for i in range(len(layer.data))]
-            new_features = {'label': labels}
+            if hasattr(layer, 'features'): layer.features = {'label': labels}
+            elif hasattr(layer, 'properties'): layer.properties = {'label': labels}
             
-            if hasattr(layer, 'features'):
-                layer.features = new_features
-            elif hasattr(layer, 'properties'):
-                layer.properties = new_features
-            
-            # 不需要调用 layer.refresh()，设置 features/data 会自动刷新
-
         finally:
             self._is_updating = False
 
     def _export_batch_crops(self):
-        """Modified: Uses Archive Path and updates JSON log."""
-        if "Batch_ROI" not in self.viewer.layers or len(self.viewer.layers["Batch_ROI"].data) == 0:
-            self.status_label.setText("❌ No ROIs.")
+        data_layer_name = self.batch_data_combo.currentText()
+        view_layer_name = self.batch_view_combo.currentText()
+        
+        if "Batch_ROI" not in self.viewer.layers or not len(self.viewer.layers["Batch_ROI"].data):
+            self.status_label.setText("❌ No ROIs defined.")
             return
-        target = self.layer_combo.currentText()
-        if target not in self.viewer.layers: return
-        
-        stack = self.viewer.layers[target].data
-        sub_name = self.sample_name_edit.text().strip() or "sample"
+        if not data_layer_name or data_layer_name not in self.viewer.layers:
+            self.status_label.setText("❌ Invalid Data Layer.")
+            return
 
-        # === Auto-detect Archive ===
-        from qtpy.QtCore import QSettings
-        archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-        # archive_path = self.viewer.metadata.get('archive_path')
+        # 检查尺寸匹配
+        data_stack = self.viewer.layers[data_layer_name].data
+        view_stack = self.viewer.layers[view_layer_name].data
         
+        if data_stack.shape[-2:] != view_stack.shape[-2:]:
+            QMessageBox.warning(self, "Mismatch", "Data Layer and View Layer sizes do not match! Crops may be misaligned.")
+
+        sub_name = self.sample_name_edit.text().strip() or "sample"
+        
+        # 归档路径检测
+        archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
         if archive_path and Path(archive_path).exists():
-            # If archived, save to root of archive (as requested)
             output_dir = Path(archive_path)
-            self.status_label.setText(f"📂 Saving to Archive: {output_dir.name}")
         else:
             d = QFileDialog.getExistingDirectory(self, "Select Output")
             if not d: return
@@ -454,93 +506,89 @@ class GeometryWidget(QWidget):
             output_dir.mkdir(parents=True, exist_ok=True)
 
         is_tiff = "TIFF" in self.batch_format_combo.currentText()
+        rois = self.viewer.layers["Batch_ROI"].data
+        log_crops = []
+        count = len(rois)
+
+        # [Fix 3] 添加进度条
+        progress = QProgressDialog("Exporting Crops...", "Cancel", 0, count, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        for i, roi in enumerate(rois):
+            if progress.wasCanceled(): break
+            
+            ys, xs = roi[:, 0], roi[:, 1]
+            bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+            
+            # 使用 Data Layer 进行裁剪
+            crop = crop_image_stack(data_stack, bbox)
+            fname = f"{sub_name}-NP{i+1}"
+            
+            if is_tiff:
+                export_to_tiff_stack(crop, str(output_dir / f"{fname}.tiff"))
+            else:
+                p = output_dir / fname
+                p.mkdir(exist_ok=True)
+                for f_idx, img in enumerate(crop):
+                    # 简单归一化以便预览
+                    if img.dtype in [np.float32, np.float64]:
+                        mn, mx = img.min(), img.max()
+                        if mx > mn: img = ((img - mn)/(mx - mn)*255).astype(np.uint8)
+                        else: img = img.astype(np.uint8)
+                    cv2.imwrite(str(p / f"{f_idx:05d}.png"), img)
+            
+            log_crops.append({"id": i+1, "bbox": bbox, "filename": fname})
+            progress.setValue(i + 1)
+            
+        # 生成 Overview Map (使用 View Layer + 矩形框)
+        self._create_overview_map(view_stack, rois, sub_name, output_dir)
         
-        try:
-            rois = self.viewer.layers["Batch_ROI"].data
-            count = 0
-            log_crops = [] # For JSON
+        # Log to JSON
+        json_path = output_dir / "processing_log.json"
+        data = {}
+        if json_path.exists():
+            try: 
+                with open(json_path, 'r') as f: data = json.load(f)
+            except: pass
+            
+        data["batch_crop"] = {
+            "data_layer": data_layer_name,
+            "view_layer": view_layer_name,
+            "count": count,
+            "rois": log_crops
+        }
+        with open(json_path, 'w') as f: json.dump(data, f, indent=2)
 
-            for i, roi in enumerate(rois):
-                ys, xs = roi[:, 0], roi[:, 1]
-                bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-                if not validate_bbox(stack.shape[1:], bbox): continue
-                
-                crop = crop_image_stack(stack, bbox)
-                fname = f"{sub_name}-NP{i+1}"
-                
-                if is_tiff:
-                    export_to_tiff_stack(crop, str(output_dir / f"{fname}.tiff"))
-                else:
-                    p = output_dir / fname
-                    p.mkdir(exist_ok=True)
-                    for f, img in enumerate(crop):
-                        if img.dtype in [np.float32, np.float64]:
-                            mn, mx = img.min(), img.max()
-                            img = ((img - mn)/(mx - mn)*255).astype(np.uint8) if mx > mn else img.astype(np.uint8)
-                        cv2.imwrite(str(p / f"{f:05d}.png"), img)
-                
-                log_crops.append({"id": i+1, "bbox": bbox, "filename": fname})
-                count += 1
-            
-            self._create_overview_map(stack, rois, sub_name, output_dir)
-            
-            # === Update JSON Log ===
-            json_path = output_dir / "processing_log.json"
-            if json_path.exists():
-                try:
-                    with open(json_path, 'r') as f: data = json.load(f)
-                except: data = {}
-            else: data = {}
-            
-            data["geometry_actions"] = {
-                "source_layer": target,
-                "rotation_angle": self.angle_spin.value(),
-                "crop_count": count,
-                "rois": log_crops
-            }
-            
-            with open(json_path, 'w') as f:
-                json.dump(data, f, indent=2)
-
-            QMessageBox.information(self, "Done", f"Saved {count} crops to:\n{output_dir}")
-            self.status_label.setText(f"✅ Saved {count} crops.")
-            
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
-            print(e)
+        progress.setValue(count)
+        progress.close()
+        
+        self.status_label.setText(f"✅ Exported {count} crops to {output_dir.name}")
+        self._force_view_active = False # 解锁视图
+        
+        QMessageBox.information(self, "Success", f"Successfully exported {count} crops!\nSaved to: {output_dir.name}")
 
     def _create_overview_map(self, image_stack, rois, sample_name, output_dir):
-        if len(image_stack) > 0:
-            mid_idx = len(image_stack) // 2
-            bg_img = image_stack[mid_idx]
-        else:
-            return
-
-        if bg_img.dtype != np.uint8:
-            img_min, img_max = bg_img.min(), bg_img.max()
-            if img_max > img_min:
-                bg_img = ((bg_img - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-            else:
-                bg_img = bg_img.astype(np.uint8)
+        """保存 Overview Map (可视层 + 矩形)"""
+        if len(image_stack) == 0: return
+        # 取中间帧
+        bg_img = image_stack[len(image_stack)//2]
         
+        # 归一化转 RGB
+        if bg_img.dtype != np.uint8:
+            mn, mx = bg_img.min(), bg_img.max()
+            if mx > mn: bg_img = ((bg_img - mn)/(mx - mn)*255).astype(np.uint8)
+            else: bg_img = bg_img.astype(np.uint8)
+            
         pil_img = Image.fromarray(bg_img).convert("RGB")
         draw = ImageDraw.Draw(pil_img)
-        
-        try:
-            font = ImageFont.truetype("arial.ttf", 24)
-        except:
-            font = ImageFont.load_default()
+        try: font = ImageFont.truetype("arial.ttf", 24)
+        except: font = ImageFont.load_default()
 
         for i, roi in enumerate(rois):
             ys, xs = roi[:, 0], roi[:, 1]
-            x1, x2 = int(min(xs)), int(max(xs))
-            y1, y2 = int(min(ys)), int(max(ys))
-            
+            x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
             draw.rectangle([x1, y1, x2, y2], outline="yellow", width=3)
+            draw.text((x1, y1 - 25 if y1 > 25 else y1+5), f"NP{i+1}", fill="yellow", font=font)
             
-            label = f"NP{i+1}"
-            text_pos = (x1, y1 - 25 if y1 > 25 else y1 + 5)
-            draw.text(text_pos, label, fill="yellow", font=font)
-
-        map_filename = f"{sample_name}_Overview.png"
-        pil_img.save(output_dir / map_filename)
+        pil_img.save(output_dir / f"{sample_name}_Overview.png")
