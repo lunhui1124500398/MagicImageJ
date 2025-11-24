@@ -4,7 +4,7 @@ TEM Data Processing Workflow - Napari GUI
 [Fix] 增加了 resize 初始化，防止界面在启动时过大。
 """
 import napari
-from qtpy.QtWidgets import QTabWidget, QDockWidget
+from qtpy.QtWidgets import QTabWidget, QDockWidget, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLabel
 from qtpy.QtCore import Qt, QTimer, QSettings
 from widgets.import_widget import ImportWidget
 from widgets.drift_widget import DriftCorrectionWidget
@@ -12,6 +12,7 @@ from widgets.geometry_widget import GeometryWidget
 from widgets.enhance_widget import EnhanceWidget
 from widgets.annotation_widget import AnnotationWidget
 from widgets.export_widget import ExportWidget
+from widgets.settings_widget import SettingsDialog, GlobalConfig
 
 class TEMWorkflow:
     def __init__(self):
@@ -25,8 +26,64 @@ class TEMWorkflow:
         QTimer.singleShot(100, self._setup_hotkeys_and_init_view)
 
     def _setup_widgets(self):
+        # === 1. 创建一个主容器 (Wrapper) ===
+        # 用它来包裹 "顶部工具栏" 和 "Tab组件"
+        main_container = QWidget()
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0) # 紧凑布局
+
+        # === 2. 创建顶部工具栏 (Toolbar) ===
+        toolbar = QWidget()
+        # toolbar.setStyleSheet("background-color: #262626; border-bottom: 1px solid #333;") # 可选：加个底色区分
+        toolbar.setStyleSheet("background: transparent;")
+        h_bar = QHBoxLayout()
+        h_bar.setContentsMargins(4, 0, 4, 0) 
+        h_bar.setSpacing(0)
+        common_font = '"Segoe UI", "Microsoft YaHei", "San Francisco", "Helvetica Neue", sans-serif'
+
+        # (可选) 左侧加一个小标题，显得不那么空
+        lbl_title = QLabel("Workflow Tools")
+        lbl_title.setStyleSheet(f"""
+            color: #777; 
+            font-weight: bold; 
+            font-size: 10px; 
+            font-family: {common_font};
+            margin-top: 2px;
+        """)
+        h_bar.addWidget(lbl_title)
+        
+        h_bar.addStretch() # 弹簧：把右边的按钮顶过去
+
+        # === 设置按钮 (移到这里) ===
+        btn_settings = QPushButton("⚙️")
+        btn_settings.setToolTip("Global Settings & Shortcuts")
+        btn_settings.setCursor(Qt.PointingHandCursor)
+        # 字体大小可以放心设大一点，因为现在高度不受限制了
+        btn_settings.setStyleSheet("""
+            QPushButton { 
+                border: none; 
+                background: transparent; 
+                font-size: 16px; /* 稍微减小图标尺寸 */
+                padding: 2px;    /* 减小内边距 */
+                margin: 0px;
+            } 
+            QPushButton:hover { 
+                color: #2196F3; 
+                background: #383838; /* 鼠标悬停时给一个淡淡的背景，提升交互感 */
+                border-radius: 3px;
+            }
+        """)
+        btn_settings.clicked.connect(self._open_settings)
+        h_bar.addWidget(btn_settings)
+        
+        toolbar.setLayout(h_bar)
+        main_layout.addWidget(toolbar)
+
         """设置所有控制面板"""
         self.tab_widget = QTabWidget()
+        # self.tab_widget.setCornerWidget(btn_settings, Qt.TopRightCorner)
+
         # === 界面美化：全局样式表 (增加留白与现代感) ===
         self.tab_widget.setStyleSheet("""
             QWidget {
@@ -113,11 +170,32 @@ class TEMWorkflow:
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
-        self.viewer.window.add_dock_widget(
-            self.tab_widget, 
+        # === 4. 将 Tab 加入主布局 ===
+        main_layout.addWidget(self.tab_widget)
+        main_container.setLayout(main_layout)
+
+        # === 5. 添加 Dock Widget (注意：这里放入的是 main_container) ===
+        dock = self.viewer.window.add_dock_widget(
+            main_container, 
             area='right', 
             name='TEM Workflow'
         )
+
+        dock.setStyleSheet(f"""
+            QDockWidget {{
+                font-family: {common_font};
+                font-size: 10pt;
+            }}
+            QDockWidget::title {{
+                font-family: {common_font};
+                background: #262626; /* 可选：让标题栏背景也融入暗色主题 */
+                padding-left: 5px;
+            }}
+        """)
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.viewer.window._qt_window)
+        dlg.exec_()
 
     def _setup_hotkeys_and_init_view(self):
         """设置快捷键并初始化视图状态 (隐藏不必要的面板)"""
@@ -137,7 +215,8 @@ class TEMWorkflow:
                     targets.append(dock)
             return targets
 
-        @self.viewer.bind_key('j')
+        toggle_key = GlobalConfig.get_napari_shortcut("shortcut_toggle_ui")
+        @self.viewer.bind_key(toggle_key)
         def toggle_left_view(viewer):
             """
             J 键逻辑：

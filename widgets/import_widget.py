@@ -229,7 +229,8 @@ class ImportWidget(QWidget):
         l_dose.addWidget(self.meta_info_label); g_dose.setLayout(l_dose); layout.addWidget(g_dose)
 
         g_exp = QGroupBox("3. Archive Configuration"); g_exp.setStyleSheet("QGroupBox { border: 1px solid #2196F3; margin-top: 6px; } QGroupBox::title { color: #2196F3; }"); l_exp = QVBoxLayout(); l_exp.setSpacing(4); l_exp.setContentsMargins(8, 12, 8, 8)
-        h1 = QHBoxLayout(); self.substance_edit = QLineEdit(); self.substance_edit.setPlaceholderText("Sub (e.g. at)")
+        h1 = QHBoxLayout(); self.substance_edit = QComboBox(); self.substance_edit.setEditable(True); self.substance_edit.setPlaceholderText("Sub (e.g. CRY2)");self.substance_edit.setMinimumWidth(100);
+        self._load_substance_history()
         self.solvent_edit = QLineEdit(); self.solvent_edit.setPlaceholderText("Solv (Default: Water)")
         self.dataset_edit = QLineEdit("ds1"); self.dataset_edit.setFixedWidth(50); self.dataset_edit.setPlaceholderText("ds#")
         h1.addWidget(QLabel("Sub:")); h1.addWidget(self.substance_edit); h1.addWidget(QLabel("Solv:")); h1.addWidget(self.solvent_edit); h1.addWidget(QLabel("ID:")); h1.addWidget(self.dataset_edit); l_exp.addLayout(h1)
@@ -306,7 +307,7 @@ class ImportWidget(QWidget):
 
     def _generate_folder_name(self):
         date_str = self.meta_cache.get('date_fmt', datetime.datetime.now().strftime("%Y%m%d"))
-        sub = self.substance_edit.text().strip() or "Sample"
+        sub = self.substance_edit.currentText().strip() or "Sample"
         sol = self.solvent_edit.text().strip() or "Water"
         ds = self.dataset_edit.text().strip() or "ds1"
         win = self.win_spin.value()
@@ -323,8 +324,37 @@ class ImportWidget(QWidget):
         name = self._generate_folder_name()
         self.preview_label.setText(name)
 
+    def _load_substance_history(self):
+        history = self.settings.value("substance_history", [])
+        if history:
+            self.substance_edit.addItems(history)
+            self.substance_edit.setCurrentIndex(0) # 默认选最近的一个
+
+    def _save_substance_history(self):
+        """在归档时调用此方法"""
+        current_text = self.substance_edit.currentText().strip()
+        if not current_text: return
+        
+        history = self.settings.value("substance_history", [])
+        # 移除重复项，并将当前项插到最前
+        if current_text in history:
+            history.remove(current_text)
+        history.insert(0, current_text)
+        
+        # 只保留最近5个
+        history = history[:5]
+        self.settings.setValue("substance_history", history)
+        
+        # 刷新UI
+        self.substance_edit.blockSignals(True)
+        self.substance_edit.clear()
+        self.substance_edit.addItems(history)
+        self.substance_edit.setCurrentText(current_text)
+        self.substance_edit.blockSignals(False)
+
     def _create_archive(self):
         if not self.current_folder: return
+        self._save_substance_history()
         parent_dir = Path(self.current_folder).parent
         folder_name = self._generate_folder_name()
         archive_path = parent_dir / folder_name

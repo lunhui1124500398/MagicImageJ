@@ -16,6 +16,7 @@ import napari
 import json
 from pathlib import Path
 import datetime
+from widgets.settings_widget import GlobalConfig
 
 # 导入核心算法
 from core.drift_correction import (calculate_drift_curve, 
@@ -98,6 +99,7 @@ class DriftCorrectionWidget(QWidget):
         self.calc_thread = None
         self.apply_thread = None
         self.correction_history = []  # [新增] 用于管理生成的校正图层
+        self._load_params() # [新增] 初始化时加载参数
         self._setup_ui()
         
         # 监听图层事件
@@ -147,14 +149,15 @@ class DriftCorrectionWidget(QWidget):
         self.kernel_spin = QSpinBox()
         self.kernel_spin.setRange(3, 51)
         self.kernel_spin.setSingleStep(2)
-        self.kernel_spin.setValue(11)
+        self.kernel_spin.setValue(int(GlobalConfig.get("drift_kernel"))) 
         param_layout.addWidget(self.kernel_spin)
         
         param_layout.addWidget(QLabel("Workers:"))
         self.max_workers_spin = QSpinBox()
         self.max_workers_spin.setRange(1, 32)
-        self.max_workers_spin.setValue(8)
+        self.max_workers_spin.setValue(int(GlobalConfig.get("drift_workers")))
         param_layout.addWidget(self.max_workers_spin)
+        
         layout.addLayout(param_layout)
 
         # 步骤1：绘制ROI
@@ -217,6 +220,12 @@ class DriftCorrectionWidget(QWidget):
         self.setLayout(main_layout)
         self._refresh_layers()
 
+        self.kernel_spin.valueChanged.connect(lambda v: GlobalConfig.set("drift_kernel", v))
+        self.max_workers_spin.valueChanged.connect(lambda v: GlobalConfig.set("drift_workers", v))
+
+    def _load_params(self):
+        pass
+
     def _refresh_layers(self, event=None):
         current_text = self.layer_combo.currentText()
         self.layer_combo.blockSignals(True)
@@ -255,8 +264,9 @@ class DriftCorrectionWidget(QWidget):
         else:
             layer = self.viewer.add_shapes(name=roi_layer_name, edge_color='red', edge_width=2, face_color=[1, 0, 0, 0.01])
             layer.mouse_drag_callbacks.append(self._on_roi_interaction)
-            
-            @layer.bind_key('z')
+
+            undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")      
+            @layer.bind_key(undo_key)
             def clear_roi(layer):
                 if len(layer.data) > 0:
                     layer.data = []
@@ -385,8 +395,9 @@ class DriftCorrectionWidget(QWidget):
                 oldest_layer = self.correction_history.pop(0)
                 if oldest_layer in self.viewer.layers:
                     self.viewer.layers.remove(oldest_layer)
-
-            @new_layer.bind_key('z')
+            
+            undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+            @new_layer.bind_key(undo_key)
             def undo_correction(layer):
                 self._undo_last_correction(layer)
             

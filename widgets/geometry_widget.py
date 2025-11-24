@@ -22,6 +22,7 @@ from core.geometry import (calculate_rotation_angle, rotate_image_stack,
 from utils.video_export import export_to_tiff_stack
 import napari
 import json
+from widgets.settings_widget import GlobalConfig
 
 class GeometryWidget(QWidget):
     def __init__(self, viewer):
@@ -38,6 +39,12 @@ class GeometryWidget(QWidget):
         self.viewer.layers.events.removed.connect(self._refresh_layers)
         # 监听激活图层变化 (用于自动选择)
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
+
+        apply_key = GlobalConfig.get_napari_shortcut("shortcut_apply_crop")
+        switch_key = GlobalConfig.get_napari_shortcut("shortcut_switch_mode")
+        
+        self.viewer.bind_key(apply_key, self._on_shortcut_apply)
+        self.viewer.bind_key(switch_key, self._on_shortcut_switch)
 
     def _setup_ui(self):
         main_layout = QVBoxLayout()
@@ -243,6 +250,33 @@ class GeometryWidget(QWidget):
         batch_group.setLayout(batch_layout)
         layout.addWidget(batch_group)
 
+        # 1. Suffix (Batch Extraction 部分创建的)
+        self.suffix_edit.setText(GlobalConfig.get("geo_suffix"))
+        self.suffix_edit.textChanged.connect(lambda t: GlobalConfig.set("geo_suffix", t))
+        
+        # 2. Keep Index (Batch Extraction 部分创建的)
+        # 注意：QSettings 有时返回字符串 'true'/'false'，有时返回 bool，这里做个兼容处理
+        val_keep = GlobalConfig.get("geo_keep_index")
+        is_checked_keep = (val_keep == 'true') if isinstance(val_keep, str) else bool(val_keep)
+        self.keep_index_check.setChecked(is_checked_keep)
+        self.keep_index_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_keep_index", bool(v)))
+        
+        # 3. Padding (Batch Extraction 部分创建的)
+        self.padding_spin.setValue(int(GlobalConfig.get("geo_padding")))
+        self.padding_spin.valueChanged.connect(lambda v: GlobalConfig.set("geo_padding", v))
+        
+        # 4. Force Square (Batch Extraction 部分创建的)
+        val_sq = GlobalConfig.get("geo_force_square")
+        is_checked_sq = (val_sq == 'true') if isinstance(val_sq, str) else bool(val_sq)
+        self.force_square_check.setChecked(is_checked_sq)
+        self.force_square_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_force_square", bool(v)))
+
+        # 5. Enlarge Canvas (Rotation 部分创建的)
+        val_enl = GlobalConfig.get("geo_enlarge")
+        is_checked_enl = (val_enl == 'true') if isinstance(val_enl, str) else bool(val_enl)
+        self.enlarge_check.setChecked(is_checked_enl)
+        self.enlarge_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_enlarge", bool(v)))
+
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #AAA; font-size: 11px;")
@@ -256,6 +290,28 @@ class GeometryWidget(QWidget):
         self._refresh_layers()
         # 初始化 Batch combos
         self._sync_batch_layers()
+
+    def _on_shortcut_apply(self, viewer):
+        """按下 Enter 键：根据当前激活的 Tab 区域决定执行什么"""
+        # 判断当前哪个GroupBox是逻辑焦点比较难，但通常如果是 Batch 模式下有 ROI，就导出 Batch
+        if "Batch_ROI" in self.viewer.layers and len(self.viewer.layers["Batch_ROI"].data) > 0:
+            self._export_batch_crops()
+            self.status_label.setText("⚡ Shortcut: Batch Export Triggered")
+        elif "Crop_ROI" in self.viewer.layers and len(self.viewer.layers["Crop_ROI"].data) > 0:
+            self._apply_crop()
+            self.status_label.setText("⚡ Shortcut: Single Crop Triggered")
+
+    def _on_shortcut_switch(self, viewer):
+        """按下 M 键：切换绘制/选择模式"""
+        # 针对 Batch ROI
+        if "Batch_ROI" in self.viewer.layers:
+            layer = self.viewer.layers["Batch_ROI"]
+            if layer.mode == 'add_rectangle':
+                layer.mode = 'select'
+                self.status_label.setText("⚡ Mode: Select/Adjust")
+            else:
+                layer.mode = 'add_rectangle'
+                self.status_label.setText("⚡ Mode: Draw")
 
     # --- Layer Management ---
     def _refresh_layers(self, event=None):
