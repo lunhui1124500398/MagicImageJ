@@ -150,18 +150,17 @@ class ExportWidget(QWidget):
         self.radio_all.setChecked(True)
         self.radio_range = QRadioButton("Range")
         
-        self.spin_start = QSpinBox(); self.spin_start.setEnabled(False)
-        self.spin_end = QSpinBox(); self.spin_end.setEnabled(False)
+        self.edit_frame_range = QLineEdit()
+        self.edit_frame_range.setPlaceholderText("e.g. 0-10, 15, 20-25")
+        self.edit_frame_range.setEnabled(False)
+        self.edit_frame_range.setToolTip("Supported formats:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12")
         
         # 联动逻辑
-        self.radio_range.toggled.connect(lambda c: (self.spin_start.setEnabled(c), self.spin_end.setEnabled(c)))
+        self.radio_range.toggled.connect(self.edit_frame_range.setEnabled)
         
         l_range.addWidget(self.radio_all)
         l_range.addWidget(self.radio_range)
-        l_range.addWidget(QLabel("From:"))
-        l_range.addWidget(self.spin_start)
-        l_range.addWidget(QLabel("To:"))
-        l_range.addWidget(self.spin_end)
+        l_range.addWidget(self.edit_frame_range)
         self.g_range.setLayout(l_range)
         layout.addWidget(self.g_range)
 
@@ -198,7 +197,7 @@ class ExportWidget(QWidget):
         h_fps.addWidget(QLabel("FPS:"))
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 120)
-        self.spin_fps.setValue(30)
+        self.spin_fps.setValue(60)
         h_fps.addWidget(self.spin_fps)
         l_vid.addLayout(h_fps)
         
@@ -213,7 +212,7 @@ class ExportWidget(QWidget):
         h_qual.addWidget(QLabel("Quality (0-100):"))
         self.spin_qual = QSpinBox()
         self.spin_qual.setRange(1, 100)
-        self.spin_qual.setValue(95)
+        self.spin_qual.setValue(100)
         h_qual.addWidget(self.spin_qual)
         l_vid.addLayout(h_qual)
         
@@ -304,6 +303,7 @@ class ExportWidget(QWidget):
         self.g_seq_set.setVisible(is_seq)
         
     def _refresh_layers(self, event=None):
+        self._restore_last_path()
         curr = self.layer_combo.currentText()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
@@ -330,12 +330,12 @@ class ExportWidget(QWidget):
         if txt not in self.viewer.layers: return
         layer = self.viewer.layers[txt]
         
-        # 更新 Frame Range 上限
-        num_frames = layer.data.shape[0]
-        self.spin_start.setMaximum(num_frames - 1)
-        self.spin_end.setMaximum(num_frames - 1)
-        self.spin_end.setValue(num_frames - 1)
-        self.spin_start.setValue(0)
+        if hasattr(layer, 'data'):
+            num_frames = layer.data.shape[0]
+            # 在 Tooltip 和 Placeholder 中提示用户当前图层的有效帧范围
+            valid_range_str = f"0-{num_frames - 1}"
+            self.edit_frame_range.setPlaceholderText(f"All (Default) or e.g. {valid_range_str}")
+            self.edit_frame_range.setToolTip(f"Valid frames: 0 to {num_frames - 1}\nSupported syntax:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12")
         
         # 如果是RGB层，禁用Annotation覆盖 (因为Annotation模块通常处理单通道叠加)
         is_rgb = (layer.data.ndim == 4) or (hasattr(layer, 'rgb') and layer.rgb)
@@ -379,10 +379,13 @@ class ExportWidget(QWidget):
         else:
             # 回退到本地记忆
             last = self.settings.value("last_output", "")
-            if last:
+            if last and Path(last).exists():
                 self.output_path = last
                 self.lbl_path.setText(last)
                 self.btn_run.setEnabled(True)
+            else:
+                self.lbl_path.setText("No path selected")
+                self.btn_run.setEnabled(False)
 
     def _get_export_params(self):
         params = {}
@@ -492,18 +495,31 @@ class ExportWidget(QWidget):
         # 2. 准备数据 (切片处理)
         layer = self.viewer.layers[layer_name]
         data = layer.data
+        total_frames = data.shape[0]
+
+        selected_indices = None # 用于记录日志
         
         if self.radio_range.isChecked():
-            start = self.spin_start.value()
-            end = self.spin_end.value()
-            # 确保范围有效
-            if start > end: start, end = end, start
-            data_slice = data[start:end+1]
+            # [修改] 使用解析函数
+            text = self.edit_frame_range.text()
+            indices = self._parse_frame_indices(text, total_frames)
+            
+            if not indices:
+                self.lbl_status.setText("❌ Invalid frame range syntax")
+                self.btn_run.setEnabled(True)
+                return
+            
+            # 使用 numpy 索引数组进行切片 (Fancy Indexing)
+            data_slice = data[indices]
+            selected_indices = text # 记录原始字符串
         else:
             data_slice = data
+            selected_indices = "All"
             
         etype = 'video' if self.radio_vid.isChecked() else 'tiff' if self.radio_tiff.isChecked() else 'image_sequence'
         params = self._get_export_params()
+
+        params['frame_range'] = selected_indices
         
         # 3. 启动线程
         self.export_thread = ExportThread(data_slice, str(final_path), etype, params)
@@ -546,3 +562,27 @@ class ExportWidget(QWidget):
                 with open(log_file, 'w') as f: json.dump(data, f, indent=2)
         except Exception as e:
             print(f"Log failed: {e}")
+    
+    def _parse_frame_indices(self, text, total_frames):
+        """解析帧范围字符串，返回排序后的去重索引列表"""
+        indices = set()
+        try:
+            parts = [p.strip() for p in text.split(',')]
+            for p in parts:
+                if not p: continue
+                if '-' in p:
+                    # 处理范围 (如 5-10)
+                    start, end = map(int, p.split('-'))
+                    # 限制范围在有效帧数内，且包含 end
+                    start = max(0, start)
+                    end = min(total_frames - 1, end)
+                    if start <= end:
+                        indices.update(range(start, end + 1))
+                else:
+                    # 处理单帧 (如 5)
+                    idx = int(p)
+                    if 0 <= idx < total_frames:
+                        indices.add(idx)
+            return sorted(list(indices))
+        except ValueError:
+            return []

@@ -10,7 +10,8 @@
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QHBoxLayout, QComboBox, QGroupBox, 
-                            QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, QMessageBox, QCheckBox, QProgressDialog)
+                            QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, 
+                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox)
 from qtpy.QtCore import Qt, QTimer, QSettings
 import numpy as np
 from pathlib import Path
@@ -85,6 +86,7 @@ class GeometryWidget(QWidget):
         # Enlarge 选项
         self.enlarge_check = QCheckBox("Enlarge Canvas (Fit All)")
         self.enlarge_check.setToolTip("Expand image size to fit rotated content without cropping")
+        self.enlarge_check.setChecked(True)
         rotate_layout.addWidget(self.enlarge_check)
 
         apply_rotate_btn = QPushButton("✅ Apply Rotation")
@@ -161,18 +163,60 @@ class GeometryWidget(QWidget):
         # 物质名输入
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("Substance Name:"))
-        self.sample_name_edit = QLineEdit("at")
+        self.sample_name_edit = QLineEdit("CRY2")
         name_layout.addWidget(self.sample_name_edit)
+
+        # === [新增功能 4] 自定义后缀输入 ===
+        name_layout.addWidget(QLabel("Suffix:"))
+        self.suffix_edit = QLineEdit("-NP{}")
+        self.suffix_edit.setPlaceholderText("e.g. -NP{} or -{}")
+        self.suffix_edit.setFixedWidth(80)
+        self.suffix_edit.setToolTip("Use {} as placeholder for number.\nExample: '-NP{}' -> '-NP1'")
+        name_layout.addWidget(self.suffix_edit)
+        # ================================
         batch_layout.addLayout(name_layout)
 
         # 格式选择
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel("Export Format:"))
         self.batch_format_combo = QComboBox()
-        self.batch_format_combo.addItems(["TIFF Stack (.tiff)", "PNG Sequence (Folder)"])
+        self.batch_format_combo.addItems(["PNG Sequence (Folder)","TIFF Stack (.tiff)"])
         format_layout.addWidget(self.batch_format_combo)
         batch_layout.addLayout(format_layout)
 
+        # === [新增] 帧范围过滤 ===
+        frame_layout = QHBoxLayout()
+        frame_layout.addWidget(QLabel("Frame Filter:"))
+        self.batch_frame_edit = QLineEdit()
+        self.batch_frame_edit.setPlaceholderText("All (Default) or 0-10, 15...")
+        self.batch_frame_edit.setToolTip("Leave empty for All frames.\nOr use: 0-10, 15, 20-25")
+        frame_layout.addWidget(self.batch_frame_edit)
+        batch_layout.addLayout(frame_layout)
+        # ========================
+
+        # === [新增功能] 序列命名设置 (Keep Index & Padding) ===
+        naming_layout = QHBoxLayout()
+
+        # 1. 保留原始帧号
+        self.keep_index_check = QCheckBox("Keep Original Frame Index")
+        self.keep_index_check.setChecked(True) # 默认勾选，符合用户现在的需求
+        self.keep_index_check.setToolTip("Checked: Frame 48 -> 00048.png\nUnchecked: Frame 48 -> 00000.png")
+        naming_layout.addWidget(self.keep_index_check)
+
+        # 2. 数字位数设置
+        naming_layout.addWidget(QLabel("Padding:"))
+        self.padding_spin = QSpinBox()
+        self.padding_spin.setRange(1, 12)
+        self.padding_spin.setValue(5) # 默认5位
+        self.padding_spin.setSuffix(" digits")
+        self.padding_spin.setToolTip("Example: 5 digits -> 00048.png; 8 digits -> 00000048.png")
+        naming_layout.addWidget(self.padding_spin)
+        
+        # 弹簧撑开
+        naming_layout.addStretch()
+        batch_layout.addLayout(naming_layout)
+        # ===================================================
+        
         # 强制正方形选项
         self.force_square_check = QCheckBox("Force Square Crops")
         self.force_square_check.setChecked(True) 
@@ -232,12 +276,62 @@ class GeometryWidget(QWidget):
             # 恢复逻辑：如果原来的选中项还在，就选原来的；如果不在，尝试选 Active Layer
             if current in layers:
                 combo.setCurrentText(current)
-            elif layers:
+            # 这里的 active layer fallback 逻辑保留给 rotate/simple crop
+            elif layers and combo in [self.rotate_layer_combo, self.simple_crop_combo]:
                 active = self.viewer.layers.selection.active
                 if active and active.name in layers:
                     combo.setCurrentText(active.name)
             
             combo.blockSignals(False)
+        
+        # === [新增功能 2] 自动选择 Batch Data/View Layer ===
+        # 逻辑：Data Layer 优先找 Rotated/Cropped (原始数据)，View Layer 优先找 Contrast/Enh (增强数据)
+        self.batch_data_combo.blockSignals(True)
+        self.batch_view_combo.blockSignals(True)
+
+        # 1. 自动选择 Data Layer (Crop Source)
+        data_candidates = [l for l in layers if l.startswith("Cropped_Rotated")]
+        # Fallback: 如果没有严格匹配的，尝试找包含 Rotated 且不含 Enh/Contrast 的
+        if not data_candidates:
+             data_candidates = [l for l in layers if "Rotated" in l and "Enh" not in l and "Contrast" not in l and "Burned" not in l]
+        # 如果当前没选或者选的不在列表中，且有推荐候选，则自动选择最新的一个
+        if data_candidates:
+            self.batch_data_combo.setCurrentText(data_candidates[-1])
+
+        # 2. 自动选择 View Layer (Reference) - 优先找对比度增强过的
+        view_candidates = [l for l in layers if l.startswith("Contrast_Enh")]
+        if not view_candidates:
+            view_candidates = [l for l in layers if l.startswith("Enh")]
+        # 如果有增强图，选最新的增强图；如果没有，默认跟 Data Layer 一样
+        if view_candidates:
+            self.batch_view_combo.setCurrentText(view_candidates[-1])
+        elif self.batch_data_combo.currentText():
+            self.batch_view_combo.setCurrentText(self.batch_data_combo.currentText())
+
+        self.batch_data_combo.blockSignals(False)
+        self.batch_view_combo.blockSignals(False)
+
+        # === [新增功能 3] 尝试从归档读取 Substance Name ===
+        self._try_load_archived_substance()
+
+    def _try_load_archived_substance(self):
+        """尝试从全局归档路径读取 readme.txt 中的物质名"""
+        try:
+            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+            if not archive_path: return
+            
+            readme_path = Path(archive_path) / "readme.txt"
+            if readme_path.exists():
+                with open(readme_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.startswith("Substance:"):
+                            # 提取 Substance: 后的内容
+                            name = line.split(":", 1)[1].strip()
+                            if name: 
+                                self.sample_name_edit.setText(name)
+                            break
+        except Exception:
+            pass
 
     def _on_active_layer_changed(self, event=None):
         """外部图层切换时，自动更新下拉框（除非正在操作）"""
@@ -375,6 +469,17 @@ class GeometryWidget(QWidget):
         # [Fix 1.4] 清理 Crop ROI
         self._clear_residue(["Crop_ROI"])
         self.viewer.layers.selection.active = self.viewer.layers[new_name]
+
+        # === [新增功能 1] Crop之后清理显示，只显示Crop出的图层 ===
+        # 只隐藏 Image 图层，且不要隐藏本图层
+        # 也不要隐藏预览层（虽然 clear_residue 已经清理了，但为了健壮性）
+        for layer in self.viewer.layers:
+            if isinstance(layer, napari.layers.Image) and layer.name != new_name:
+                # 排除掉一些不想被误伤的辅助层（可选）
+                if "Preview" not in layer.name: 
+                    layer.visible = False
+        # =====================================================
+
         self.status_label.setText(f"✅ Crop applied: {new_name}")
 
     # --- Batch Crop Logic ---
@@ -489,6 +594,24 @@ class GeometryWidget(QWidget):
         # 检查尺寸匹配
         data_stack = self.viewer.layers[data_layer_name].data
         view_stack = self.viewer.layers[view_layer_name].data
+
+        # === [修改] 应用帧过滤 ===
+        raw_range_text = self.batch_frame_edit.text()
+        total_frames = data_stack.shape[0]
+        selected_indices = self._parse_frame_indices(raw_range_text, total_frames)
+        
+        if not selected_indices:
+            self.status_label.setText("❌ No valid frames selected.")
+            return
+
+        # 这一步很关键：先筛选帧，减少数据量，且排除坏帧
+        # 注意：使用 fancy indexing 会创建副本，内存占用会暂时增加
+        filtered_data_stack = data_stack[selected_indices]
+        keep_original_index = self.keep_index_check.isChecked()
+        pad_width = self.padding_spin.value()
+        # View stack 也要同步筛选，用于生成 overview map (虽然 map 只取中间帧，但最好取筛选后的中间帧)
+        filtered_view_stack = view_stack[selected_indices]
+        # =======================
         
         if data_stack.shape[-2:] != view_stack.shape[-2:]:
             QMessageBox.warning(self, "Mismatch", "Data Layer and View Layer sizes do not match! Crops may be misaligned.")
@@ -522,27 +645,50 @@ class GeometryWidget(QWidget):
             bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
             
             # 使用 Data Layer 进行裁剪
-            crop = crop_image_stack(data_stack, bbox)
-            fname = f"{sub_name}-NP{i+1}"
+            crop = crop_image_stack(filtered_data_stack, bbox)
+
+            # === [新增功能 4] 使用自定义后缀格式 ===
+            suffix_fmt = self.suffix_edit.text()
+            if "{}" not in suffix_fmt:
+                # 如果用户没写 {}，自动补上数字
+                suffix_str = f"{suffix_fmt}{i+1}"
+            else:
+                # 格式化字符串
+                suffix_str = suffix_fmt.replace("{}", str(i+1))
+            
+            fname = f"{sub_name}{suffix_str}"
+            # ===================================
             
             if is_tiff:
                 export_to_tiff_stack(crop, str(output_dir / f"{fname}.tiff"))
             else:
                 p = output_dir / fname
                 p.mkdir(exist_ok=True)
-                for f_idx, img in enumerate(crop):
+                for k, img in enumerate(crop):
                     # 简单归一化以便预览
                     if img.dtype in [np.float32, np.float64]:
                         mn, mx = img.min(), img.max()
                         if mx > mn: img = ((img - mn)/(mx - mn)*255).astype(np.uint8)
                         else: img = img.astype(np.uint8)
-                    cv2.imwrite(str(p / f"{f_idx:05d}.png"), img)
+                    
+                    # === [核心修改] 计算文件名索引 ===
+                    if keep_original_index:
+                        # 使用 selected_indices 中的真实原始帧号
+                        # 注意：crop 的第 k 帧对应 selected_indices 的第 k 个元素
+                        file_idx = selected_indices[k]
+                    else:
+                        # 重置为 0, 1, 2...
+                        file_idx = k
+                    
+                    # 使用 f-string 动态填充零: {file_idx:0{pad_width}d}
+                    file_name = f"{file_idx:0{pad_width}d}.png"
+                    cv2.imwrite(str(p / file_name), img)
             
             log_crops.append({"id": i+1, "bbox": bbox, "filename": fname})
             progress.setValue(i + 1)
             
         # 生成 Overview Map (使用 View Layer + 矩形框)
-        self._create_overview_map(view_stack, rois, sub_name, output_dir)
+        self._create_overview_map(filtered_view_stack, rois, sub_name, output_dir)
         
         # Log to JSON
         json_path = output_dir / "processing_log.json"
@@ -556,6 +702,7 @@ class GeometryWidget(QWidget):
             "data_layer": data_layer_name,
             "view_layer": view_layer_name,
             "count": count,
+            "frame_filter": raw_range_text if raw_range_text else "All", # [修改] 记录筛选参数
             "rois": log_crops
         }
         with open(json_path, 'w') as f: json.dump(data, f, indent=2)
@@ -592,3 +739,25 @@ class GeometryWidget(QWidget):
             draw.text((x1, y1 - 25 if y1 > 25 else y1+5), f"NP{i+1}", fill="yellow", font=font)
             
         pil_img.save(output_dir / f"{sample_name}_Overview.png")
+    
+    def _parse_frame_indices(self, text, total_frames):
+        """解析帧范围 (复用逻辑)"""
+        if not text.strip(): return list(range(total_frames)) # 空字符串返回所有
+        indices = set()
+        try:
+            parts = [p.strip() for p in text.split(',')]
+            for p in parts:
+                if not p: continue
+                if '-' in p:
+                    start, end = map(int, p.split('-'))
+                    start = max(0, start)
+                    end = min(total_frames - 1, end)
+                    if start <= end:
+                        indices.update(range(start, end + 1))
+                else:
+                    idx = int(p)
+                    if 0 <= idx < total_frames:
+                        indices.add(idx)
+            return sorted(list(indices))
+        except ValueError:
+            return list(range(total_frames)) # 解析失败回退到所有，或者抛错

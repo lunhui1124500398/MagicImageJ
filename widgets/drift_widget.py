@@ -97,6 +97,7 @@ class DriftCorrectionWidget(QWidget):
         self.current_drifts = None
         self.calc_thread = None
         self.apply_thread = None
+        self.correction_history = []  # [新增] 用于管理生成的校正图层
         self._setup_ui()
         
         # 监听图层事件
@@ -174,12 +175,12 @@ class DriftCorrectionWidget(QWidget):
         layout.addWidget(self.progress_bar)
 
         ctrl_layout = QHBoxLayout()
-        self.auto_calc_cb = QCheckBox("Auto-calc on release")
+        self.auto_calc_cb = QCheckBox("Auto Preview (Calc & Apply)")
         self.auto_calc_cb.setChecked(True)
-        self.auto_calc_cb.setToolTip("Calculate immediately after drawing ROI.")
+        self.auto_calc_cb.setToolTip("Calculate and show corrected result immediately after drawing ROI.")
         ctrl_layout.addWidget(self.auto_calc_cb)
         
-        preview_btn = QPushButton("📊 Recalculate")
+        preview_btn = QPushButton("📊 Manual Recalc")
         preview_btn.clicked.connect(self._preview_drift)
         ctrl_layout.addWidget(preview_btn)
         layout.addLayout(ctrl_layout)
@@ -191,7 +192,7 @@ class DriftCorrectionWidget(QWidget):
 
         # 步骤3：应用矫正
         layout.addWidget(QLabel("<b>Step 3: Apply Correction</b>"))
-        self.apply_btn = QPushButton("✅ Apply Drift Correction")
+        self.apply_btn = QPushButton("✅ Apply / Commit")
         self.apply_btn.clicked.connect(self._apply_correction)
         self.apply_btn.setEnabled(False)
         layout.addWidget(self.apply_btn)
@@ -199,6 +200,11 @@ class DriftCorrectionWidget(QWidget):
         redraw_btn = QPushButton("🔄 Reset / Clear ROI")
         redraw_btn.clicked.connect(self._redraw_roi)
         layout.addWidget(redraw_btn)
+
+        # [新增] 提示标签
+        self.hint_label = QLabel("Tip: Press 'Z' on corrected layer to Undo/Retry.")
+        self.hint_label.setStyleSheet("color: #4CAF50; font-style: italic;")
+        layout.addWidget(self.hint_label)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -249,6 +255,7 @@ class DriftCorrectionWidget(QWidget):
         else:
             layer = self.viewer.add_shapes(name=roi_layer_name, edge_color='red', edge_width=2, face_color=[1, 0, 0, 0.01])
             layer.mouse_drag_callbacks.append(self._on_roi_interaction)
+            
             @layer.bind_key('z')
             def clear_roi(layer):
                 if len(layer.data) > 0:
@@ -260,7 +267,7 @@ class DriftCorrectionWidget(QWidget):
                     self.progress_bar.setVisible(False)
         self.viewer.layers.selection.active = layer
         layer.mode = 'add_rectangle'
-        self.status_label.setText("✏️ Mode: Draw Rectangle (Press 'Z' to undo)")
+        self.status_label.setText("✏️ Mode: Draw Rectangle (Auto-Preview ON)")
 
     def _on_roi_interaction(self, layer, event):
         yield
@@ -330,18 +337,26 @@ class DriftCorrectionWidget(QWidget):
         self.drift_canvas.setVisible(True)
         self.apply_btn.setEnabled(True)
         self.status_label.setText(f"✅ Max X: {np.max(np.abs(drifts[:,0])):.1f}, Y: {np.max(np.abs(drifts[:,1])):.1f}")
+        # === [核心修改] 自动应用校正 ===
+        if self.auto_calc_cb.isChecked():
+            self.status_label.setText("⚡ Auto-applying correction...")
+            self._apply_correction(auto_mode=True)
+        else:
+            self.status_label.setText("✅ Calculated. Click 'Apply' to see result.")
+
 
     def _on_drift_error(self, error_msg):
         self.progress_bar.setVisible(False)
         self.auto_calc_cb.setEnabled(True)
         self.status_label.setText(f"❌ Error: {error_msg}")
 
-    def _apply_correction(self):
+    def _apply_correction(self, auto_mode=False):
         if self.current_drifts is None: return
         layer_name = self.layer_combo.currentText()
         layer = self.viewer.layers[layer_name]
-        
-        self.status_label.setText("⏳ Applying correction...")
+
+        if not auto_mode:
+            self.status_label.setText("⏳ Applying correction...")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.apply_btn.setEnabled(False)
@@ -352,28 +367,61 @@ class DriftCorrectionWidget(QWidget):
         self.apply_thread.error.connect(self._on_drift_error)
         self.apply_thread.start()
 
-    def _on_apply_finished(self, corrected_stack, layer_name):
+    def _on_apply_finished(self, corrected_stack, source_layer_name):
         self.progress_bar.setVisible(False)
         self.apply_btn.setEnabled(True)
         try:
-            new_layer_name = f"Corrected_{layer_name}"
-            self.viewer.add_image(corrected_stack, name=new_layer_name, colormap='gray', metadata={'source': layer_name})
-            
-            # === Log to Archive ===
-            self._log_drift_action(layer_name)
+            count = len(self.correction_history) + 1
+            new_layer_name = f"Corrected_v{count}_{source_layer_name}"
+            new_layer = self.viewer.add_image(
+                corrected_stack, 
+                name=new_layer_name, 
+                colormap='gray', 
+                metadata={'source': source_layer_name, 'is_drift_result': True}
+            )
 
-            self.status_label.setText(f"✅ Done! Layer: {new_layer_name}")
+            self.correction_history.append(new_layer)
+            if len(self.correction_history) > 3:
+                oldest_layer = self.correction_history.pop(0)
+                if oldest_layer in self.viewer.layers:
+                    self.viewer.layers.remove(oldest_layer)
+
+            @new_layer.bind_key('z')
+            def undo_correction(layer):
+                self._undo_last_correction(layer)
             
-            # 自动切换
-            for l in self.viewer.layers:
-                if isinstance(l, napari.layers.Image) and l.name != new_layer_name: l.visible = False
-            self.viewer.layers.selection.active = self.viewer.layers[new_layer_name]
-            self._refresh_layers()
-            self.layer_combo.setCurrentText(new_layer_name)
-            if "Drift_ROI" in self.viewer.layers: self.viewer.layers["Drift_ROI"].visible = False
-            
+            if source_layer_name in self.viewer.layers:
+                self.viewer.layers[source_layer_name].visible = False
+            self.viewer.layers.selection.active = new_layer
+            self.status_label.setText(f"✅ Previewing: {new_layer_name}. Press 'Z' to Undo.")
+
+            self._log_drift_action(source_layer_name)
+        
         except Exception as e:
             self.status_label.setText(f"❌ Apply Error: {str(e)}")
+    
+    def _undo_last_correction(self, layer_to_remove):
+        """撤销操作：删除图层，显示原图，激活ROI层"""
+        # 1. 删除图层
+        if layer_to_remove in self.viewer.layers:
+            self.viewer.layers.remove(layer_to_remove)
+        
+        if layer_to_remove in self.correction_history:
+            self.correction_history.remove(layer_to_remove)
+        
+        
+        # 2. 恢复原图可见性
+        source_name = layer_to_remove.metadata.get('source')
+        if source_name and source_name in self.viewer.layers:
+            self.viewer.layers[source_name].visible = True
+            
+        # 3. 激活 ROI 图层以便重画
+        if "Drift_ROI" in self.viewer.layers:
+            roi_layer = self.viewer.layers["Drift_ROI"]
+            self.viewer.layers.selection.active = roi_layer
+            roi_layer.mode = 'select' # 或者 'add_rectangle' 根据偏好
+            
+        self.status_label.setText("↩️ Undone. Adjust ROI and try again.")
 
     def _log_drift_action(self, source_layer):
         """Save parameters to processing_log.json"""
@@ -411,9 +459,15 @@ class DriftCorrectionWidget(QWidget):
             print(f"Failed to log drift: {e}")
 
     def _redraw_roi(self):
-        if "Drift_ROI" in self.viewer.layers: self.viewer.layers.remove("Drift_ROI")
+        # 清理所有历史
+        for l in self.correction_history:
+            if l in self.viewer.layers: # 必须检查存在性
+                self.viewer.layers.remove(l)
+        self.correction_history.clear()
+        
+        if "Drift_ROI" in self.viewer.layers: 
+            self.viewer.layers.remove("Drift_ROI")
+            
         self.current_drifts = None
-        self.apply_btn.setEnabled(False)
         self.drift_canvas.setVisible(False)
-        self.progress_bar.setVisible(False)
         self._add_shapes_layer()

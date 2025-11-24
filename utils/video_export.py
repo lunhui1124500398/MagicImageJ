@@ -159,7 +159,7 @@ def _draw_timestamp_pil(draw, cfg, frame_idx):
     draw.text((x, y), txt, font=font, fill=(*color, 255), anchor='lt')
 
 def get_available_codecs() -> list:
-    codecs = ['mp4v', 'XVID', 'MJPG', 'H264', 'avc1']
+    codecs = ['H264', 'XVID', 'MJPG', 'mp4v', 'avc1']
     return codecs 
     
 def export_to_tiff_stack(image_stack: np.ndarray, output_path: str) -> bool:
