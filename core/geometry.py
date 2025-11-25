@@ -74,6 +74,16 @@ def rotate_image_stack(image_stack: np.ndarray,
     
     return np.ascontiguousarray(np.stack(rotated_frames, axis=0))
 
+def flip_image_stack(image_stack: np.ndarray, mode: str) -> np.ndarray:
+    """
+    翻转图像栈
+    mode: 'horizontal' | 'vertical'
+    """
+    # image_stack shape: (T, Y, X)
+    # axis 1 is Y (Vertical), axis 2 is X (Horizontal)
+    axis = 2 if mode == 'horizontal' else 1
+    return np.ascontiguousarray(np.flip(image_stack, axis=axis))
+
 def crop_image_stack(image_stack: np.ndarray,
                      bbox: Tuple[int, int, int, int]) -> np.ndarray:
     """裁剪图像栈"""

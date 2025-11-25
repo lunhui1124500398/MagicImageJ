@@ -251,13 +251,13 @@ class ExportWidget(QWidget):
         # 6. Annotations Check
         self.g_anno = QGroupBox("Overlay Annotations")
         self.g_anno.setCheckable(True)
-        self.g_anno.setChecked(True)
+        self.g_anno.setChecked(False)
         l_anno = QVBoxLayout()
         
         self.check_sb = QCheckBox("Scale Bar")
-        self.check_sb.setChecked(True)
+        self.check_sb.setChecked(False)
         self.check_ts = QCheckBox("Timestamp")
-        self.check_ts.setChecked(True)
+        self.check_ts.setChecked(False)
         
         l_anno.addWidget(self.check_sb)
         l_anno.addWidget(self.check_ts)
@@ -325,6 +325,21 @@ class ExportWidget(QWidget):
             if idx >= 0: self.layer_combo.setCurrentIndex(idx)
         self.layer_combo.blockSignals(False)
         self._on_layer_changed(self.layer_combo.currentText())
+
+        s = self.annotation_settings
+        
+        # 读取配置 (注意：如果从未配置过，默认给 False，实现"默认不加")
+        def str2bool(v):
+            return str(v).lower() == 'true'
+
+        # 1. 同步 Scale Bar 状态
+        # 第二个参数 'false' 是默认值，即如果用户从未动过配置，则不勾选
+        sb_enabled = str2bool(s.value("scale/enable", "false"))
+        self.check_sb.setChecked(sb_enabled)
+
+        # 2. 同步 Timestamp 状态
+        ts_enabled = str2bool(s.value("label/enable", "false"))
+        self.check_ts.setChecked(ts_enabled)
 
     def _on_active_layer_changed(self, event=None):
         active = self.viewer.layers.selection.active

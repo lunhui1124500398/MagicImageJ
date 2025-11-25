@@ -17,7 +17,7 @@ import numpy as np
 from pathlib import Path
 import cv2
 from PIL import Image, ImageDraw, ImageFont
-from core.geometry import (calculate_rotation_angle, rotate_image_stack, 
+from core.geometry import (calculate_rotation_angle, rotate_image_stack, flip_image_stack,
                            crop_image_stack, validate_bbox)
 from utils.video_export import export_to_tiff_stack
 import napari
@@ -79,17 +79,30 @@ class GeometryWidget(QWidget):
         draw_line_btn.clicked.connect(self._draw_rotation_line)
         rotate_layout.addWidget(draw_line_btn)
 
-        angle_layout = QHBoxLayout()
-        angle_layout.addWidget(QLabel("Angle:"))
+        # --- 翻转按钮区 (新增) ---
+        h_flip = QHBoxLayout()
+        btn_flip_h = QPushButton("↔️ Flip Horz")
+        btn_flip_h.clicked.connect(lambda: self._apply_flip('horizontal'))
+        btn_flip_v = QPushButton("↕️ Flip Vert")
+        btn_flip_v.clicked.connect(lambda: self._apply_flip('vertical'))
+        h_flip.addWidget(btn_flip_h)
+        h_flip.addWidget(btn_flip_v)
+        rotate_layout.addLayout(h_flip)
+        
+        # --- 旋转区 (保留但简化) ---
+        h_angle = QHBoxLayout()
+        h_angle.addWidget(QLabel("Angle:"))
         self.angle_spin = QDoubleSpinBox()
-        self.angle_spin.setRange(-360, 360)
-        self.angle_spin.setDecimals(2)
-        angle_layout.addWidget(self.angle_spin)
-        calc_btn = QPushButton("📐 Recalc")
-        calc_btn.clicked.connect(self._calculate_angle)
-        angle_layout.addWidget(calc_btn)
-        rotate_layout.addLayout(angle_layout)
-
+        self.angle_spin.setRange(-360, 360); self.angle_spin.setDecimals(2)
+        h_angle.addWidget(self.angle_spin)
+        
+        # Recalc 功能保留在小按钮里，以防万一还需要
+        calc_btn = QPushButton("📏 Line-Calc") 
+        calc_btn.setToolTip("Draw a line to calculate angle")
+        calc_btn.clicked.connect(self._draw_rotation_line)
+        h_angle.addWidget(calc_btn)
+        rotate_layout.addLayout(h_angle)
+    
         # Enlarge 选项
         self.enlarge_check = QCheckBox("Enlarge Canvas (Fit All)")
         self.enlarge_check.setToolTip("Expand image size to fit rotated content without cropping")
@@ -495,6 +508,25 @@ class GeometryWidget(QWidget):
         except Exception as e:
             self.status_label.setText(f"Error: {e}")
 
+    def _apply_flip(self, direction):
+        layer_name = self.rotate_layer_combo.currentText()
+        if not layer_name: return
+        image_stack = self.viewer.layers[layer_name].data
+        try:
+            flipped = flip_image_stack(image_stack, direction)
+            suffix = "FlipH" if direction == 'horizontal' else "FlipV"
+            new_name = f"{suffix}_{layer_name}"
+            self.viewer.add_image(flipped, name=new_name, colormap='gray')
+            
+            # 自动切换下拉框目标
+            self.rotate_layer_combo.setCurrentText(new_name)
+            self.simple_crop_combo.setCurrentText(new_name)
+            self.viewer.layers.selection.active = self.viewer.layers[new_name]
+            
+            self.status_label.setText(f"✅ Applied {direction} flip.")
+        except Exception as e:
+            self.status_label.setText(f"Error: {e}")
+
     # --- Simple Crop ---
     def _draw_crop_rect(self):
         self._clear_residue(["Crop_ROI", "Rotation_Line", "Batch_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
@@ -505,6 +537,14 @@ class GeometryWidget(QWidget):
             face_color=[1, 1, 1, 0.01] 
         )
         layer.mode = 'add_rectangle'
+        def on_data_change(event):
+            # 只有在 add_rectangle 模式且有数据时才切换，防止循环触发
+            if layer.mode == 'add_rectangle' and len(layer.data) > 0:
+                layer.mode = 'select' # 切换到选择/编辑模式
+                self.viewer.layers.selection.active = layer # 确保图层被选中以便编辑
+                self.status_label.setText("🖐️ Mode: Adjust Crop Rect (Drag corners to resize)")
+
+        layer.events.data.connect(on_data_change)
         self.status_label.setText("✏️ Draw Single Crop Rect.")
 
     def _apply_crop(self):
