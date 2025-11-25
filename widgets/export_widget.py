@@ -39,11 +39,17 @@ class ExportThread(QThread):
             success = False
             # 确保父目录存在
             Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+            # 复制一份 params，避免修改原始字典影响后续的 Log 记录
+            self.func_params = self.params.copy()
+
+            # 如果存在 frame_range (仅用于Log)，在传给底层函数前移除它
+            if 'frame_range' in self.func_params:
+                del self.func_params['frame_range']
             
             if self.export_type == 'video':
                 # Video 导出
                 success = export_to_video(
-                    self.image_stack, str(self.output_path), **self.params
+                    self.image_stack, str(self.output_path), **self.func_params
                 )
                 # 视频导出进度目前封装在 utils 里，这里发送完成信号
                 self.progress.emit(100, 100)
@@ -63,6 +69,8 @@ class ExportThread(QThread):
                 self.error.emit("Export function returned False.")
                 
         except Exception as e:
+            import traceback
+            traceback.print_exc() # 打印堆栈方便调试
             self.error.emit(str(e))
 
     def _export_image_sequence(self):

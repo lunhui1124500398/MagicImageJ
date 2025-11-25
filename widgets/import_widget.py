@@ -374,7 +374,8 @@ class ImportWidget(QWidget):
         # Write info files
         with open(archive_path / "readme.txt", 'w', encoding='utf-8') as f:
             f.write(f"Archive: {folder_name}\nCreated: {datetime.datetime.now()}\n" + "-"*30 + "\n")
-            f.write(f"Substance: {self.substance_edit.text()}\nSolvent: {self.solvent_edit.text()}\nDataset: {self.dataset_edit.text()}\n")
+            self.sub_txt = self.substance_edit.currentText()
+            f.write(f"Substance: {self.sub_txt}\nSolvent: {self.solvent_edit.text()}\nDataset: {self.dataset_edit.text()}\n")
             f.write(f"Buffer Info: {self.buffer_edit.toPlainText()}\n" + "-"*30 + "\n")
             f.write("Original DM4 Metadata:\n")
             for k, v in self.meta_cache.items(): f.write(f"{k}: {v}\n")
