@@ -15,6 +15,7 @@ import os
 import shutil
 import json
 import datetime
+import gc
 
 try:
     import dm4
@@ -406,6 +407,27 @@ class ImportWidget(QWidget):
 
     def _load_data(self):
         if not self.current_folder: return
+        if len(self.viewer.layers) > 0:
+            # 弹出确认框，防止误触导致数据丢失
+            # 这里的逻辑是：无论是不是同一个文件夹，只要有未保存的图层，都提醒一下
+            reply = QMessageBox.question(
+                self, 
+                "Confirm Load", 
+                "Loading new data will CLEAR ALL current layers (including analysis results).\n\n"
+                "Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No, 
+                QMessageBox.Yes
+            )
+            
+            # 如果用户点了 No，直接取消操作
+            if reply == QMessageBox.No:
+                return
+
+            # 用户点了 Yes，执行内存清理
+            print("Cleaning up existing layers to free memory...")
+            self.viewer.layers.clear() 
+            gc.collect()
+        
         self.load_btn.setEnabled(False)
         self.progress.setVisible(True)
         self.status.setText("Loading...")

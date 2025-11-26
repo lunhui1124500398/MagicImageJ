@@ -478,6 +478,12 @@ class DriftCorrectionWidget(QWidget):
         
         if "Drift_ROI" in self.viewer.layers: 
             self.viewer.layers.remove("Drift_ROI")
+        
+        layer_name = self.layer_combo.currentText()
+        if layer_name and layer_name in self.viewer.layers:
+            self.viewer.layers[layer_name].visible = True
+        # 可选：将焦点切回原图层，体验更好
+            self.viewer.layers.selection.active = self.viewer.layers[layer_name]
             
         self.current_drifts = None
         self.drift_canvas.setVisible(False)
