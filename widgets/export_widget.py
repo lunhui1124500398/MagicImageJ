@@ -204,7 +204,7 @@ class ExportWidget(QWidget):
         h_fps = QHBoxLayout()
         h_fps.addWidget(QLabel("FPS:"))
         self.spin_fps = QSpinBox()
-        self.spin_fps.setRange(1, 120)
+        self.spin_fps.setRange(1, 99999)
         self.spin_fps.setValue(60)
         h_fps.addWidget(self.spin_fps)
         l_vid.addLayout(h_fps)

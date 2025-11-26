@@ -22,7 +22,8 @@ def calculate_rotation_angle(line_points: Tuple[Tuple[float, float], Tuple[float
 def rotate_image_stack(image_stack: np.ndarray,
                        angle: float,
                        center: Optional[Tuple[int, int]] = None,
-                       expand: bool = False) -> np.ndarray:
+                       expand: bool = False,
+                       progress_callback=None) -> np.ndarray:
     """
     旋转图像栈
     
@@ -67,10 +68,15 @@ def rotate_image_stack(image_stack: np.ndarray,
 
     # 旋转所有帧
     rotated_frames = []
-    for frame in image_stack:
+    total = len(image_stack)
+    for i,frame in enumerate(image_stack):
         # 使用 borderMode=cv2.BORDER_CONSTANT (黑色填充)
         rotated = cv2.warpAffine(frame, M, (dest_w, dest_h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         rotated_frames.append(rotated)
+        if progress_callback and i % 5 == 0: 
+            progress_callback(i + 1, total)
+    if progress_callback: 
+        progress_callback(total, total)
     
     return np.ascontiguousarray(np.stack(rotated_frames, axis=0))
 

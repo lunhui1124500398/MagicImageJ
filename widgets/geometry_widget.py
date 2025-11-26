@@ -12,7 +12,7 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
                             QLabel, QHBoxLayout, QComboBox, QGroupBox, 
                             QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, 
                             QMessageBox, QCheckBox, QProgressDialog, QSpinBox)
-from qtpy.QtCore import Qt, QTimer, QSettings
+from qtpy.QtCore import Qt, QTimer, QSettings, QThread, Signal
 import numpy as np
 from pathlib import Path
 import cv2
@@ -23,6 +23,28 @@ from utils.video_export import export_to_tiff_stack
 import napari
 import json
 from widgets.settings_widget import GlobalConfig
+
+class RotationThread(QThread):
+    progress = Signal(int, int)
+    finished = Signal(np.ndarray)
+    error = Signal(str)
+
+    def __init__(self, stack, angle, expand):
+        super().__init__()
+        self.stack = stack
+        self.angle = angle
+        self.expand = expand
+
+    def run(self):
+        try:
+            def cb(c, t):
+                self.progress.emit(c, t)
+            
+            # 调用核心算法
+            res = rotate_image_stack(self.stack, self.angle, expand=self.expand, progress_callback=cb)
+            self.finished.emit(res)
+        except Exception as e:
+            self.error.emit(str(e))
 
 class GeometryWidget(QWidget):
     def __init__(self, viewer):
@@ -492,21 +514,42 @@ class GeometryWidget(QWidget):
         angle = self.angle_spin.value()
         expand = self.enlarge_check.isChecked()
         image_stack = self.viewer.layers[layer_name].data
-        try:
-            rotated = rotate_image_stack(image_stack, angle, expand=expand)
-            new_name = f"Rotated_{layer_name}"
-            self.viewer.add_image(rotated, name=new_name, colormap='gray')
-            
-            # 清理 Line
-            self._clear_residue(["Rotation_Line"])
-            
-            # [Fix 1.2] 自动切换 Simple Crop 的目标图层为新图层
-            self.simple_crop_combo.setCurrentText(new_name)
-            self.viewer.layers.selection.active = self.viewer.layers[new_name]
-            
-            self.status_label.setText(f"✅ Rotated {angle:.1f}° (Expand={expand})")
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
+        # UI 锁定
+        self.status_label.setText("⏳ Rotating...")
+        
+        # 进度条
+        self.rot_progress = QProgressDialog(f"Rotating {angle:.1f}°...", "Cancel", 0, len(image_stack), self)
+        self.rot_progress.setWindowModality(Qt.WindowModal)
+        self.rot_progress.show()
+        
+        # 启动线程
+        self.rot_thread = RotationThread(image_stack, angle, expand)
+        self.rot_thread.progress.connect(lambda c, t: self.rot_progress.setValue(c))
+        
+        def on_finished(rotated):
+            self.rot_progress.close()
+            try:
+                new_name = f"Rotated_{layer_name}"
+                self.viewer.add_image(rotated, name=new_name, colormap='gray')
+                
+                # 清理 Line
+                self._clear_residue(["Rotation_Line"])
+                
+                # 自动切换 Simple Crop 的目标图层
+                self.simple_crop_combo.setCurrentText(new_name)
+                self.viewer.layers.selection.active = self.viewer.layers[new_name]
+                
+                self.status_label.setText(f"✅ Rotated {angle:.1f}° (Expand={expand})")
+            except Exception as e:
+                self.status_label.setText(f"Error showing result: {e}")
+        
+        def on_error(err):
+            self.rot_progress.close()
+            self.status_label.setText(f"❌ Rotation Error: {err}")
+
+        self.rot_thread.finished.connect(on_finished)
+        self.rot_thread.error.connect(on_error)
+        self.rot_thread.start()
 
     def _apply_flip(self, direction):
         layer_name = self.rotate_layer_combo.currentText()
@@ -560,11 +603,12 @@ class GeometryWidget(QWidget):
         stack = self.viewer.layers[target].data
         cropped = crop_image_stack(stack, bbox)
         new_name = f"Cropped_{target}"
-        self.viewer.add_image(cropped, name=new_name, colormap='gray')
         
-        # [Fix 1.4] 清理 Crop ROI
+        new_layer = self.viewer.add_image(cropped, name=new_name, colormap='gray')
+        
+        # 清理 Crop ROI
         self._clear_residue(["Crop_ROI"])
-        self.viewer.layers.selection.active = self.viewer.layers[new_name]
+        self.viewer.layers.selection.active = new_layer
 
         # === [新增功能 1] Crop之后清理显示，只显示Crop出的图层 ===
         # 只隐藏 Image 图层，且不要隐藏本图层
@@ -575,8 +619,25 @@ class GeometryWidget(QWidget):
                 if "Preview" not in layer.name: 
                     layer.visible = False
         # =====================================================
+        undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift") 
+        
+        @new_layer.bind_key(undo_key, overwrite=True)
+        def undo_crop(layer):
+            # 1. 删除当前裁剪层
+            if layer in self.viewer.layers:
+                self.viewer.layers.remove(layer)
+            
+            # 2. 恢复原图层可见性
+            if target in self.viewer.layers:
+                self.viewer.layers[target].visible = True
+                self.viewer.layers.selection.active = self.viewer.layers[target]
+            
+            # 3. 恢复 ROI 绘制层 (方便重画)
+            self._draw_crop_rect()
+            self.status_label.setText("↩️ Crop Undone.")
 
-        self.status_label.setText(f"✅ Crop applied: {new_name}")
+        self.status_label.setText(f"✅ Crop applied. Press '{undo_key}' to Undo.")
+        # self.status_label.setText(f"✅ Crop applied: {new_name}")
 
     # --- Batch Crop Logic ---
     def _start_batch_mode(self):

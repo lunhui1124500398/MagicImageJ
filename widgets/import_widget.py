@@ -1,13 +1,15 @@
+# File: widgets/import_widget.py
+
 """
 数据导入控件 - 增强版 (含智能数据归档 & 进度优化)
-修复日志:
-- [Critical Fix] ArchiveThread: 真正实装了 Windows 长路径支持 (添加 \\?\ 前缀并强制反斜杠)。
-- [Critical Fix] ArchiveThread: 实装递归检测 (Recursion Guard)。
+更新日志:
+- [New] 增加“手动选择单帧计算剂量”功能 (Pick Button)。
+- [Critical Fix] ArchiveThread: Windows 长路径支持 & 递归检测。
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QFileDialog, QLabel, QSpinBox, QHBoxLayout,
                             QProgressBar, QComboBox, QGroupBox, QMessageBox,
-                            QDoubleSpinBox, QScrollArea, QLineEdit, QTextEdit)
+                            QDoubleSpinBox, QScrollArea, QLineEdit, QTextEdit, QSizePolicy)
 from qtpy.QtCore import Signal, QThread, QSettings, Qt
 import numpy as np
 from pathlib import Path
@@ -49,13 +51,11 @@ class ArchiveThread(QThread):
             dst_abs = os.path.abspath(self.dst)
 
             # 2. 递归检查 (Recursion Guard)
-            # 如果 dst 是 src 的子目录，copytree 会死循环
             if dst_abs.startswith(src_abs):
                 raise ValueError(f"Recursion Error: Destination is inside Source.\nSrc: {src_abs}\nDst: {dst_abs}")
 
             # 3. Windows 长路径支持 (Long Path Support)
             if os.name == 'nt':
-                # 必须强制使用反斜杠，混合斜杠会导致 \\?\ 失效
                 src_abs = src_abs.replace('/', '\\')
                 dst_abs = dst_abs.replace('/', '\\')
                 
@@ -91,11 +91,14 @@ class LoaderThread(QThread):
             self.error.emit(str(e))
 
 class DoseCalculationThread(QThread):
+    """剂量计算线程"""
     finished = Signal(float, str, dict)
     error = Signal(str)
-    def __init__(self, folder_path):
+    
+    def __init__(self, folder_path, frame_idx=-1):
         super().__init__()
         self.folder_path = Path(folder_path)
+        self.frame_idx = frame_idx # -1 means Auto (Middle frame)
 
     def _decode_string(self, data):
         if isinstance(data, str): return data
@@ -123,15 +126,33 @@ class DoseCalculationThread(QThread):
             self.error.emit("Library 'dm4' not found.")
             return
         try:
+            # 1. 获取所有 DM4 文件并排序 (与读取顺序一致)
             files = sorted(list(self.folder_path.rglob("*.dm4")))
             if not files:
                 self.error.emit("No .dm4 files found.")
                 return
-            mid = len(files) // 2
-            start = max(0, mid - 5); end = min(len(files), mid + 5)
-            candidates = files[start:end] if files[start:end] else files
-            candidate = max(candidates, key=lambda f: f.stat().st_size)
             
+            # 2. 确定目标文件索引
+            total_files = len(files)
+            candidate = None
+            target_idx = 0
+            if self.frame_idx < 0:
+                # 自动选择中间
+                mid = total_files // 2
+                start = max(0, mid - 5)
+                end = min(total_files, mid + 5)
+                candidates_list = files[start:end] if files[start:end] else files
+                # 选取体积最大的文件
+                candidate = max(candidates_list, key=lambda f: f.stat().st_size)
+                target_idx = files.index(candidate)
+            else:
+                # 手动选择，防止越界
+                target_idx = max(0, min(self.frame_idx, total_files - 1))
+                candidate = files[target_idx]
+            
+            candidate = files[target_idx]
+            
+            # 3. 读取 Metadata
             with dm4.DM4File.open(str(candidate)) as dm4file:
                 tags = dm4file.read_directory()
                 image_list = tags.named_subdirs['ImageList']
@@ -209,6 +230,7 @@ class ImportWidget(QWidget):
             self.folder_label.setText(last)
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
+            self.pick_file_btn.setEnabled(True) # Enable pick button
 
     def _setup_ui(self):
         main = QVBoxLayout(); main.setContentsMargins(2, 2, 2, 2)
@@ -217,18 +239,55 @@ class ImportWidget(QWidget):
         
         layout.addWidget(QLabel("<h3>📂 Import & Archive</h3>"))
 
+        # Group 1: Data Source
         g_source = QGroupBox("1. Data Source"); l_source = QVBoxLayout(); l_source.setSpacing(4); l_source.setContentsMargins(8, 8, 8, 8)
         h_brow = QHBoxLayout(); btn_browse = QPushButton("📂 Browse Folder"); btn_browse.clicked.connect(self._browse_folder)
         h_brow.addWidget(btn_browse); self.folder_label = QLabel("None"); self.folder_label.setStyleSheet("color: gray; font-size: 11px;")
         l_source.addLayout(h_brow); l_source.addWidget(self.folder_label); g_source.setLayout(l_source); layout.addWidget(g_source)
 
+        # Group 2: Scan Metadata (修改的部分)
         g_dose = QGroupBox("2. Scan Metadata"); l_dose = QVBoxLayout(); l_dose.setSpacing(4); l_dose.setContentsMargins(8, 8, 8, 8)
-        h_calc = QHBoxLayout(); self.calc_dose_btn = QPushButton("🧮 Scan & Calc Dose"); self.calc_dose_btn.setEnabled(False); self.calc_dose_btn.clicked.connect(self._calc_dose)
-        h_calc.addWidget(self.calc_dose_btn); self.dose_val_label = QLabel("Dose: N/A"); self.dose_val_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
-        h_calc.addWidget(self.dose_val_label); l_dose.addLayout(h_calc)
+        
+        h_calc = QHBoxLayout()
+        self.calc_dose_btn = QPushButton("🧮 Calc Dose")
+        self.calc_dose_btn.setEnabled(False)
+        self.calc_dose_btn.clicked.connect(self._calc_dose)
+        h_calc.addWidget(self.calc_dose_btn)
+        
+        # === [NEW] Pick Frame Button & SpinBox ===
+        h_calc.addWidget(QLabel("Img:"))
+        
+        # 1. 索引输入框 (支持 -1 Auto)
+        self.dose_idx_spin = QSpinBox()
+        self.dose_idx_spin.setRange(-1, 99999)
+        self.dose_idx_spin.setValue(-1)
+        self.dose_idx_spin.setSpecialValueText("Auto")
+        self.dose_idx_spin.setToolTip("Frame Index (-1 for Middle). Pick file to auto-set.")
+        
+        self.dose_idx_spin.setMinimumWidth(80)
+        self.dose_idx_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        h_calc.addWidget(self.dose_idx_spin)
+
+        # 2. 选取文件按钮
+        self.pick_file_btn = QPushButton("📂")
+        self.pick_file_btn.setToolTip("Pick a specific .dm4 file from the folder to calculate dose")
+        self.pick_file_btn.setFixedWidth(50)
+        self.pick_file_btn.setEnabled(False)
+        self.pick_file_btn.clicked.connect(self._pick_single_file_for_dose)
+        h_calc.addWidget(self.pick_file_btn)
+
+        # 结果显示
+        self.dose_val_label = QLabel("N/A")
+        self.dose_val_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
+        h_calc.addWidget(self.dose_val_label)
+        
+        h_calc.addStretch()
+        l_dose.addLayout(h_calc)
+        
         self.meta_info_label = QLabel("Select folder to extract date, mag, pixel size..."); self.meta_info_label.setWordWrap(True); self.meta_info_label.setStyleSheet("font-size: 10px; color: gray;")
         l_dose.addWidget(self.meta_info_label); g_dose.setLayout(l_dose); layout.addWidget(g_dose)
 
+        # Group 3: Archive Config
         g_exp = QGroupBox("3. Archive Configuration"); g_exp.setStyleSheet("QGroupBox { border: 1px solid #2196F3; margin-top: 6px; } QGroupBox::title { color: #2196F3; }"); l_exp = QVBoxLayout(); l_exp.setSpacing(4); l_exp.setContentsMargins(8, 12, 8, 8)
         h1 = QHBoxLayout(); self.substance_edit = QComboBox(); self.substance_edit.setEditable(True); self.substance_edit.setPlaceholderText("Sub (e.g. CRY2)");self.substance_edit.setMinimumWidth(100);
         self._load_substance_history()
@@ -252,6 +311,7 @@ class ImportWidget(QWidget):
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)): w.valueChanged.connect(self._update_preview)
         g_exp.setLayout(l_exp); layout.addWidget(g_exp)
 
+        # Group 4: Action
         g_arc = QGroupBox("4. Action"); g_arc.setStyleSheet("QGroupBox { border: 1px solid #FF9800; margin-top: 6px; } QGroupBox::title { color: #FF9800; }"); l_arc = QVBoxLayout(); l_arc.setSpacing(6); l_arc.setContentsMargins(8, 12, 8, 8)
         l_arc.addWidget(QLabel("Preview Folder Name:")); self.preview_label = QLabel("..."); self.preview_label.setWordWrap(True); self.preview_label.setStyleSheet("font-family: 'Segoe UI', sans-serif; font-size: 11px; color: #E0E0E0; background-color: #2D2D2D; padding: 8px; border: 1px solid #3E3E3E; border-radius: 4px;")
         l_arc.addWidget(self.preview_label)
@@ -261,6 +321,7 @@ class ImportWidget(QWidget):
         l_arc.addWidget(self.archive_progress)
         g_arc.setLayout(l_arc); layout.addWidget(g_arc)
 
+        # Group 5: Load
         g_load = QGroupBox("5. Load to Viewer"); l_load = QVBoxLayout(); l_load.setSpacing(4); l_load.setContentsMargins(8, 8, 8, 8)
         h_params = QHBoxLayout(); h_params.addWidget(QLabel("Bit Depth:")); self.bit_depth_combo = QComboBox(); self.bit_depth_combo.addItems(["8", "16", "32"]); self.bit_depth_combo.setCurrentText("8"); h_params.addWidget(self.bit_depth_combo)
         h_params.addWidget(QLabel("Workers:")); self.max_workers_spin = QSpinBox(); self.max_workers_spin.setRange(1, 32); self.max_workers_spin.setValue(8); h_params.addWidget(self.max_workers_spin); l_load.addLayout(h_params)
@@ -279,20 +340,58 @@ class ImportWidget(QWidget):
             self.folder_label.setText(f)
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
+            self.pick_file_btn.setEnabled(True) # 启用选择文件按钮
             self._update_preview()
+
+    def _pick_single_file_for_dose(self):
+        """打开文件选择器，反算索引"""
+        if not self.current_folder: return
+        
+        # 打开文件选择对话框
+        f, _ = QFileDialog.getOpenFileName(self, "Select DM4 Image for Dose Calculation", self.current_folder, "DM4 Files (*.dm4)")
+        
+        if f:
+            self.status.setText("Locating file index...")
+            try:
+                # 为了找到正确的 Index，我们需要重现线程里的排序逻辑
+                target_path = Path(f).resolve()
+                all_files = sorted(list(Path(self.current_folder).rglob("*.dm4")))
+                
+                # 查找 Index
+                found_idx = -1
+                for i, p in enumerate(all_files):
+                    if p.resolve() == target_path:
+                        found_idx = i
+                        break
+                
+                if found_idx >= 0:
+                    self.dose_idx_spin.setValue(found_idx)
+                    self.status.setText(f"Selected: {target_path.name} (Index: {found_idx})")
+                    # 自动触发计算
+                    self._calc_dose()
+                else:
+                    self.status.setText("❌ File not found in current structure match.")
+            except Exception as e:
+                self.status.setText(f"❌ Error picking file: {e}")
 
     def _calc_dose(self):
         if not self.current_folder: return
         self.calc_dose_btn.setEnabled(False)
+        self.pick_file_btn.setEnabled(False) # 计算时禁用选择
         self.status.setText("Scanning metadata...")
-        self.thread_dose = DoseCalculationThread(self.current_folder)
+        
+        # 获取用户设置的 Index (-1 为自动)
+        frame_idx = self.dose_idx_spin.value()
+        
+        self.thread_dose = DoseCalculationThread(self.current_folder, frame_idx=frame_idx)
         self.thread_dose.finished.connect(self._on_dose_done)
-        self.thread_dose.error.connect(lambda e: (self.status.setText(e), self.calc_dose_btn.setEnabled(True)))
+        self.thread_dose.error.connect(lambda e: (self.status.setText(e), self.calc_dose_btn.setEnabled(True), self.pick_file_btn.setEnabled(True)))
         self.thread_dose.start()
 
     def _on_dose_done(self, dose, fname, info):
         self.meta_cache = info; self.meta_cache['dose'] = dose
         self.calc_dose_btn.setEnabled(True)
+        self.pick_file_btn.setEnabled(True)
         self.dose_val_label.setText(f"{dose:.2f} e⁻/Å²/s")
         if info.get('mag', 0) > 0:
             m = info['mag']
@@ -409,7 +508,6 @@ class ImportWidget(QWidget):
         if not self.current_folder: return
         if len(self.viewer.layers) > 0:
             # 弹出确认框，防止误触导致数据丢失
-            # 这里的逻辑是：无论是不是同一个文件夹，只要有未保存的图层，都提醒一下
             reply = QMessageBox.question(
                 self, 
                 "Confirm Load", 
