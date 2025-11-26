@@ -13,6 +13,8 @@ from widgets.enhance_widget import EnhanceWidget
 from widgets.annotation_widget import AnnotationWidget
 from widgets.export_widget import ExportWidget
 from widgets.settings_widget import SettingsDialog, GlobalConfig
+import numpy as np
+import math
 
 class TEMWorkflow:
     def __init__(self):
@@ -39,7 +41,7 @@ class TEMWorkflow:
         toolbar.setStyleSheet("background: transparent;")
         h_bar = QHBoxLayout()
         h_bar.setContentsMargins(4, 0, 4, 0) 
-        h_bar.setSpacing(0)
+        h_bar.setSpacing(4)
         common_font = '"Segoe UI", "Microsoft YaHei", "San Francisco", "Helvetica Neue", sans-serif'
 
         # (可选) 左侧加一个小标题，显得不那么空
@@ -54,6 +56,18 @@ class TEMWorkflow:
         h_bar.addWidget(lbl_title)
         
         h_bar.addStretch() # 弹簧：把右边的按钮顶过去
+
+        self.btn_ruler = QPushButton("📏 Measure")
+        self.btn_ruler.setCheckable(True) # 这是一个开关按钮
+        self.btn_ruler.setToolTip("Toggle Measurement Tool (Draw lines to measure distance)")
+        self.btn_ruler.setStyleSheet("""
+            QPushButton { border: 1px solid #444; background: #333; color: #DDD; border-radius: 3px; padding: 2px 8px; font-size: 11px; }
+            QPushButton:checked { background: #2196F3; color: white; border: 1px solid #2196F3; }
+            QPushButton:hover { border-color: #666; }
+        """)
+        self.btn_ruler.clicked.connect(self._toggle_measurement_tool)
+        h_bar.addWidget(self.btn_ruler)
+        h_bar.addStretch()
 
         # === 设置按钮 (移到这里) ===
         btn_settings = QPushButton("⚙️")
@@ -253,6 +267,97 @@ class TEMWorkflow:
         current_widget = self.tab_widget.widget(index)
         if hasattr(current_widget, '_refresh_layers'):
             current_widget._refresh_layers()
+    
+    def _toggle_measurement_tool(self, checked):
+        layer_name = "Measurements"
+        
+        if checked:
+            # 开启测量模式
+            if layer_name not in self.viewer.layers:
+                # 创建 Shapes 图层
+                self.measure_layer = self.viewer.add_shapes(
+                    name=layer_name,
+                    shape_type='line',
+                    edge_color='#FFD700',
+                    edge_width=3,
+                    face_color=[0,0,0,0],
+                    # 设置文本显示属性
+                    text={
+                        'string': '{length}', 
+                        'size': 11, 
+                        'color': 'white', 
+                        'anchor': 'center', 
+                        'translation': [0, -15]
+                    },
+                    features={'length': []} # 初始化 features
+                )
+                self.measure_layer.mode = 'add_line'
+                self.measure_layer.events.data.connect(self._on_measure_data_change)
+                undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift") # 通常是 Control-Z
+                @self.measure_layer.bind_key(undo_key)
+                def undo_last_line(layer):
+                    if len(layer.data) > 0:
+                        layer.data = layer.data[:-1] # 移除最后一个数据
+                        # 注意：features 会由 _on_measure_data_change 自动重新计算，无需手动 pop
+                        self.viewer.status = "↩️ Last measurement removed."
+            else:
+                self.measure_layer = self.viewer.layers[layer_name]
+                self.measure_layer.visible = True
+                self.measure_layer.mode = 'add_line'
+            
+            self.viewer.layers.selection.active = self.measure_layer
+            self.viewer.status = "📏 Measurement Mode: Draw lines to measure.(Ctrl+Z to Undo)"
+            
+        else:
+            # 关闭测量模式 (但不删除图层，只是切换回选择模式或隐藏)
+            if layer_name in self.viewer.layers:
+                self.viewer.layers[layer_name].mode = 'pan_zoom'
+                # 可选：是否隐藏图层？通常用户可能想保留测量结果，所以这里不隐藏
+            # 隐藏图层
+            self.viewer.status = "End Measurement."
+
+    def _on_measure_data_change(self, event=None):
+        """计算线段长度并更新标签"""
+        if "Measurements" not in self.viewer.layers: return
+        layer = self.viewer.layers["Measurements"]
+        if len(layer.data) == 0: 
+            layer.features = {'length': []}
+            return
+        
+        # 获取像素尺寸 (尝试从当前选中的 Image 图层获取)
+        pixel_size = 1.0
+        unit = "px"
+        
+        # 遍历图层寻找底图的 metadata
+        for l in self.viewer.layers:
+            if isinstance(l, napari.layers.Image) and l.visible:
+                meta = l.metadata
+                if meta and 'pixel_A' in meta:
+                    pixel_size = meta['pixel_A'] / 10.0 # 转换为 nm
+                    unit = "nm"
+                elif meta and 'pixel_unit' in meta and 'pixel_size' in meta:
+                     pixel_size = meta['pixel_size']
+                     unit = meta['pixel_unit']
+                break
+        
+        new_lengths = []
+        for shape_data in layer.data:
+            # Line data shape: (2, 2) -> [[y1, x1], [y2, x2]]
+            p1 = shape_data[0]
+            p2 = shape_data[1]
+            # 欧几里得距离
+            dist_px = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+            dist_phys = dist_px * pixel_size
+            
+            if unit == "px":
+                lbl = f"{dist_phys:.1f} px"
+            else:
+                lbl = f"{dist_phys:.2f} {unit}"
+            new_lengths.append(lbl)
+            
+        # 更新 features 以刷新显示
+        layer.features = {'length': new_lengths}
+        layer.refresh()
 
     def run(self):
         napari.run()

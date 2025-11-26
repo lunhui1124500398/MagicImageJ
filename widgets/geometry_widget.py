@@ -24,6 +24,157 @@ import napari
 import json
 from widgets.settings_widget import GlobalConfig
 
+class BatchExportThread(QThread):
+    """
+    后台导出线程 (修复版)
+    修复日志:
+    - [Fix] 解决 Windows 下 cv2.imwrite 无法保存中文/特殊字符路径的问题。
+    - [Fix] 增加 np.asarray 确保数据不是 Dask 格式。
+    """
+    progress = Signal(int)          # 发送进度信号
+    finished = Signal(int, str)     # 完成信号 (数量, 路径名)
+    error = Signal(str)             # 错误信号
+
+    def __init__(self, params):
+        super().__init__()
+        self.p = params
+
+    def run(self):
+        try:
+            # --- 解包参数 ---
+            data_stack = self.p['data_stack']
+            rois = self.p['rois']
+            frame_ranges_list = self.p['frame_ranges_list']
+            global_range_text = self.p['global_range_text']
+            output_dir = self.p['output_dir']
+            sub_name = self.p['sub_name']
+            suffix_fmt = self.p['suffix_fmt']
+            is_tiff = self.p['is_tiff']
+            keep_idx = self.p['keep_idx']
+            pad = self.p['pad']
+            
+            total_frames = data_stack.shape[0]
+            log_crops = []
+            count = len(rois)
+
+            for i, roi in enumerate(rois):
+                if self.isInterruptionRequested(): break
+
+                # 1. 计算坐标
+                ys, xs = roi[:, 0], roi[:, 1]
+                bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+                
+                # 2. 确定帧范围
+                specific_range = str(frame_ranges_list[i]).strip() if i < len(frame_ranges_list) else ""
+                range_to_use = specific_range if specific_range else global_range_text
+                
+                # 3. 解析需要导出的帧索引
+                selected_indices = parse_indices_helper(range_to_use, total_frames)
+                
+                if not selected_indices:
+                    continue 
+                    
+                # 4. 动态切片 (使用 np.asarray 确保转为内存中的 Numpy 数组，防止 Dask 懒加载导致写入失败)
+                filtered_data_stack = np.asarray(data_stack[selected_indices])
+                
+                # 5. 执行裁剪
+                crop = crop_image_stack(filtered_data_stack, bbox)
+
+                # 6. 生成文件名
+                if "{}" not in suffix_fmt:
+                    suffix_str = f"{suffix_fmt}{i+1}"
+                else:
+                    suffix_str = suffix_fmt.replace("{}", str(i+1))
+                fname = f"{sub_name}{suffix_str}"
+                
+                # 7. 保存文件
+                if is_tiff:
+                    # TIFF 格式
+                    export_to_tiff_stack(crop, str(output_dir / f"{fname}.tiff"))
+                else:
+                    # PNG 序列格式
+                    p = output_dir / fname
+                    p.mkdir(exist_ok=True) # 文件夹创建成功，说明路径没问题
+                    
+                    for k, img in enumerate(crop):
+                        # 数据归一化与转换
+                        if img.dtype in [np.float32, np.float64]:
+                            mn, mx = img.min(), img.max()
+                            if mx > mn: img = ((img - mn) / (mx - mn) * 255).astype(np.uint8)
+                            else: img = img.astype(np.uint8)
+                        elif img.dtype != np.uint8:
+                            # 16bit 转 8bit (可选，为了兼容性)
+                            # 如果你想保留 16bit png，可以注释掉这行，但部分看图软件看不了
+                            pass 
+                        
+                        # 编号逻辑
+                        file_idx = selected_indices[k] if keep_idx else k
+                        file_name = f"{file_idx:0{pad}d}.png"
+                        save_path = str(p / file_name)
+
+                        # === [核心修复] 使用 imencode + tofile 支持中文/特殊路径 ===
+                        try:
+                            # cv2.imwrite 不支持中文路径，改用这种写法：
+                            is_success, im_buf = cv2.imencode(".png", img)
+                            if is_success:
+                                im_buf.tofile(save_path)
+                            else:
+                                print(f"Warning: Failed to encode frame {k}")
+                        except Exception as save_err:
+                            print(f"Save Error: {save_err}")
+                        # =======================================================
+                
+                # 8. 记录日志
+                log_crops.append({
+                    "id": i+1, "bbox": bbox, "filename": fname, 
+                    "frame_range_used": range_to_use if range_to_use else "All"
+                })
+                
+                self.progress.emit(i + 1)
+            
+            # 写入日志
+            json_path = output_dir / "processing_log.json"
+            log_data = {}
+            if json_path.exists():
+                try: 
+                    with open(json_path, 'r') as f: log_data = json.load(f)
+                except: 
+                    pass
+            
+            log_data["batch_crop"] = {
+                "data_layer": self.p['data_layer_name'],
+                "count": count,
+                "global_filter": global_range_text,
+                "rois": log_crops
+            }
+            with open(json_path, 'w') as f: json.dump(log_data, f, indent=2)
+            
+            self.finished.emit(count, str(output_dir.name))
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+def parse_indices_helper(text, total_frames):
+    if not text.strip() or text.strip().lower() == "all": 
+        return list(range(total_frames))
+    indices = set()
+    try:
+        parts = [p.strip() for p in text.split(',')]
+        for p in parts:
+            if not p: continue
+            if '-' in p:
+                start, end = map(int, p.split('-'))
+                start = max(0, start); end = min(total_frames - 1, end)
+                if start <= end: indices.update(range(start, end + 1))
+            else:
+                idx = int(p)
+                if 0 <= idx < total_frames: indices.add(idx)
+        return sorted(list(indices))
+    except:
+        return list(range(total_frames))
+
 class RotationThread(QThread):
     progress = Signal(int, int)
     finished = Signal(np.ndarray)
@@ -206,17 +357,20 @@ class GeometryWidget(QWidget):
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("Substance Name:"))
         self.sample_name_edit = QLineEdit("CRY2")
-        name_layout.addWidget(self.sample_name_edit)
+        name_layout.addWidget(self.sample_name_edit, 1)
 
         # === [新增功能 4] 自定义后缀输入 ===
         name_layout.addWidget(QLabel("Suffix:"))
         self.suffix_edit = QLineEdit("-NP{}")
         self.suffix_edit.setPlaceholderText("e.g. -NP{} or -{}")
-        self.suffix_edit.setFixedWidth(80)
+        # self.suffix_edit.setFixedWidth(80)
+        self.suffix_edit.setMinimumWidth(100)
         self.suffix_edit.setToolTip("Use {} as placeholder for number.\nExample: '-NP{}' -> '-NP1'")
-        name_layout.addWidget(self.suffix_edit)
+        name_layout.addWidget(self.suffix_edit, 2)
         # ================================
         batch_layout.addLayout(name_layout)
+
+
 
         # 格式选择
         format_layout = QHBoxLayout()
@@ -233,6 +387,14 @@ class GeometryWidget(QWidget):
         self.batch_frame_edit.setPlaceholderText("All (Default) or 0-10, 15...")
         self.batch_frame_edit.setToolTip("Leave empty for All frames.\nOr use: 0-10, 15, 20-25")
         frame_layout.addWidget(self.batch_frame_edit)
+
+        self.btn_set_specific_range = QPushButton("📌 Set for Selected")
+        self.btn_set_specific_range.setToolTip("Apply the text in the box to the CURRENTLY SELECTED ROI only.\nExample: Select ROI 2, type '0-50', click this button.")
+        self.btn_set_specific_range.clicked.connect(self._set_range_for_selected_roi)
+        # 稍微改个样式区分一下
+        self.btn_set_specific_range.setStyleSheet("background-color: #555; font-size: 10px; padding: 4px;")
+        frame_layout.addWidget(self.btn_set_specific_range)
+        
         batch_layout.addLayout(frame_layout)
         # ========================
 
@@ -530,14 +692,27 @@ class GeometryWidget(QWidget):
             self.rot_progress.close()
             try:
                 new_name = f"Rotated_{layer_name}"
-                self.viewer.add_image(rotated, name=new_name, colormap='gray')
+                new_layer = self.viewer.add_image(rotated, name=new_name, colormap='gray', metadata={'source_layer': layer_name})
+                if layer_name in self.viewer.layers:
+                    self.viewer.layers[layer_name].visible = False
                 
                 # 清理 Line
                 self._clear_residue(["Rotation_Line"])
                 
                 # 自动切换 Simple Crop 的目标图层
                 self.simple_crop_combo.setCurrentText(new_name)
-                self.viewer.layers.selection.active = self.viewer.layers[new_name]
+                self.viewer.layers.selection.active = new_layer
+                undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+                @new_layer.bind_key(undo_key, overwrite=True)
+                def undo_rotation(layer):
+                    # 1. 恢复原图层
+                    src = layer.metadata.get('source_layer')
+                    if src and src in self.viewer.layers:
+                        self.viewer.layers[src].visible = True
+                        self.viewer.layers.selection.active = self.viewer.layers[src]
+                    # 2. 删除当前层
+                    self.viewer.layers.remove(layer)
+                    self.status_label.setText("↩️ Rotation Undone.")
                 
                 self.status_label.setText(f"✅ Rotated {angle:.1f}° (Expand={expand})")
             except Exception as e:
@@ -657,17 +832,101 @@ class GeometryWidget(QWidget):
                 if isinstance(l, napari.layers.Image): l.visible = (l.name == view_layer)
 
         # 2. 创建 ROI 层
+       # [修复 Dtype 报错] 显式初始化 features 为字符串类型
+        # 即使是空列表，也声明一下这列是放字符串的，防止 pandas 推断错误
         roi_layer = self.viewer.add_shapes(
             name="Batch_ROI",
             shape_type='rectangle',
             edge_color='#00FF00', 
             face_color=[0, 1, 0, 0.05],
             edge_width=2,
-            text={'string': '{label}', 'size': 12, 'color': 'white', 'anchor': 'upper_left', 'translation': [-5, -5]}
+            text={
+                'string': '{label}\n{frame_info}', 
+                'size': 10, 
+                'color': '#00FF00', 
+                'anchor': 'upper_left', 
+                'translation': [-5, -5]
+            },
+            features={
+                'label': [], 
+                'frame_range': [], 
+                'frame_info': []
+            }
         )
         roi_layer.events.data.connect(self._on_batch_data_change)
         roi_layer.mode = 'add_rectangle'
-        self.status_label.setText(f"✏️ Drawing on '{view_layer}'. Data source: '{self.batch_data_combo.currentText()}'")
+        
+        # [新增] 绑定 Undo (删除上一个画的框)
+        undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+        @roi_layer.bind_key(undo_key)
+        def undo_batch_rect(layer):
+            if layer.mode == 'add_rectangle' and len(layer.data) > 0:
+                # 移除最后一个数据
+                layer.data = layer.data[:-1]
+                # features 会触发 _on_batch_data_change 自动重建，不用手动删
+                self.status_label.setText("↩️ Last ROI removed.")
+            elif layer.mode == 'select':
+                self.status_label.setText("ℹ️ Undo available in Draw Mode.")
+
+        self.status_label.setText(f"✏️ Drawing on '{view_layer}'. (Ctrl+Z to Undo last)")
+
+    def _set_range_for_selected_roi(self):
+        """
+        设置选中 ROI 的特定帧范围
+        [Fix] 使用 Python List 中转，彻底解决 Pandas ChainedAssignmentError 和 Dtype 问题
+        """
+        if "Batch_ROI" not in self.viewer.layers: return
+        layer = self.viewer.layers["Batch_ROI"]
+        
+        # 1. 获取选中项
+        selected_idxs = list(layer.selected_data)
+        if not selected_idxs:
+            self.status_label.setText("⚠️ No ROI selected. Select a green box first.")
+            return
+        
+        # 2. 获取输入文本
+        range_str = self.batch_frame_edit.text().strip()
+        
+        # === [核心修复] 数据中转 ===
+        # 不直接操作 layer.features (DataFrame)，而是提取为纯 Python 列表
+        # 这样做既快又安全，完全避开 Pandas 的警告
+        
+        current_features = layer.features
+        n_shapes = len(layer.data)
+        
+        # 提取列，如果列不存在则初始化为空列表
+        # list(...) 强制转换，切断与 Pandas 的引用关联
+        labels = list(current_features.get('label', []))
+        ranges = list(current_features.get('frame_range', []))
+        infos = list(current_features.get('frame_info', []))
+        
+        # 3. 对齐数据长度 (防御性编程)
+        # 防止因手动删除等操作导致 features 长度滞后
+        while len(labels) < n_shapes: labels.append(str(len(labels)+1))
+        while len(ranges) < n_shapes: ranges.append("")
+        while len(infos) < n_shapes: infos.append("")
+            
+        # 4. 修改 Python List (安全操作)
+        for idx in selected_idxs:
+            if idx < len(ranges): # 再次检查越界，确保安全
+                if not range_str or range_str.lower() == "global":
+                    ranges[idx] = "" # 空字符串表示使用全局设置
+                    infos[idx] = ""
+                else:
+                    ranges[idx] = str(range_str) # 强制转为字符串
+                    infos[idx] = f"[{range_str}]"
+        
+        # 5. 整体赋值回 Features
+        # Napari 会接收这个字典并自动更新底层的 DataFrame
+        layer.features = {
+            'label': labels,
+            'frame_range': ranges,
+            'frame_info': infos
+        }
+        
+        # 6. 刷新界面
+        layer.refresh()
+        self.status_label.setText(f"✅ Set range '{range_str}' for {len(selected_idxs)} ROI(s).")
 
     def _switch_to_select_mode(self):
         if "Batch_ROI" in self.viewer.layers:
@@ -700,7 +959,6 @@ class GeometryWidget(QWidget):
                 x1, x2 = np.min(xs), np.max(xs)
                 
                 h, w = y2 - y1, x2 - x1
-                
                 needs_reshape = False
                 
                 # 正方形逻辑
@@ -730,147 +988,128 @@ class GeometryWidget(QWidget):
                 layer.data = new_data_list
 
             # 2. Update Labels
-            labels = [str(i+1) for i in range(len(layer.data))]
-            if hasattr(layer, 'features'): layer.features = {'label': labels}
-            elif hasattr(layer, 'properties'): layer.properties = {'label': labels}
+            n_shapes = len(layer.data)
+            labels = [str(i+1) for i in range(n_shapes)]
+            current_ranges = layer.features.get('frame_range', [])
+            current_infos = layer.features.get('frame_info', [])
+            range_list = [str(x) for x in current_ranges]
+            info_list = [str(x) for x in current_infos]
+            # 补齐长度
+            while len(range_list) < n_shapes:
+                range_list.append("")
+                info_list.append("")
+            # 截断
+            range_list = range_list[:n_shapes]
+            info_list = info_list[:n_shapes]
+            
+            layer.features = {
+                'label': labels,
+                'frame_range': range_list,
+                'frame_info': info_list
+            }
+            # if hasattr(layer, 'features'): layer.features = {'label': labels}
+            # elif hasattr(layer, 'properties'): layer.properties = {'label': labels}
             
         finally:
             self._is_updating = False
 
     def _export_batch_crops(self):
+        # 1. 基础校验
         data_layer_name = self.batch_data_combo.currentText()
         view_layer_name = self.batch_view_combo.currentText()
-        
         if "Batch_ROI" not in self.viewer.layers or not len(self.viewer.layers["Batch_ROI"].data):
             self.status_label.setText("❌ No ROIs defined.")
             return
-        if not data_layer_name or data_layer_name not in self.viewer.layers:
-            self.status_label.setText("❌ Invalid Data Layer.")
-            return
+        if not data_layer_name or data_layer_name not in self.viewer.layers: return
 
-        # 检查尺寸匹配
+        # 2. 准备参数 (主线程只负责收集数据)
+        # 提取 Numpy 数组数据，传递给线程是安全的（引用传递，不占额外内存）
         data_stack = self.viewer.layers[data_layer_name].data
-        view_stack = self.viewer.layers[view_layer_name].data
-
-        # === [修改] 应用帧过滤 ===
-        raw_range_text = self.batch_frame_edit.text()
-        total_frames = data_stack.shape[0]
-        selected_indices = self._parse_frame_indices(raw_range_text, total_frames)
+        view_stack = self.viewer.layers[view_layer_name].data # 留给回调函数画 Map 用
         
-        if not selected_indices:
-            self.status_label.setText("❌ No valid frames selected.")
-            return
-
-        # 这一步很关键：先筛选帧，减少数据量，且排除坏帧
-        # 注意：使用 fancy indexing 会创建副本，内存占用会暂时增加
-        filtered_data_stack = data_stack[selected_indices]
-        keep_original_index = self.keep_index_check.isChecked()
-        pad_width = self.padding_spin.value()
-        # View stack 也要同步筛选，用于生成 overview map (虽然 map 只取中间帧，但最好取筛选后的中间帧)
-        filtered_view_stack = view_stack[selected_indices]
-        # =======================
+        layer = self.viewer.layers["Batch_ROI"]
+        rois = layer.data # 这是一个 List[np.ndarray]，拷贝给线程
         
-        if data_stack.shape[-2:] != view_stack.shape[-2:]:
-            QMessageBox.warning(self, "Mismatch", "Data Layer and View Layer sizes do not match! Crops may be misaligned.")
+        # 安全提取 features (防止线程运行时被修改)
+        roi_features = layer.features
+        frame_ranges_list = list(roi_features.get('frame_range', [""] * len(rois)))
+        global_range_text = self.batch_frame_edit.text().strip()
 
+        # 3. 路径处理
         sub_name = self.sample_name_edit.text().strip() or "sample"
-        
-        # 归档路径检测
         archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
         if archive_path and Path(archive_path).exists():
             output_dir = Path(archive_path)
         else:
-            d = QFileDialog.getExistingDirectory(self, "Select Output")
+            last_import_folder = QSettings("NapariUser", "Importer").value("last_folder", "")
+            start_dir = ""
+            
+            if last_import_folder and Path(last_import_folder).exists():
+                # 设为导入文件夹的"同级目录" (即父目录)
+                # 例如导入的是 D:/Data/Session1/Raw，默认打开 D:/Data/Session1
+                start_dir = str(Path(last_import_folder).parent)
+            d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
             if not d: return
             output_dir = Path(d) / sub_name
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        is_tiff = "TIFF" in self.batch_format_combo.currentText()
-        rois = self.viewer.layers["Batch_ROI"].data
-        log_crops = []
-        count = len(rois)
-
-        # [Fix 3] 添加进度条
-        progress = QProgressDialog("Exporting Crops...", "Cancel", 0, count, self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.show()
-
-        for i, roi in enumerate(rois):
-            if progress.wasCanceled(): break
-            
-            ys, xs = roi[:, 0], roi[:, 1]
-            bbox = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-            
-            # 使用 Data Layer 进行裁剪
-            crop = crop_image_stack(filtered_data_stack, bbox)
-
-            # === [新增功能 4] 使用自定义后缀格式 ===
-            suffix_fmt = self.suffix_edit.text()
-            if "{}" not in suffix_fmt:
-                # 如果用户没写 {}，自动补上数字
-                suffix_str = f"{suffix_fmt}{i+1}"
-            else:
-                # 格式化字符串
-                suffix_str = suffix_fmt.replace("{}", str(i+1))
-            
-            fname = f"{sub_name}{suffix_str}"
-            # ===================================
-            
-            if is_tiff:
-                export_to_tiff_stack(crop, str(output_dir / f"{fname}.tiff"))
-            else:
-                p = output_dir / fname
-                p.mkdir(exist_ok=True)
-                for k, img in enumerate(crop):
-                    # 简单归一化以便预览
-                    if img.dtype in [np.float32, np.float64]:
-                        mn, mx = img.min(), img.max()
-                        if mx > mn: img = ((img - mn)/(mx - mn)*255).astype(np.uint8)
-                        else: img = img.astype(np.uint8)
-                    
-                    # === [核心修改] 计算文件名索引 ===
-                    if keep_original_index:
-                        # 使用 selected_indices 中的真实原始帧号
-                        # 注意：crop 的第 k 帧对应 selected_indices 的第 k 个元素
-                        file_idx = selected_indices[k]
-                    else:
-                        # 重置为 0, 1, 2...
-                        file_idx = k
-                    
-                    # 使用 f-string 动态填充零: {file_idx:0{pad_width}d}
-                    file_name = f"{file_idx:0{pad_width}d}.png"
-                    cv2.imwrite(str(p / file_name), img)
-            
-            log_crops.append({"id": i+1, "bbox": bbox, "filename": fname})
-            progress.setValue(i + 1)
-            
-        # 生成 Overview Map (使用 View Layer + 矩形框)
-        self._create_overview_map(filtered_view_stack, rois, sub_name, output_dir)
-        
-        # Log to JSON
-        json_path = output_dir / "processing_log.json"
-        data = {}
-        if json_path.exists():
-            try: 
-                with open(json_path, 'r') as f: data = json.load(f)
-            except: pass
-            
-        data["batch_crop"] = {
-            "data_layer": data_layer_name,
-            "view_layer": view_layer_name,
-            "count": count,
-            "frame_filter": raw_range_text if raw_range_text else "All", # [修改] 记录筛选参数
-            "rois": log_crops
+        # 4. 打包参数字典 (传递给线程)
+        params = {
+            'data_stack': data_stack,
+            'rois': rois,
+            'frame_ranges_list': frame_ranges_list,
+            'global_range_text': global_range_text,
+            'output_dir': output_dir,
+            'sub_name': sub_name,
+            'suffix_fmt': self.suffix_edit.text(),
+            'is_tiff': "TIFF" in self.batch_format_combo.currentText(),
+            'keep_idx': self.keep_index_check.isChecked(),
+            'pad': self.padding_spin.value(),
+            'data_layer_name': data_layer_name 
         }
-        with open(json_path, 'w') as f: json.dump(data, f, indent=2)
 
-        progress.setValue(count)
-        progress.close()
+        # 5. 显示模态进度条 (这下主界面不会卡死了，进度条也能刷新了)
+        self.batch_progress = QProgressDialog("Exporting Crops...", "Cancel", 0, len(rois), self)
+        self.batch_progress.setWindowModality(Qt.WindowModal)
+        self.batch_progress.setMinimumDuration(0)
+        self.batch_progress.canceled.connect(self._on_export_cancel)
+        self.batch_progress.show()
+
+        # 6. 创建并启动线程
+        self.export_thread = BatchExportThread(params)
         
-        self.status_label.setText(f"✅ Exported {count} crops to {output_dir.name}")
-        self._force_view_active = False # 解锁视图
+        # 绑定信号：线程发出的进度 -> 更新进度条
+        self.export_thread.progress.connect(self.batch_progress.setValue)
         
-        QMessageBox.information(self, "Success", f"Successfully exported {count} crops!\nSaved to: {output_dir.name}")
+        # 绑定信号：线程完成 -> 执行后续操作 (画 Map，弹提示)
+        # 注意：这里用 lambda 把 view_stack 传给回调，因为画 map 很快，可以在主线程做
+        self.export_thread.finished.connect(lambda c, path: self._on_export_finished(c, path, view_stack, rois, sub_name, output_dir))
+        self.export_thread.error.connect(self._on_export_error)
+        
+        self.export_thread.start() # 🚀 启动！
+        
+    def _on_export_cancel(self):
+        """用户点击取消按钮时触发"""
+        if self.export_thread.isRunning():
+            self.export_thread.requestInterruption()
+            self.status_label.setText("⚠️ Export canceled.")
+
+    def _on_export_finished(self, count, path_name, view_stack, rois, sub_name, output_dir):
+        """线程任务完成后触发"""
+        self.batch_progress.close()
+        
+        # 生成 Map (Pillow 画图很快，不阻塞 UI，放在主线程没问题)
+        self._create_overview_map(view_stack, rois, sub_name, output_dir)
+        
+        self.status_label.setText(f"✅ Exported {count} crops.")
+        self._force_view_active = False
+        QMessageBox.information(self, "Success", f"Exported {count} crops!\nSaved to: {path_name}")
+
+    def _on_export_error(self, err):
+        """线程报错时触发"""
+        self.batch_progress.close()
+        self.status_label.setText(f"❌ Error: {err}")
+        QMessageBox.critical(self, "Export Error", str(err))
 
     def _create_overview_map(self, image_stack, rois, sample_name, output_dir):
         """保存 Overview Map (可视层 + 矩形)"""
@@ -897,24 +1136,3 @@ class GeometryWidget(QWidget):
             
         pil_img.save(output_dir / f"{sample_name}_Overview.png")
     
-    def _parse_frame_indices(self, text, total_frames):
-        """解析帧范围 (复用逻辑)"""
-        if not text.strip(): return list(range(total_frames)) # 空字符串返回所有
-        indices = set()
-        try:
-            parts = [p.strip() for p in text.split(',')]
-            for p in parts:
-                if not p: continue
-                if '-' in p:
-                    start, end = map(int, p.split('-'))
-                    start = max(0, start)
-                    end = min(total_frames - 1, end)
-                    if start <= end:
-                        indices.update(range(start, end + 1))
-                else:
-                    idx = int(p)
-                    if 0 <= idx < total_frames:
-                        indices.add(idx)
-            return sorted(list(indices))
-        except ValueError:
-            return list(range(total_frames)) # 解析失败回退到所有，或者抛错

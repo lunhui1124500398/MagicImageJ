@@ -16,6 +16,7 @@ import napari
 import json
 from pathlib import Path
 import datetime
+from widgets.settings_widget import GlobalConfig
 
 # JSON Encoder
 class NumpyEncoder(json.JSONEncoder):
@@ -41,6 +42,58 @@ class EnhanceThread(QThread):
             
             result = enhance_image_stack(self.image_stack, **self.params, progress_callback=cb)
             self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class ContrastBurnThread(QThread):
+    progress = Signal(int)
+    finished = Signal(np.ndarray)
+    error = Signal(str)
+
+    def __init__(self, data, c_min, c_max):
+        super().__init__()
+        self.data = data
+        self.c_min = c_min
+        self.c_max = c_max
+
+    def run(self):
+        try:
+            self.progress.emit(10)
+            # 1. 转换类型 (Float32) 以便计算
+            # 如果数据量极大，这里也可以分块，但通常 numpy 整体运算够快，
+            # 主要是搬移到子线程不卡 UI
+            data_f = self.data.astype(np.float32, copy=False)
+            
+            self.progress.emit(30)
+            range_width = self.c_max - self.c_min
+            if range_width < 1e-9: range_width = 1e-9
+            
+            # 2. 归一化
+            normalized = (data_f - self.c_min) / range_width
+            self.progress.emit(60)
+            
+            # 3. Clip
+            normalized = np.clip(normalized, 0, 1)
+            self.progress.emit(80)
+            
+            # 4. 映射回 uint8 (通常 burn 都是为了可视化导出，转为 8bit 最通用)
+            # 如果原图是 16bit，这里也可以保留，但通常 ImageJ 风格的 Adjust Contrast 
+            # 意味着 "Apply Window/Level"，结果通常预期是视觉一致的 8bit。
+            # 这里我们根据原图类型智能判断：如果是整数类型，通常映射回相同类型或 uint8
+            
+            dtype = self.data.dtype
+            if np.issubdtype(dtype, np.integer):
+                # 如果原图是整数，我们映射到该类型的最大值
+                # 但通常 Apply Contrast 后的目的是为了看清楚，转 uint8 (0-255) 是最常用的
+                # 这里为了稳妥，映射到 0-255 uint8，这也是 "Burn" 的通常含义
+                res = (normalized * 255).astype(np.uint8)
+            else:
+                # 浮点图保持浮点
+                res = normalized.astype(np.float32)
+                
+            self.progress.emit(100)
+            self.finished.emit(res)
+            
         except Exception as e:
             self.error.emit(str(e))
 
@@ -316,7 +369,7 @@ class EnhanceWidget(QWidget):
             if not enhanced_stack.flags['C_CONTIGUOUS']:
                 enhanced_stack = np.ascontiguousarray(enhanced_stack)
             new_layer_name = f"Enh_{layer_name}"
-            new_layer = self.viewer.add_image(enhanced_stack, name=new_layer_name, colormap='gray')
+            new_layer = self.viewer.add_image(enhanced_stack, name=new_layer_name, colormap='gray', metadata={'source_layer': layer_name})
             
             # === Log params ===
             self._log_action("filter_enhancement", {
@@ -325,8 +378,22 @@ class EnhanceWidget(QWidget):
             })
 
             self.status_label.setText(f"✅ Done. Layer: {new_layer_name}.")
-            input_layer.visible = False 
+            if layer_name in self.viewer.layers:
+                self.viewer.layers[layer_name].visible = False
             self.viewer.layers.selection.active = new_layer
+
+            # [新增] 绑定 Undo
+            undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+            @new_layer.bind_key(undo_key, overwrite=True)
+            def undo_enhance(layer):
+                # 1. 恢复原图层
+                src = layer.metadata.get('source_layer')
+                if src and src in self.viewer.layers:
+                    self.viewer.layers[src].visible = True
+                    self.viewer.layers.selection.active = self.viewer.layers[src]
+                # 2. 删除当前层
+                self.viewer.layers.remove(layer)
+                self.status_label.setText("↩️ Enhancement Undone.")
         except Exception as e:
             self.status_label.setText(f"❌ Error: {str(e)}")
 
@@ -425,39 +492,89 @@ class EnhanceWidget(QWidget):
         self.status_label.setText("⏳ Applying contrast...")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+        self.apply_contrast_btn.setEnabled(False)
+
+        self.burn_thread = ContrastBurnThread(layer.data, c_min, c_max)
+        self.burn_thread.progress.connect(self.progress_bar.setValue)
+        self.burn_thread.finished.connect(lambda res: self._on_burn_finished(res, layer, c_min, c_max))
+        self.burn_thread.error.connect(lambda err: self._on_enhance_error(err)) # 复用错误处理
+        self.burn_thread.start()
         
+        # try:
+        #     data = layer.data
+        #     range_width = c_max - c_min
+        #     if range_width < 1e-9: range_width = 1e-9
+        #     normalized = (data - c_min) / range_width
+        #     normalized = np.clip(normalized, 0, 1)
+        #     dtype = data.dtype
+            
+        #     # 映射回原类型范围 (如 uint8 0-255)
+        #     if np.issubdtype(dtype, np.integer):
+        #         info = np.iinfo(dtype)
+        #         burnt_data = (normalized * info.max).astype(dtype)
+        #     else:
+        #         burnt_data = normalized.astype(np.float32)
+            
+        #     new_layer_name = f"Contrast_{layer.name}"
+        #     new_layer = self.viewer.add_image(burnt_data, name=new_layer_name, colormap='gray')
+            
+        #     self._log_action("contrast_adjustment", {
+        #         "source": layer.name,
+        #         "min": c_min,
+        #         "max": c_max,
+        #         "clipped": True
+        #     })
+
+        #     self.status_label.setText(f"✅ Applied. New layer: {new_layer_name}")
+        #     layer.visible = False
+        #     self.viewer.layers.selection.active = new_layer
+        # except Exception as e:
+        #     self.status_label.setText(f"❌ Error: {str(e)}")
+        # finally:
+        #     self.progress_bar.setVisible(False)
+    def _on_burn_finished(self, burnt_data, original_layer, c_min, c_max):
+        self.progress_bar.setVisible(False)
+        self.apply_contrast_btn.setEnabled(True)
         try:
-            data = layer.data
-            range_width = c_max - c_min
-            if range_width < 1e-9: range_width = 1e-9
-            normalized = (data - c_min) / range_width
-            normalized = np.clip(normalized, 0, 1)
-            dtype = data.dtype
+            new_layer_name = f"Contrast_{original_layer.name}"
             
-            # 映射回原类型范围 (如 uint8 0-255)
-            if np.issubdtype(dtype, np.integer):
-                info = np.iinfo(dtype)
-                burnt_data = (normalized * info.max).astype(dtype)
-            else:
-                burnt_data = normalized.astype(np.float32)
+            # 添加新图层
+            # [新增] 绑定 source_layer 元数据以便 Undo
+            new_layer = self.viewer.add_image(
+                burnt_data, 
+                name=new_layer_name, 
+                colormap='gray',
+                metadata={'source_layer': original_layer.name}
+            )
             
-            new_layer_name = f"Contrast_{layer.name}"
-            new_layer = self.viewer.add_image(burnt_data, name=new_layer_name, colormap='gray')
-            
+            # 记录日志
             self._log_action("contrast_adjustment", {
-                "source": layer.name,
+                "source": original_layer.name,
                 "min": c_min,
                 "max": c_max,
                 "clipped": True
             })
 
             self.status_label.setText(f"✅ Applied. New layer: {new_layer_name}")
-            layer.visible = False
+            
+            # 隐藏原图层
+            original_layer.visible = False
             self.viewer.layers.selection.active = new_layer
+            
+            # [新增] 绑定 Undo
+            from widgets.settings_widget import GlobalConfig
+            undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+            @new_layer.bind_key(undo_key, overwrite=True)
+            def undo_burn(layer):
+                src = layer.metadata.get('source_layer')
+                if src and src in self.viewer.layers:
+                    self.viewer.layers[src].visible = True
+                    self.viewer.layers.selection.active = self.viewer.layers[src]
+                self.viewer.layers.remove(layer)
+                self.status_label.setText("↩️ Contrast Undo.")
+
         except Exception as e:
             self.status_label.setText(f"❌ Error: {str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
 
     def _log_action(self, key, info):
         try:
