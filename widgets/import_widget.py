@@ -1,15 +1,18 @@
-# File: widgets/import_widget.py
-
 """
 数据导入控件 - 增强版 (含智能数据归档 & 进度优化)
-更新日志:
-- [New] 增加“手动选择单帧计算剂量”功能 (Pick Button)。
-- [Critical Fix] ArchiveThread: Windows 长路径支持 & 递归检测。
+修复日志:
+- [Fix] 补全缺失的 _get_dir_size 方法。
+- [Req 0] 自动正则匹配 Dataset ID。
+- [Req 1] 原始数据文件夹按 {Date}_{Sub}_{OriginalDatasetN} 命名。
+- [Req 2] >100GB 自动切换为移动模式，并弹窗提醒。
+- [Info] 归档时保存 current_date 和 current_dataset_id 到全局配置。
+- [Req New] 归档完成弹窗包含文件大小和模式信息，且可配置关闭。
 """
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QFileDialog, QLabel, QSpinBox, QHBoxLayout,
                             QProgressBar, QComboBox, QGroupBox, QMessageBox,
-                            QDoubleSpinBox, QScrollArea, QLineEdit, QTextEdit, QSizePolicy)
+                            QDoubleSpinBox, QScrollArea, QLineEdit, QTextEdit, QSizePolicy,
+                            QCheckBox) # Added QCheckBox
 from qtpy.QtCore import Signal, QThread, QSettings, Qt
 import numpy as np
 from pathlib import Path
@@ -18,6 +21,7 @@ import shutil
 import json
 import datetime
 import gc
+import re
 
 try:
     import dm4
@@ -35,35 +39,39 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 class ArchiveThread(QThread):
-    """归档复制线程"""
+    """归档复制/移动线程"""
     finished = Signal()
     error = Signal(str)
     
-    def __init__(self, src, dst):
+    def __init__(self, src, dst, move_mode=False):
         super().__init__()
         self.src = src
         self.dst = dst
+        self.move_mode = move_mode 
         
     def run(self):
         try:
-            # 1. 路径标准化 (Resolve absolute paths)
+            # 1. 路径标准化
             src_abs = os.path.abspath(self.src)
             dst_abs = os.path.abspath(self.dst)
 
-            # 2. 递归检查 (Recursion Guard)
+            # 2. 递归检查
             if dst_abs.startswith(src_abs):
                 raise ValueError(f"Recursion Error: Destination is inside Source.\nSrc: {src_abs}\nDst: {dst_abs}")
 
-            # 3. Windows 长路径支持 (Long Path Support)
+            # 3. Windows 长路径支持
             if os.name == 'nt':
                 src_abs = src_abs.replace('/', '\\')
                 dst_abs = dst_abs.replace('/', '\\')
-                
                 if not src_abs.startswith('\\\\?\\'): src_abs = '\\\\?\\' + src_abs
                 if not dst_abs.startswith('\\\\?\\'): dst_abs = '\\\\?\\' + dst_abs
             
-            # 4. 执行复制
-            shutil.copytree(src_abs, dst_abs, dirs_exist_ok=True)
+            # 4. 执行复制或移动
+            if self.move_mode:
+                shutil.move(src_abs, dst_abs)
+            else:
+                shutil.copytree(src_abs, dst_abs, dirs_exist_ok=True)
+                
             self.finished.emit()
             
         except Exception as e:
@@ -98,7 +106,7 @@ class DoseCalculationThread(QThread):
     def __init__(self, folder_path, frame_idx=-1):
         super().__init__()
         self.folder_path = Path(folder_path)
-        self.frame_idx = frame_idx # -1 means Auto (Middle frame)
+        self.frame_idx = frame_idx 
 
     def _decode_string(self, data):
         if isinstance(data, str): return data
@@ -126,33 +134,26 @@ class DoseCalculationThread(QThread):
             self.error.emit("Library 'dm4' not found.")
             return
         try:
-            # 1. 获取所有 DM4 文件并排序 (与读取顺序一致)
             files = sorted(list(self.folder_path.rglob("*.dm4")))
             if not files:
                 self.error.emit("No .dm4 files found.")
                 return
             
-            # 2. 确定目标文件索引
             total_files = len(files)
-            candidate = None
             target_idx = 0
             if self.frame_idx < 0:
-                # 自动选择中间
                 mid = total_files // 2
                 start = max(0, mid - 5)
                 end = min(total_files, mid + 5)
                 candidates_list = files[start:end] if files[start:end] else files
-                # 选取体积最大的文件
                 candidate = max(candidates_list, key=lambda f: f.stat().st_size)
                 target_idx = files.index(candidate)
             else:
-                # 手动选择，防止越界
                 target_idx = max(0, min(self.frame_idx, total_files - 1))
                 candidate = files[target_idx]
             
             candidate = files[target_idx]
             
-            # 3. 读取 Metadata
             with dm4.DM4File.open(str(candidate)) as dm4file:
                 tags = dm4file.read_directory()
                 image_list = tags.named_subdirs['ImageList']
@@ -230,7 +231,7 @@ class ImportWidget(QWidget):
             self.folder_label.setText(last)
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
-            self.pick_file_btn.setEnabled(True) # Enable pick button
+            self.pick_file_btn.setEnabled(True)
 
     def _setup_ui(self):
         main = QVBoxLayout(); main.setContentsMargins(2, 2, 2, 2)
@@ -245,7 +246,7 @@ class ImportWidget(QWidget):
         h_brow.addWidget(btn_browse); self.folder_label = QLabel("None"); self.folder_label.setStyleSheet("color: gray; font-size: 11px;")
         l_source.addLayout(h_brow); l_source.addWidget(self.folder_label); g_source.setLayout(l_source); layout.addWidget(g_source)
 
-        # Group 2: Scan Metadata (修改的部分)
+        # Group 2: Scan Metadata
         g_dose = QGroupBox("2. Scan Metadata"); l_dose = QVBoxLayout(); l_dose.setSpacing(4); l_dose.setContentsMargins(8, 8, 8, 8)
         
         h_calc = QHBoxLayout()
@@ -254,21 +255,16 @@ class ImportWidget(QWidget):
         self.calc_dose_btn.clicked.connect(self._calc_dose)
         h_calc.addWidget(self.calc_dose_btn)
         
-        # === [NEW] Pick Frame Button & SpinBox ===
         h_calc.addWidget(QLabel("Img:"))
-        
-        # 1. 索引输入框 (支持 -1 Auto)
         self.dose_idx_spin = QSpinBox()
         self.dose_idx_spin.setRange(-1, 99999)
         self.dose_idx_spin.setValue(-1)
         self.dose_idx_spin.setSpecialValueText("Auto")
         self.dose_idx_spin.setToolTip("Frame Index (-1 for Middle). Pick file to auto-set.")
-        
         self.dose_idx_spin.setMinimumWidth(80)
         self.dose_idx_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         h_calc.addWidget(self.dose_idx_spin)
 
-        # 2. 选取文件按钮
         self.pick_file_btn = QPushButton("📂")
         self.pick_file_btn.setToolTip("Pick a specific .dm4 file from the folder to calculate dose")
         self.pick_file_btn.setFixedWidth(50)
@@ -276,7 +272,6 @@ class ImportWidget(QWidget):
         self.pick_file_btn.clicked.connect(self._pick_single_file_for_dose)
         h_calc.addWidget(self.pick_file_btn)
 
-        # 结果显示
         self.dose_val_label = QLabel("N/A")
         self.dose_val_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
         h_calc.addWidget(self.dose_val_label)
@@ -319,6 +314,15 @@ class ImportWidget(QWidget):
         l_arc.addWidget(self.create_archive_btn)
         self.archive_progress = QProgressBar(); self.archive_progress.setVisible(False); self.archive_progress.setRange(0, 0) # Indeterminate
         l_arc.addWidget(self.archive_progress)
+        
+        # [New Config] Show Popup Checkbox
+        self.check_show_popup = QCheckBox("Show Result Popup")
+        # Load from QSettings, default True. type=bool ensures correct parsing
+        self.check_show_popup.setChecked(self.settings.value("show_archive_popup", True, type=bool))
+        self.check_show_popup.stateChanged.connect(lambda v: self.settings.setValue("show_archive_popup", bool(v)))
+        self.check_show_popup.setToolTip("Show a popup message with size and mode details after archiving.")
+        l_arc.addWidget(self.check_show_popup)
+        
         g_arc.setLayout(l_arc); layout.addWidget(g_arc)
 
         # Group 5: Load
@@ -340,34 +344,38 @@ class ImportWidget(QWidget):
             self.folder_label.setText(f)
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
-            self.pick_file_btn.setEnabled(True) # 启用选择文件按钮
+            self.pick_file_btn.setEnabled(True)
+            
+            # === [Req 0] Auto-detect Dataset ID ===
+            folder_name = Path(f).name
+            # 匹配 dataset1, dataset-1, dataset_nonOL_1 等中的数字
+            match = re.search(r"dataset[-_]?.*?(\d+)", folder_name, re.IGNORECASE)
+            if match:
+                ds_num = match.group(1)
+                self.dataset_edit.setText(f"ds{ds_num}")
+                self.status.setText(f"ℹ️ Auto-detected dataset ID: ds{ds_num}")
+            else:
+                self.status.setText("⚠️ Could not auto-detect 'dataset' number in folder name.")
+                QMessageBox.information(self, "Check ID", "Could not detect 'dataset' number in folder name.\nPlease check the ID field manually.")
+            
             self._update_preview()
 
     def _pick_single_file_for_dose(self):
-        """打开文件选择器，反算索引"""
         if not self.current_folder: return
-        
-        # 打开文件选择对话框
         f, _ = QFileDialog.getOpenFileName(self, "Select DM4 Image for Dose Calculation", self.current_folder, "DM4 Files (*.dm4)")
-        
         if f:
             self.status.setText("Locating file index...")
             try:
-                # 为了找到正确的 Index，我们需要重现线程里的排序逻辑
                 target_path = Path(f).resolve()
                 all_files = sorted(list(Path(self.current_folder).rglob("*.dm4")))
-                
-                # 查找 Index
                 found_idx = -1
                 for i, p in enumerate(all_files):
                     if p.resolve() == target_path:
                         found_idx = i
                         break
-                
                 if found_idx >= 0:
                     self.dose_idx_spin.setValue(found_idx)
                     self.status.setText(f"Selected: {target_path.name} (Index: {found_idx})")
-                    # 自动触发计算
                     self._calc_dose()
                 else:
                     self.status.setText("❌ File not found in current structure match.")
@@ -377,12 +385,9 @@ class ImportWidget(QWidget):
     def _calc_dose(self):
         if not self.current_folder: return
         self.calc_dose_btn.setEnabled(False)
-        self.pick_file_btn.setEnabled(False) # 计算时禁用选择
+        self.pick_file_btn.setEnabled(False)
         self.status.setText("Scanning metadata...")
-        
-        # 获取用户设置的 Index (-1 为自动)
         frame_idx = self.dose_idx_spin.value()
-        
         self.thread_dose = DoseCalculationThread(self.current_folder, frame_idx=frame_idx)
         self.thread_dose.finished.connect(self._on_dose_done)
         self.thread_dose.error.connect(lambda e: (self.status.setText(e), self.calc_dose_btn.setEnabled(True), self.pick_file_btn.setEnabled(True)))
@@ -428,33 +433,38 @@ class ImportWidget(QWidget):
         history = self.settings.value("substance_history", [])
         if history:
             self.substance_edit.addItems(history)
-            self.substance_edit.setCurrentIndex(0) # 默认选最近的一个
+            self.substance_edit.setCurrentIndex(0)
 
     def _save_substance_history(self):
-        """在归档时调用此方法"""
         current_text = self.substance_edit.currentText().strip()
         if not current_text: return
-        
         history = self.settings.value("substance_history", [])
-        # 移除重复项，并将当前项插到最前
-        if current_text in history:
-            history.remove(current_text)
+        if current_text in history: history.remove(current_text)
         history.insert(0, current_text)
-        
-        # 只保留最近5个
         history = history[:5]
         self.settings.setValue("substance_history", history)
-        
-        # 刷新UI
         self.substance_edit.blockSignals(True)
         self.substance_edit.clear()
         self.substance_edit.addItems(history)
         self.substance_edit.setCurrentText(current_text)
         self.substance_edit.blockSignals(False)
 
+    def _get_dir_size(self, path):
+        total = 0
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file():
+                    total += entry.stat().st_size
+                elif entry.is_dir():
+                    total += self._get_dir_size(entry.path)
+        except Exception: pass
+        return total
+
     def _create_archive(self):
         if not self.current_folder: return
         self._save_substance_history()
+        
+        # 1. 准备路径
         parent_dir = Path(self.current_folder).parent
         folder_name = self._generate_folder_name()
         archive_path = parent_dir / folder_name
@@ -463,15 +473,21 @@ class ImportWidget(QWidget):
             if QMessageBox.warning(self, "Exists", f"Folder exists:\n{folder_name}\nOverwrite?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.No: return
         
         self.create_archive_btn.setEnabled(False)
-        self.status.setText("Archiving... Do not close.")
         self.archive_progress.setVisible(True)
         
-        # Create structure
+        # 2. 创建归档根目录结构
         archive_path.mkdir(parents=True, exist_ok=True)
         self.archive_root = str(archive_path)
         QSettings("NapariUser", "Global").setValue("archive_path", self.archive_root)
         
-        # Write info files
+        # === [信息共享] 保存关键信息供 GeometryWidget 使用 ===
+        date_str = self.meta_cache.get('date_fmt', datetime.datetime.now().strftime("%Y%m%d"))
+        ds_id = self.dataset_edit.text().strip() or "ds1"
+        QSettings("NapariUser", "Global").setValue("current_date", date_str)
+        QSettings("NapariUser", "Global").setValue("current_dataset_id", ds_id)
+        # =======================================================
+
+        # 3. 写入 Info
         with open(archive_path / "readme.txt", 'w', encoding='utf-8') as f:
             f.write(f"Archive: {folder_name}\nCreated: {datetime.datetime.now()}\n" + "-"*30 + "\n")
             self.sub_txt = self.substance_edit.currentText()
@@ -483,20 +499,53 @@ class ImportWidget(QWidget):
         params = {"folder_name": folder_name, "import_meta": self.meta_cache, "planned_settings": {"rolling_avg_window": self.win_spin.value(), "gaussian_sigma": self.sigma_spin.value()}}
         with open(archive_path / "processing_log.json", 'w') as f: json.dump(params, f, indent=2, cls=NumpyEncoder)
 
-        # Start Copy Thread
-        # 传递字符串路径给线程，线程内部处理 \\?\ 转换
-        raw_dest = archive_path / "Original_Dataset"
+        # 4. [Req 2] 计算大小并决定 Move vs Copy
+        self.status.setText("Checking size...")
+        size_bytes = self._get_dir_size(str(self.current_folder))
+        size_gb = size_bytes / (1024**3)
+        move_mode = False
         
-        self.archive_thread = ArchiveThread(str(self.current_folder), str(raw_dest))
-        self.archive_thread.finished.connect(self._on_archive_done)
+        # 阈值: 100GB
+        if size_gb > 100:
+            move_mode = True
+            # 注意：此处弹窗只是通知将要发生什么，不需要用户再次确认（因为已经在之前逻辑里确定了策略）
+            # 或者，如果之前需求是自动切换并提醒，这里只是标记
+            # 用户希望在 *完成后* 提醒，所以这里我们只记录状态
+        
+        # 5. [Req 1] 原始文件重命名逻辑
+        # 提取 dataset ID 数字部分
+        ds_num = re.sub(r'[^0-9]', '', ds_id) 
+        if not ds_num: ds_num = "1"
+        
+        raw_folder_name = f"{date_str}_{self.sub_txt}_OriginalDataset{ds_num}"
+        raw_dest = archive_path / raw_folder_name
+        
+        self.status.setText(f"{'Moving' if move_mode else 'Copying'} raw data...")
+        self.archive_thread = ArchiveThread(str(self.current_folder), str(raw_dest), move_mode=move_mode)
+        # Pass move_mode and size_gb to callback
+        self.archive_thread.finished.connect(lambda: self._on_archive_done(move_mode, size_gb))
         self.archive_thread.error.connect(self._on_archive_error)
         self.archive_thread.start()
 
-    def _on_archive_done(self):
+    def _on_archive_done(self, was_moved, size_gb):
         self.archive_progress.setVisible(False)
         self.create_archive_btn.setEnabled(True)
         self.status.setText(f"✅ Archived: {Path(self.archive_root).name}")
-        QMessageBox.information(self, "Success", f"Archive created!\n{self.archive_root}\n\nWidgets linked to this archive.")
+        
+        # [Req New] Popup with details
+        if self.check_show_popup.isChecked():
+            mode_str = "MOVE (Fast)" if was_moved else "COPY (Safe)"
+            msg = f"Archive created successfully!\n\n" \
+                  f"📂 Path: {self.archive_root}\n" \
+                  f"📦 Source Size: {size_gb:.2f} GB\n" \
+                  f"⚙️ Mode: {mode_str}\n"
+            
+            if was_moved:
+                msg += "\n[Info] Large dataset detected (>100GB). Original folder was MOVED to archive to save time/space."
+            else:
+                msg += "\n[Info] Original folder was COPIED. Please delete the source manually if needed."
+                
+            QMessageBox.information(self, "Archive Complete", msg)
 
     def _on_archive_error(self, err):
         self.archive_progress.setVisible(False)
@@ -507,22 +556,12 @@ class ImportWidget(QWidget):
     def _load_data(self):
         if not self.current_folder: return
         if len(self.viewer.layers) > 0:
-            # 弹出确认框，防止误触导致数据丢失
             reply = QMessageBox.question(
-                self, 
-                "Confirm Load", 
-                "Loading new data will CLEAR ALL current layers (including analysis results).\n\n"
-                "Are you sure you want to continue?",
-                QMessageBox.Yes | QMessageBox.No, 
-                QMessageBox.Yes
+                self, "Confirm Load", "Loading new data will CLEAR ALL current layers.\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
             )
-            
-            # 如果用户点了 No，直接取消操作
-            if reply == QMessageBox.No:
-                return
-
-            # 用户点了 Yes，执行内存清理
-            print("Cleaning up existing layers to free memory...")
+            if reply == QMessageBox.No: return
+            print("Cleaning up existing layers...")
             self.viewer.layers.clear() 
             gc.collect()
         

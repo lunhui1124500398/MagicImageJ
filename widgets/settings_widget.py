@@ -1,6 +1,8 @@
 """
 File: widgets/settings_widget.py
 配置管理与设置界面 (增强版)
+修改日志:
+- [Req 3] 新增后缀配置 (lrtem, hrtem, mask, mask_new)
 """
 from qtpy.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                             QLineEdit, QPushButton, QFormLayout, QTabWidget, 
@@ -15,12 +17,17 @@ class GlobalConfig:
     
     DEFAULTS = {
         "shortcut_toggle_ui": "J",
-        "shortcut_undo_drift": "Ctrl+Z", # Napari 偏好 Control 全拼
+        "shortcut_undo_drift": "Ctrl+Z",
         "shortcut_apply_crop": "Enter",
         "shortcut_switch_mode": "M",
         "drift_kernel": 11,
         "drift_workers": 8,
-        "geo_suffix": "-NP{}",
+        # Geometry Defaults
+        "geo_suffix": "_origin",      # 主后缀默认值
+        "geo_suffix_lrtem": "_lrtem", # [New]
+        "geo_suffix_hrtem": "_hrtem", # [New]
+        "geo_suffix_mask": "_mask",   # [New]
+        "geo_suffix_mask_new": "_mask_new", # [New]
         "geo_padding": 5,
         "geo_keep_index": True,
         "geo_force_square": True,
@@ -30,7 +37,6 @@ class GlobalConfig:
     @classmethod
     def get(cls, key):
         val = cls._settings.value(key, cls.DEFAULTS.get(key, ""))
-        # 修正：处理 QSettings 读取布尔值可能变字符串的问题
         if str(val).lower() == 'true': return True
         if str(val).lower() == 'false': return False
         return val
@@ -41,31 +47,23 @@ class GlobalConfig:
     
     @classmethod
     def get_napari_shortcut(cls, key):
-        """
-        [关键修复] 将 Qt 的快捷键格式 (Ctrl+Z) 转换为 Napari 识别的格式 (Control-Z)
-        """
         raw = cls.get(key)
-        # 替换规则：Napari 使用 'Control-' 而不是 'Ctrl+'
-        # 且分隔符通常是 '-'
+        # Napari shortcut format conversion
         napari_key = raw.replace("Ctrl+", "Control-") \
                         .replace("Shift+", "Shift-") \
                         .replace("Alt+", "Alt-") \
                         .replace("Meta+", "Meta-") \
-                        .replace("Enter", "Return") # 有时 Enter 需要转为 Return
-        
-        # 处理单独的 "Ctrl Z" (无加号情况，虽然 Qt 通常带加号)
+                        .replace("Enter", "Return")
         if "Ctrl " in napari_key:
             napari_key = napari_key.replace("Ctrl ", "Control-")
-            
         return napari_key
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("⚙️ Preferences & Shortcuts")
-        self.resize(600, 500) #稍微调大一点
+        self.resize(600, 550) 
         
-        # === [修复 4] 统一应用样式表 (与主界面一致) ===
         self.setStyleSheet("""
             QDialog { background-color: #262626; color: #E0E0E0; font-family: "Segoe UI", sans-serif; font-size: 10pt; }
             QTabWidget::pane { border: 1px solid #444; }
@@ -106,7 +104,7 @@ class SettingsDialog(QDialog):
         tab_shortcuts.setLayout(form_short)
         tabs.addTab(tab_shortcuts, "⌨️ Shortcuts")
         
-        # === [修复 3] Tab 2: Default Params (可视化参数) ===
+        # === Tab 2: Default Params ===
         tab_params = QWidget()
         layout_params = QVBoxLayout()
         
@@ -125,7 +123,7 @@ class SettingsDialog(QDialog):
         layout_params.addWidget(g_drift)
         
         # Group: Geometry
-        g_geo = QGroupBox("Batch Crop / Geometry Defaults")
+        g_geo = QGroupBox("Batch Crop Defaults")
         f_geo = QFormLayout()
         
         self.geo_suffix_edit = QLineEdit(str(GlobalConfig.get("geo_suffix")))
@@ -134,7 +132,7 @@ class SettingsDialog(QDialog):
         self.geo_sq_check = QCheckBox("Force Square Crops"); self.geo_sq_check.setChecked(bool(GlobalConfig.get("geo_force_square")))
         self.geo_enl_check = QCheckBox("Enlarge Canvas on Rotate"); self.geo_enl_check.setChecked(bool(GlobalConfig.get("geo_enlarge")))
 
-        f_geo.addRow("Suffix Pattern:", self.geo_suffix_edit)
+        f_geo.addRow("Main Suffix (Default):", self.geo_suffix_edit)
         f_geo.addRow("Zero Padding:", self.geo_padding_spin)
         f_geo.addRow("", self.geo_keep_idx_check)
         f_geo.addRow("", self.geo_sq_check)
@@ -142,6 +140,21 @@ class SettingsDialog(QDialog):
         g_geo.setLayout(f_geo)
         layout_params.addWidget(g_geo)
         
+        # Group: Folder Suffixes (Auxiliary)
+        g_aux = QGroupBox("Auxiliary Folder Suffixes")
+        f_aux = QFormLayout()
+        self.suff_lr_edit = QLineEdit(str(GlobalConfig.get("geo_suffix_lrtem")))
+        self.suff_hr_edit = QLineEdit(str(GlobalConfig.get("geo_suffix_hrtem")))
+        self.suff_mask_edit = QLineEdit(str(GlobalConfig.get("geo_suffix_mask")))
+        self.suff_new_edit = QLineEdit(str(GlobalConfig.get("geo_suffix_mask_new")))
+        
+        f_aux.addRow("Low Res:", self.suff_lr_edit)
+        f_aux.addRow("High Res:", self.suff_hr_edit)
+        f_aux.addRow("Mask:", self.suff_mask_edit)
+        f_aux.addRow("Mask (New):", self.suff_new_edit)
+        g_aux.setLayout(f_aux)
+        layout_params.addWidget(g_aux)
+
         layout_params.addStretch()
         tab_params.setLayout(layout_params)
         tabs.addTab(tab_params, "💾 Default Parameters")
@@ -174,24 +187,30 @@ class SettingsDialog(QDialog):
         self.setLayout(layout)
 
     def accept(self):
-        # 1. Save Shortcuts
+        # Save Shortcuts
         for key, edit in self.key_edits.items():
             seq = edit.keySequence().toString()
             if seq: GlobalConfig.set(key, seq)
             
-        # 2. Save Drift Params
+        # Save Drift Params
         GlobalConfig.set("drift_kernel", self.drift_kernel_spin.value())
         GlobalConfig.set("drift_workers", self.drift_workers_spin.value())
         
-        # 3. Save Geometry Params
+        # Save Geometry Params
         GlobalConfig.set("geo_suffix", self.geo_suffix_edit.text())
         GlobalConfig.set("geo_padding", self.geo_padding_spin.value())
         GlobalConfig.set("geo_keep_index", self.geo_keep_idx_check.isChecked())
         GlobalConfig.set("geo_force_square", self.geo_sq_check.isChecked())
         GlobalConfig.set("geo_enlarge", self.geo_enl_check.isChecked())
         
+        # Save Aux Suffixes
+        GlobalConfig.set("geo_suffix_lrtem", self.suff_lr_edit.text())
+        GlobalConfig.set("geo_suffix_hrtem", self.suff_hr_edit.text())
+        GlobalConfig.set("geo_suffix_mask", self.suff_mask_edit.text())
+        GlobalConfig.set("geo_suffix_mask_new", self.suff_new_edit.text())
+        
         super().accept()
-        QMessageBox.information(self, "Saved", "Settings saved successfully!\nNote: Some changes may require restarting Napari or re-opening widgets.")
+        QMessageBox.information(self, "Saved", "Settings saved successfully!")
 
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm", "Reset ALL settings to factory defaults?") == QMessageBox.Yes:
