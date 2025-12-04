@@ -154,7 +154,7 @@ class DriftCorrectionWidget(QWidget):
         
         param_layout.addWidget(QLabel("Workers:"))
         self.max_workers_spin = QSpinBox()
-        self.max_workers_spin.setRange(1, 32)
+        self.max_workers_spin.setRange(1, 99999)
         self.max_workers_spin.setValue(int(GlobalConfig.get("drift_workers")))
         param_layout.addWidget(self.max_workers_spin)
         

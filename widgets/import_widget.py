@@ -4,7 +4,7 @@
 - [Fix] 补全缺失的 _get_dir_size 方法。
 - [Req 0] 自动正则匹配 Dataset ID。
 - [Req 1] 原始数据文件夹按 {Date}_{Sub}_{OriginalDatasetN} 命名。
-- [Req 2] >100GB 自动切换为移动模式，并弹窗提醒。
+- [Req 2] >30GB 自动切换为移动模式，并弹窗提醒。
 - [Info] 归档时保存 current_date 和 current_dataset_id 到全局配置。
 - [Req New] 归档完成弹窗包含文件大小和模式信息，且可配置关闭。
 """
@@ -505,8 +505,8 @@ class ImportWidget(QWidget):
         size_gb = size_bytes / (1024**3)
         move_mode = False
         
-        # 阈值: 100GB
-        if size_gb > 100:
+        # 阈值: 30GB
+        if size_gb > 30:
             move_mode = True
             # 注意：此处弹窗只是通知将要发生什么，不需要用户再次确认（因为已经在之前逻辑里确定了策略）
             # 或者，如果之前需求是自动切换并提醒，这里只是标记
