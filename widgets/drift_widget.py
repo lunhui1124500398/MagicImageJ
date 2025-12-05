@@ -99,13 +99,15 @@ class DriftCorrectionWidget(QWidget):
         self.calc_thread = None
         self.apply_thread = None
         self.correction_history = []  # [新增] 用于管理生成的校正图层
-        self._load_params() # [新增] 初始化时加载参数
         self._setup_ui()
         
         # 监听图层事件
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
         self.viewer.layers.events.removed.connect(self._refresh_layers)
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
+
+        self._load_params_from_config() # [新增] 初始化时加载参数
+        GlobalConfig.signals.config_updated.connect(self._load_params_from_config)
 
     def _setup_ui(self):
         # 1. 创建最外层布局 (用于放滚动条)
@@ -179,8 +181,8 @@ class DriftCorrectionWidget(QWidget):
 
         ctrl_layout = QHBoxLayout()
         self.auto_calc_cb = QCheckBox("Auto Preview (Calc & Apply)")
-        self.auto_calc_cb.setChecked(True)
         self.auto_calc_cb.setToolTip("Calculate and show corrected result immediately after drawing ROI.")
+        self.auto_calc_cb.stateChanged.connect(lambda v: GlobalConfig.set("drift_auto_calc", bool(v))) # Save on change
         ctrl_layout.addWidget(self.auto_calc_cb)
         
         preview_btn = QPushButton("📊 Manual Recalc")
@@ -223,8 +225,20 @@ class DriftCorrectionWidget(QWidget):
         self.kernel_spin.valueChanged.connect(lambda v: GlobalConfig.set("drift_kernel", v))
         self.max_workers_spin.valueChanged.connect(lambda v: GlobalConfig.set("drift_workers", v))
 
-    def _load_params(self):
-        pass
+    def _load_params_from_config(self):
+        """从 GlobalConfig 读取参数并更新 UI"""
+        # 阻断信号防止循环触发 set
+        self.kernel_spin.blockSignals(True)
+        self.max_workers_spin.blockSignals(True)
+        self.auto_calc_cb.blockSignals(True)
+
+        self.kernel_spin.setValue(int(GlobalConfig.get("drift_kernel")))
+        self.max_workers_spin.setValue(int(GlobalConfig.get("drift_workers")))
+        self.auto_calc_cb.setChecked(bool(GlobalConfig.get("drift_auto_calc")))
+
+        self.kernel_spin.blockSignals(False)
+        self.max_workers_spin.blockSignals(False)
+        self.auto_calc_cb.blockSignals(False)
 
     def _refresh_layers(self, event=None):
         current_text = self.layer_combo.currentText()

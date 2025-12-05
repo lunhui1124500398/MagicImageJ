@@ -107,6 +107,8 @@ class EnhanceWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._refresh_layers_silently)
         self.viewer.layers.events.removed.connect(self._refresh_layers_silently)
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
+        self._load_params_from_config()
+        GlobalConfig.signals.config_updated.connect(self._load_params_from_config)
 
     def _setup_ui(self):
         # 1. 创建最外层布局
@@ -143,7 +145,7 @@ class EnhanceWidget(QWidget):
         # --- 高斯模糊 ---
         gaussian_layout = QHBoxLayout()
         self.use_gaussian_check = QCheckBox("Gaussian Blur")
-        self.use_gaussian_check.stateChanged.connect(self._toggle_gaussian)
+        #self.use_gaussian_check.stateChanged.connect(self._toggle_gaussian)
         gaussian_layout.addWidget(self.use_gaussian_check)
         
         self.ksize_slider = QSlider(Qt.Horizontal)
@@ -168,7 +170,7 @@ class EnhanceWidget(QWidget):
         # --- 滚动平均 ---
         avg_layout = QHBoxLayout()
         self.use_average_check = QCheckBox("Roll Avg")
-        self.use_average_check.stateChanged.connect(self._toggle_average)
+        # self.use_average_check.stateChanged.connect(self._toggle_average)
         avg_layout.addWidget(self.use_average_check)
         avg_layout.addWidget(QLabel("Win:"))
         self.window_spin = QSpinBox()
@@ -269,6 +271,14 @@ class EnhanceWidget(QWidget):
         self._toggle_gaussian()
         self._toggle_average()
         self._update_frame_loss_info()
+
+        # 绑定保存逻辑：当数值改变时，立即保存到 GlobalConfig
+        # ==========================================
+        self.use_gaussian_check.stateChanged.connect(lambda v: (self._toggle_gaussian(), GlobalConfig.set("enh_use_gaussian", bool(v))))
+        self.use_average_check.stateChanged.connect(lambda v: (self._toggle_average(), GlobalConfig.set("enh_use_average", bool(v))))
+        self.sigma_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_sigma", v))
+        self.window_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_window", v))
+        self.max_workers_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_workers", v))
 
     def _refresh_layers_silently(self, event=None):
         current_text = self.layer_combo.currentText()
@@ -593,3 +603,26 @@ class EnhanceWidget(QWidget):
                 json.dump(data, f, indent=2, cls=NumpyEncoder)
         except Exception as e:
             print(f"Log error: {e}")
+    
+    def _load_params_from_config(self):
+        self.use_gaussian_check.blockSignals(True)
+        self.use_average_check.blockSignals(True)
+        self.sigma_spin.blockSignals(True)
+        self.window_spin.blockSignals(True)
+        self.max_workers_spin.blockSignals(True)
+
+        self.use_gaussian_check.setChecked(bool(GlobalConfig.get("enh_use_gaussian")))
+        self.use_average_check.setChecked(bool(GlobalConfig.get("enh_use_average")))
+        self.sigma_spin.setValue(float(GlobalConfig.get("enh_sigma")))
+        self.window_spin.setValue(int(GlobalConfig.get("enh_window")))
+        self.max_workers_spin.setValue(int(GlobalConfig.get("enh_workers")))
+
+        self.use_gaussian_check.blockSignals(False)
+        self.use_average_check.blockSignals(False)
+        self.sigma_spin.blockSignals(False)
+        self.window_spin.blockSignals(False)
+        self.max_workers_spin.blockSignals(False)
+        
+        # Refresh UI state (enable/disable)
+        self._toggle_gaussian()
+        self._toggle_average()

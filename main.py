@@ -26,6 +26,8 @@ class TEMWorkflow:
         self._setup_widgets()
         # 使用 QTimer.singleShot 确保在 Napari 界面完全加载后执行初始化隐藏
         QTimer.singleShot(100, self._setup_hotkeys_and_init_view)
+        # 监听热更新信号，用于刷新 Measure 样式
+        GlobalConfig.signals.config_updated.connect(self._refresh_measure_style)
 
     def _setup_widgets(self):
         # === 1. 创建一个主容器 (Wrapper) ===
@@ -268,23 +270,43 @@ class TEMWorkflow:
         if hasattr(current_widget, '_refresh_layers'):
             current_widget._refresh_layers()
     
+    def _refresh_measure_style(self):
+        """热更新：如果测量图层存在，立即更新其颜色和字体"""
+        if "Measurements" in self.viewer.layers:
+            layer = self.viewer.layers["Measurements"]
+            
+            # 读取新配置
+            new_color = GlobalConfig.get("style_measure_color")
+            new_width = int(GlobalConfig.get("style_measure_width"))
+            new_font_size = int(GlobalConfig.get("style_measure_font_size"))
+            
+            # 更新图层属性
+            layer.edge_color = new_color
+            layer.edge_width = new_width
+            layer.text.color = 'white' # 保持白色文字，或者也配置
+            layer.text.size = new_font_size
+            layer.refresh()
+
     def _toggle_measurement_tool(self, checked):
         layer_name = "Measurements"
         
         if checked:
             # 开启测量模式
             if layer_name not in self.viewer.layers:
+                color = GlobalConfig.get("style_measure_color")
+                width = int(GlobalConfig.get("style_measure_width"))
+                font_size = int(GlobalConfig.get("style_measure_font_size"))
                 # 创建 Shapes 图层
                 self.measure_layer = self.viewer.add_shapes(
                     name=layer_name,
                     shape_type='line',
-                    edge_color='#FFD700',
-                    edge_width=3,
+                    edge_color=color,
+                    edge_width=width,
                     face_color=[0,0,0,0],
                     # 设置文本显示属性
                     text={
                         'string': '{length}', 
-                        'size': 11, 
+                        'size': font_size, 
                         'color': 'white', 
                         'anchor': 'center', 
                         'translation': [0, -15]

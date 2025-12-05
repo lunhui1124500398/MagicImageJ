@@ -13,6 +13,7 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
                             QProgressBar, QComboBox, QGroupBox, QMessageBox,
                             QDoubleSpinBox, QScrollArea, QLineEdit, QTextEdit, QSizePolicy,
                             QCheckBox) # Added QCheckBox
+from widgets.settings_widget import GlobalConfig
 from qtpy.QtCore import Signal, QThread, QSettings, Qt
 import numpy as np
 from pathlib import Path
@@ -646,8 +647,10 @@ class ImportWidget(QWidget):
         size_gb = size_bytes / (1024**3)
         move_mode = False
         
-        # 阈值: 30GB
-        if size_gb > 30:
+        # 阈值读取
+        move_threshold = float(GlobalConfig.get("sys_move_threshold_gb"))
+
+        if size_gb > move_threshold:
             move_mode = True
             # 注意：此处弹窗只是通知将要发生什么，不需要用户再次确认（因为已经在之前逻辑里确定了策略）
             # 或者，如果之前需求是自动切换并提醒，这里只是标记

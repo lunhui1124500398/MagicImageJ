@@ -213,6 +213,10 @@ class GeometryWidget(QWidget):
         self._is_updating = False 
         self._force_view_active = False 
         self._setup_ui()
+
+        # 初始化与热更新
+        self._load_params_from_config()
+        GlobalConfig.signals.config_updated.connect(self._load_params_from_config)
         
         self.viewer.layers.events.reordered.connect(self._enforce_view_visibility)
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
@@ -276,7 +280,7 @@ class GeometryWidget(QWidget):
     
         self.enlarge_check = QCheckBox("Enlarge Canvas (Fit All)")
         self.enlarge_check.setToolTip("Expand image size to fit rotated content without cropping")
-        self.enlarge_check.setChecked(True)
+        self.enlarge_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_enlarge", bool(v)))
         rotate_layout.addWidget(self.enlarge_check)
 
         apply_rotate_btn = QPushButton("✅ Apply Rotation")
@@ -373,11 +377,20 @@ class GeometryWidget(QWidget):
         h_checks = QHBoxLayout()
         self.check_denoise = QCheckBox("Gen Denoise Folders")
         self.check_denoise.setToolTip("Creates empty folders with Main Suffix + Configured Suffix (e.g. _contrasted_lrtem)")
+        
+
         self.check_refine = QCheckBox("Gen Refine Folder")
         self.check_refine.setToolTip("Creates empty folder with Main Suffix + Configured Suffix (e.g. _contrasted_mask_new)")
+        
+
         h_checks.addWidget(self.check_denoise)
         h_checks.addWidget(self.check_refine)
         batch_layout.addLayout(h_checks)
+
+        # 添加信号
+        self.check_denoise.stateChanged.connect(lambda v: GlobalConfig.set("geo_create_denoise", bool(v)))
+        self.check_refine.stateChanged.connect(lambda v: GlobalConfig.set("geo_create_refine", bool(v)))
+        self.suffix_edit.editingFinished.connect(lambda: GlobalConfig.set("geo_suffix", self.suffix_edit.text()))
 
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel("Export Format:"))
@@ -404,7 +417,7 @@ class GeometryWidget(QWidget):
         # Naming options
         naming_layout = QHBoxLayout()
         self.keep_index_check = QCheckBox("Keep Original Frame Index")
-        self.keep_index_check.setChecked(True) 
+        self.keep_index_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_keep_index", bool(v)))
         naming_layout.addWidget(self.keep_index_check)
 
         naming_layout.addWidget(QLabel("Padding:"))
@@ -417,7 +430,7 @@ class GeometryWidget(QWidget):
         batch_layout.addLayout(naming_layout)
         
         self.force_square_check = QCheckBox("Force Square Crops")
-        self.force_square_check.setChecked(True) 
+        self.force_square_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_force_square", bool(v)))
         batch_layout.addWidget(self.force_square_check)
 
         # Tools
@@ -684,9 +697,10 @@ class GeometryWidget(QWidget):
     # --- Simple Crop ---
     def _draw_crop_rect(self):
         self._clear_residue(["Crop_ROI", "Rotation_Line", "Batch_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
+        edge_col = GlobalConfig.get("style_crop_color")
         layer = self.viewer.add_shapes(
             name="Crop_ROI", shape_type='rectangle', 
-            edge_color='yellow', edge_width=3,
+            edge_color=edge_col, edge_width=3,
             face_color=[1, 1, 1, 0.01] 
         )
         layer.mode = 'add_rectangle'
@@ -749,17 +763,22 @@ class GeometryWidget(QWidget):
             self._force_view_active = False
             for l in self.viewer.layers:
                 if isinstance(l, napari.layers.Image): l.visible = (l.name == view_layer)
+        
+        box_col = GlobalConfig.get("style_batch_box_color")
+        width = int(GlobalConfig.get("style_batch_width"))
+        txt_col = GlobalConfig.get("style_batch_text_color")
+        font_size = int(GlobalConfig.get("style_batch_font_size"))
 
         roi_layer = self.viewer.add_shapes(
             name="Batch_ROI",
             shape_type='rectangle',
-            edge_color='#00FF00', 
+            edge_color=box_col, 
             face_color=[0, 1, 0, 0.05],
-            edge_width=2,
+            edge_width=width,
             text={
                 'string': '{label}\n{frame_info}', 
-                'size': 10, 
-                'color': '#00FF00', 
+                'size': font_size, 
+                'color': txt_col, 
                 'anchor': 'upper_left', 
                 'translation': [-5, -5]
             },
@@ -1045,3 +1064,23 @@ class GeometryWidget(QWidget):
                     log_data["batch_crop"]["overview_frame"] = idx
                 with open(json_path, 'w') as f: json.dump(log_data, f, indent=2)
             except: pass
+    
+    def _load_params_from_config(self):
+        """热更新：从配置读取状态"""
+        # Block signals
+        widgets = [self.enlarge_check, self.keep_index_check, self.force_square_check, 
+                   self.check_denoise, self.check_refine, self.suffix_edit, self.padding_spin]
+        for w in widgets: w.blockSignals(True)
+
+        self.enlarge_check.setChecked(bool(GlobalConfig.get("geo_enlarge")))
+        self.keep_index_check.setChecked(bool(GlobalConfig.get("geo_keep_index")))
+        self.force_square_check.setChecked(bool(GlobalConfig.get("geo_force_square")))
+        self.check_denoise.setChecked(bool(GlobalConfig.get("geo_create_denoise")))
+        self.check_refine.setChecked(bool(GlobalConfig.get("geo_create_refine")))
+        self.suffix_edit.setText(str(GlobalConfig.get("geo_suffix")))
+        self.padding_spin.setValue(int(GlobalConfig.get("geo_padding")))
+
+        # Update Style Configs (Color etc.) for Draw Rect logic
+        # 这里的样式参数会在 _draw_crop_rect 调用时实时读取 GlobalConfig.get()，无需刷新 UI 控件
+
+        for w in widgets: w.blockSignals(False)

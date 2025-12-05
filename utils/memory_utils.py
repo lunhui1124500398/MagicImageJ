@@ -9,6 +9,10 @@
    - [New] 安全脚本：清理脚本(.bat)强制生成在用户缓存目录，防止误删系统Temp文件。
    - 退出时启动外部进程强制删除被锁文件。
 """
+
+# 注意：为了避免循环导入，这里我们手动复制一下简单的读取逻辑，或者使用之前定义的 _load_json_config_value
+# 但最好是从 GlobalConfig 读取。如果在 utils 里不好引 widgets，建议保留 memory_utils 里的 _load_json_config_value 并增强它。
+
 import numpy as np
 import tempfile
 import os
@@ -65,7 +69,8 @@ def try_clean_old_files(cache_dir_str):
     if not cache_dir_str: return
     
     remaining_size = 0
-    large_file_warning_threshold = 10 * 1024**3 # 10GB 预警阈值
+    gb_warn = float(_load_json_config_value("sys_disk_warn_gb", 10.0))
+    large_file_warning_threshold = gb_warn * 1024**3
     
     try:
         folder = Path(cache_dir_str)
@@ -198,8 +203,9 @@ def create_huge_array(shape, dtype, fill_zeros=False):
     itemsize = np.dtype(dtype).itemsize
     nbytes = elements * itemsize
     
-    # 阈值 4GB
-    threshold = 4 * 1024**3 
+    # 阈值
+    gb_limit = float(_load_json_config_value("sys_ram_threshold_gb", 4.0))
+    threshold = gb_limit * 1024**3 
 
     if nbytes > threshold:
         cache_dir = get_cache_dir()
