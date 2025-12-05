@@ -2,11 +2,13 @@
 几何变换模块
 提供旋转和裁剪功能
 更新日志:
-- rotate_image_stack: 增加 expand 参数，支持旋转时扩大画布保留全图 (仿ImageJ Enlarge)
+- rotate_image_stack: 增加 expand 参数，支持旋转时扩大画布保留全图 (仿ImageJ Enlarge);修复 OOM 问题 (memmap)
 """
 import numpy as np
 import cv2
 from typing import Tuple, Optional
+from utils.memory_utils import create_huge_array
+import os
 
 def calculate_rotation_angle(line_points: Tuple[Tuple[float, float], Tuple[float, float]]) -> float:
     """根据画线计算旋转角度"""
@@ -25,22 +27,7 @@ def rotate_image_stack(image_stack: np.ndarray,
                        expand: bool = False,
                        progress_callback=None) -> np.ndarray:
     """
-    旋转图像栈
-    
-    Parameters:
-    -----------
-    image_stack : np.ndarray
-        形状为 (T, Y, X) 的图像栈
-    angle : float
-        旋转角度
-    center : tuple, optional
-        旋转中心
-    expand : bool
-        是否扩大画布以包含所有旋转后的像素 (ImageJ Enlarge模式)
-        
-    Returns:
-    --------
-    rotated_stack : np.ndarray
+    旋转图像栈 (内存优化版)
     """
     T, H, W = image_stack.shape
     
@@ -66,19 +53,35 @@ def rotate_image_stack(image_stack: np.ndarray,
         
         dest_w, dest_h = new_w, new_h
 
-    # 旋转所有帧
-    rotated_frames = []
-    total = len(image_stack)
-    for i,frame in enumerate(image_stack):
-        # 使用 borderMode=cv2.BORDER_CONSTANT (黑色填充)
-        rotated = cv2.warpAffine(frame, M, (dest_w, dest_h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        rotated_frames.append(rotated)
-        if progress_callback and i % 5 == 0: 
-            progress_callback(i + 1, total)
-    if progress_callback: 
-        progress_callback(total, total)
-    
-    return np.ascontiguousarray(np.stack(rotated_frames, axis=0))
+    # === 预分配内存 (可能在 Disk) ===
+    # 结果可能比原图大 (expand=True)，更需要硬盘缓存
+    new_shape = (T, dest_h, dest_w)
+    result_stack, temp_file = create_huge_array(new_shape, image_stack.dtype, fill_zeros=True)
+
+    try:
+        total = len(image_stack)
+        for i, frame in enumerate(image_stack):
+            # 直接写入预分配数组
+            # 使用 borderMode=cv2.BORDER_CONSTANT (黑色填充)
+            result_stack[i] = cv2.warpAffine(frame, M, (dest_w, dest_h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            
+            if progress_callback and i % 5 == 0: 
+                progress_callback(i + 1, total)
+        
+        if progress_callback: 
+            progress_callback(total, total)
+        
+        if hasattr(result_stack, 'flush'):
+            result_stack.flush()
+            
+        return result_stack
+        
+    except Exception as e:
+        print(f"Rotation Error: {e}")
+        if temp_file and os.path.exists(temp_file):
+            try: os.remove(temp_file)
+            except: pass
+        raise e
 
 def flip_image_stack(image_stack: np.ndarray, mode: str) -> np.ndarray:
     """

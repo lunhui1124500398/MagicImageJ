@@ -2,13 +2,15 @@
 漂移矫正模块
 更新日志:
 - calculate_drift_curve: 增加 progress_callback 支持
-- apply_drift_correction: 增加 progress_callback 支持
+- apply_drift_correction: 修复内存爆炸问题，引入 memmap 支持
 """
 import numpy as np
 import cv2
 from scipy.signal import medfilt
 from typing import Tuple, Optional
 import concurrent.futures
+from utils.memory_utils import create_huge_array
+import os
 
 def calculate_drift_single_frame(frame: np.ndarray, 
                                  roi: np.ndarray,
@@ -69,36 +71,59 @@ def apply_drift_correction(image_stack: np.ndarray,
                            max_workers: int = 8,
                            progress_callback=None) -> np.ndarray:
     """
-    应用漂移矫正
-    progress_callback: func(current, total)
+    应用漂移矫正 (内存优化版)
+    使用 create_huge_array 预分配内存/硬盘空间，避免 OOM。
     """
-    def translate_frame(args):
-        frame, drift = args
-        rows, cols = frame.shape[:2]
-        M = np.float32([[1, 0, drift[0]], [0, 1, drift[1]]])
-        return cv2.warpAffine(frame, M, (cols, rows))
+    T, H, W = image_stack.shape
     
-    corrected_frames = [None] * len(image_stack)
+    # === 使用内存工具分配结果数组 (可能在 RAM，也可能在 Disk) ===
+    result, temp_filename = create_huge_array(image_stack.shape, image_stack.dtype, fill_zeros=False)
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(translate_frame, (image_stack[i], drifts[i])): i
-            for i in range(len(image_stack))
-        }
+    try:
+        def process_batch(batch_indices):
+            # 处理一批索引，直接写入 result
+            for i in batch_indices:
+                frame = image_stack[i]
+                drift = drifts[i]
+                M = np.float32([[1, 0, drift[0]], [0, 1, drift[1]]])
+                # 直接写入结果数组
+                result[i] = cv2.warpAffine(frame, M, (W, H))
+            return len(batch_indices)
+        
+        # 分块处理 (避免 Future 对象过多消耗内存)
+        chunk_size = 100
+        indices = list(range(T))
+        chunks = [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
         
         completed_count = 0
-        total_count = len(image_stack)
         
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            corrected_frames[idx] = future.result()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_batch, chunk): chunk for chunk in chunks}
             
-            completed_count += 1
-            if progress_callback:
-                progress_callback(completed_count, total_count)
-                
-    result = np.stack(corrected_frames, axis=0)
-    return np.ascontiguousarray(result)
+            for future in concurrent.futures.as_completed(futures):
+                count = future.result()
+                completed_count += count
+                if progress_callback:
+                    progress_callback(completed_count, T)
+        
+        # 如果是 memmap，强制刷新到磁盘
+        if hasattr(result, 'flush'):
+            result.flush()
+            
+        return result
+
+    except Exception as e:
+        print(f"Error in apply_drift_correction: {e}")
+        # 尝试清理临时文件（如果创建了）
+        if temp_filename and os.path.exists(temp_filename):
+            try:
+                # 尽量清理，注意：如果是 memmap，因为被 result 引用，可能无法立即删除 (Windows)
+                # 通常需要 del result 之后才能删除。
+                # 这里我们重新抛出异常，让上层处理，或者依靠系统清理
+                pass
+            except:
+                pass
+        raise e
 
 def validate_roi(image_shape: Tuple[int, int],
                  roi_bbox: Tuple[int, int, int, int]) -> bool:

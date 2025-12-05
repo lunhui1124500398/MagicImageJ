@@ -1,19 +1,23 @@
 """
 File: widgets/settings_widget.py
-配置管理与设置界面 (增强版)
+配置管理与设置界面 (JSON持久化版)
 修改日志:
-- [Req 3] 新增后缀配置 (lrtem, hrtem, mask, mask_new)
+- [Fix Persistence] 弃用 QSettings，改用 JSON 文件保存配置，解决设置丢失问题。
+- [Fix Bug] 确保 _browse_cache_dir 方法存在。
 """
 from qtpy.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                             QLineEdit, QPushButton, QFormLayout, QTabWidget, 
                             QWidget, QKeySequenceEdit, QMessageBox, QSpinBox, 
-                            QCheckBox, QGroupBox)
-from qtpy.QtCore import QSettings
+                            QCheckBox, QGroupBox, QFileDialog)
 from qtpy.QtGui import QKeySequence
+import json
+import os
+from pathlib import Path
 
 class GlobalConfig:
-    """全局配置单例辅助类"""
-    _settings = QSettings("NapariUser", "GlobalConfig")
+    """全局配置单例辅助类 (基于 JSON 文件)"""
+    # 配置文件路径: 用户主目录/.napari_tem_config.json
+    _config_path = Path.home() / ".napari_tem_config.json"
     
     DEFAULTS = {
         "shortcut_toggle_ui": "J",
@@ -22,12 +26,12 @@ class GlobalConfig:
         "shortcut_switch_mode": "M",
         "drift_kernel": 11,
         "drift_workers": 8,
-        # Geometry Defaults
-        "geo_suffix": "_origin",      # 主后缀默认值
-        "geo_suffix_lrtem": "_lrtem", # [New]
-        "geo_suffix_hrtem": "_hrtem", # [New]
-        "geo_suffix_mask": "_mask",   # [New]
-        "geo_suffix_mask_new": "_mask_new", # [New]
+        "cache_dir": "", 
+        "geo_suffix": "_origin",
+        "geo_suffix_lrtem": "_lrtem",
+        "geo_suffix_hrtem": "_hrtem",
+        "geo_suffix_mask": "_mask",
+        "geo_suffix_mask_new": "_mask_new",
         "geo_padding": 5,
         "geo_keep_index": True,
         "geo_force_square": True,
@@ -35,19 +39,48 @@ class GlobalConfig:
     }
 
     @classmethod
+    def _load_config(cls):
+        """内部方法：读取所有配置"""
+        if not cls._config_path.exists():
+            return {}
+        try:
+            with open(cls._config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading config: {e}")
+            return {}
+
+    @classmethod
+    def _save_config(cls, data):
+        """内部方法：保存配置"""
+        try:
+            with open(cls._config_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    @classmethod
     def get(cls, key):
-        val = cls._settings.value(key, cls.DEFAULTS.get(key, ""))
-        if str(val).lower() == 'true': return True
-        if str(val).lower() == 'false': return False
+        """获取配置值，如果不存在则返回默认值"""
+        data = cls._load_config()
+        val = data.get(key, cls.DEFAULTS.get(key, ""))
+        
+        # 处理布尔值转换 (为了兼容某些特定逻辑)
+        if isinstance(val, str):
+            if val.lower() == 'true': return True
+            if val.lower() == 'false': return False
         return val
 
     @classmethod
     def set(cls, key, value):
-        cls._settings.setValue(key, value)
+        """设置并立即保存配置"""
+        data = cls._load_config()
+        data[key] = value
+        cls._save_config(data)
     
     @classmethod
     def get_napari_shortcut(cls, key):
-        raw = cls.get(key)
+        raw = str(cls.get(key))
         # Napari shortcut format conversion
         napari_key = raw.replace("Ctrl+", "Control-") \
                         .replace("Shift+", "Shift-") \
@@ -62,7 +95,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("⚙️ Preferences & Shortcuts")
-        self.resize(600, 550) 
+        self.resize(650, 600) 
         
         self.setStyleSheet("""
             QDialog { background-color: #262626; color: #E0E0E0; font-family: "Segoe UI", sans-serif; font-size: 10pt; }
@@ -96,7 +129,7 @@ class SettingsDialog(QDialog):
         }
         
         for key, label in shortcuts_map.items():
-            val = GlobalConfig.get(key)
+            val = str(GlobalConfig.get(key))
             edit = QKeySequenceEdit(QKeySequence(val))
             self.key_edits[key] = edit
             form_short.addRow(label, edit)
@@ -107,6 +140,30 @@ class SettingsDialog(QDialog):
         # === Tab 2: Default Params ===
         tab_params = QWidget()
         layout_params = QVBoxLayout()
+        
+        # --- Cache Group ---
+        g_cache = QGroupBox("Performance & Cache (Important for Large Data)")
+        f_cache = QFormLayout()
+        
+        self.cache_dir_edit = QLineEdit(str(GlobalConfig.get("cache_dir")))
+        self.cache_dir_edit.setPlaceholderText("System Default (e.g. C:/Temp)")
+        self.cache_dir_edit.setToolTip("Select a drive with at least 200GB free space for processing large datasets.")
+        
+        btn_browse_cache = QPushButton("📂")
+        btn_browse_cache.setFixedWidth(40)
+        btn_browse_cache.clicked.connect(self._browse_cache_dir)
+        
+        h_cache = QHBoxLayout()
+        h_cache.addWidget(self.cache_dir_edit)
+        h_cache.addWidget(btn_browse_cache)
+        
+        f_cache.addRow("Cache Directory:", h_cache)
+        lbl_hint = QLabel("Note: For 60GB+ images, use an SSD with >200GB free space.")
+        lbl_hint.setStyleSheet("color: #AAA; font-size: 9pt; font-style: italic;")
+        f_cache.addRow("", lbl_hint)
+        
+        g_cache.setLayout(f_cache)
+        layout_params.addWidget(g_cache)
         
         # Group: Drift
         g_drift = QGroupBox("Drift Correction Defaults")
@@ -186,12 +243,20 @@ class SettingsDialog(QDialog):
         
         self.setLayout(layout)
 
+    def _browse_cache_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Cache Directory (SSD Recommended)")
+        if d:
+            self.cache_dir_edit.setText(d)
+
     def accept(self):
         # Save Shortcuts
         for key, edit in self.key_edits.items():
             seq = edit.keySequence().toString()
             if seq: GlobalConfig.set(key, seq)
             
+        # Save Cache Dir
+        GlobalConfig.set("cache_dir", self.cache_dir_edit.text())
+
         # Save Drift Params
         GlobalConfig.set("drift_kernel", self.drift_kernel_spin.value())
         GlobalConfig.set("drift_workers", self.drift_workers_spin.value())
@@ -210,9 +275,15 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("geo_suffix_mask_new", self.suff_new_edit.text())
         
         super().accept()
-        QMessageBox.information(self, "Saved", "Settings saved successfully!")
+        # 提示用户
+        QMessageBox.information(self, "Settings Saved", f"Configuration saved to:\n{GlobalConfig._config_path}")
 
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm", "Reset ALL settings to factory defaults?") == QMessageBox.Yes:
-            GlobalConfig._settings.clear()
+            # 删除配置文件
+            try:
+                if GlobalConfig._config_path.exists():
+                    os.remove(GlobalConfig._config_path)
+            except Exception as e:
+                print(f"Error resetting: {e}")
             self.reject()

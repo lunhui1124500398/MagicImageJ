@@ -22,6 +22,15 @@ import json
 import datetime
 import gc
 import re
+import platform
+import ctypes
+
+# 尝试导入 psutil 获取更准确的内存信息，如果没有则使用 ctypes (Windows) 或 os (Linux)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 try:
     import dm4
@@ -219,6 +228,12 @@ class ImportWidget(QWidget):
         super().__init__()
         self.viewer = viewer
         self.settings = QSettings("NapariUser", "Importer")
+        
+        # === 1. Detect System Specs ===
+        self.total_ram_gb = self._get_total_memory_gb()
+        self.cpu_count = os.cpu_count() or 4
+        self.recommended_workers = self._calculate_optimal_workers()
+
         self._setup_ui()
         self.current_folder = None
         self.meta_cache = {} 
@@ -232,6 +247,56 @@ class ImportWidget(QWidget):
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
             self.pick_file_btn.setEnabled(True)
+    
+    def _get_total_memory_gb(self):
+        """获取系统物理内存 (GB)"""
+        try:
+            if PSUTIL_AVAILABLE:
+                return psutil.virtual_memory().total / (1024**3)
+            elif platform.system() == "Windows":
+                # Windows fallback
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(stat)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                return stat.ullTotalPhys / (1024**3)
+            else:
+                return 16 # Default fallback
+        except:
+            return 16
+    
+    def _calculate_optimal_workers(self):
+        """
+        计算最佳 Worker 数量
+        基于: RAM余量 (每线程~200MB) 和 CPU 核心数
+        SSD 场景下，瓶颈通常是 RAM，而非 I/O
+        """
+        # 保留 4GB 给系统和 Napari 基础开销
+        available_for_workers = max(1, self.total_ram_gb - 4)
+        
+        # 估算每个 Worker 满载时的峰值内存 (包含 DM4解析 + Numpy临时对象)
+        # 经验值: 2048x2048 float32 加上 overhead 约为 250MB
+        mem_limit_workers = int(available_for_workers * 1024 / 250) 
+        
+        # CPU 限制 (IO密集型可适当超频，但受限于 Python GIL 和 内存带宽)
+        cpu_limit_workers = self.cpu_count * 2
+        
+        # 取交集，并设定硬限
+        optimal = min(mem_limit_workers, cpu_limit_workers)
+        optimal = max(2, min(optimal, 128)) # 至少2个，最多128
+        
+        return optimal
 
     def _setup_ui(self):
         main = QVBoxLayout(); main.setContentsMargins(2, 2, 2, 2)
@@ -328,13 +393,48 @@ class ImportWidget(QWidget):
         # Group 5: Load
         g_load = QGroupBox("5. Load to Viewer"); l_load = QVBoxLayout(); l_load.setSpacing(4); l_load.setContentsMargins(8, 8, 8, 8)
         h_params = QHBoxLayout(); h_params.addWidget(QLabel("Bit Depth:")); self.bit_depth_combo = QComboBox(); self.bit_depth_combo.addItems(["8", "16", "32"]); self.bit_depth_combo.setCurrentText("8"); h_params.addWidget(self.bit_depth_combo)
-        h_params.addWidget(QLabel("Workers:")); self.max_workers_spin = QSpinBox(); self.max_workers_spin.setRange(1, 32); self.max_workers_spin.setValue(8); h_params.addWidget(self.max_workers_spin); l_load.addLayout(h_params)
+        h_params.addWidget(QLabel("Workers:")); self.max_workers_spin = QSpinBox(); self.max_workers_spin.setRange(1, 128);  self.max_workers_spin.setValue(self.recommended_workers); 
+        # Tooltip 显示系统信息
+        ram_info = f"{self.total_ram_gb:.1f} GB"
+        tip = (f"System RAM: {ram_info}\n"
+               f"CPU Cores: {self.cpu_count}\n"
+               f"Recommended: {self.recommended_workers} (Safe for your hardware)\n"
+               f"Note: Higher is not always faster (IO/RAM bottlenecks).")
+        self.max_workers_spin.setToolTip(tip)
+        h_params.addWidget(self.max_workers_spin); l_load.addLayout(h_params)
+        # Dynamic Warning Label
+        self.lbl_memory_warning = QLabel("")
+        self.lbl_memory_warning.setStyleSheet("color: #FF5252; font-size: 10px; font-weight: bold;")
+        self.lbl_memory_warning.setVisible(False)
+        l_load.addWidget(self.lbl_memory_warning)
+        
+        # Connect signal
+        self.max_workers_spin.valueChanged.connect(self._check_worker_count)
+        
         self.load_btn = QPushButton("🚀 Load Images"); self.load_btn.clicked.connect(self._load_data); self.load_btn.setEnabled(False); l_load.addWidget(self.load_btn)
         self.progress = QProgressBar(); self.progress.setVisible(False); l_load.addWidget(self.progress)
         g_load.setLayout(l_load); layout.addWidget(g_load)
 
         self.status = QLabel(""); layout.addWidget(self.status)
         content.setLayout(layout); scroll.setWidget(content); main.addWidget(scroll); self.setLayout(main)
+    
+    def _check_worker_count(self, val):
+        """动态显示内存警告"""
+        # 计算当前设置预计消耗的内存
+        # 基础: 4GB
+        # 增量: 0.25 GB per worker
+        est_usage = 4 + (val * 0.25)
+        
+        if val > self.recommended_workers:
+            diff = val - self.recommended_workers
+            if est_usage > self.total_ram_gb:
+                self.lbl_memory_warning.setText(f"❌ DANGER! {val} workers may crash your PC (Est: {est_usage:.1f}GB > {self.total_ram_gb:.1f}GB)")
+                self.lbl_memory_warning.setVisible(True)
+            else:
+                self.lbl_memory_warning.setText(f"⚠️ Warning: {val} exceeds recommended ({self.recommended_workers}). Watch RAM.")
+                self.lbl_memory_warning.setVisible(True)
+        else:
+            self.lbl_memory_warning.setVisible(False)
 
     def _browse_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Select Data Folder", self.settings.value("last_folder", ""))
@@ -347,17 +447,58 @@ class ImportWidget(QWidget):
             self.pick_file_btn.setEnabled(True)
             
             # === [Req 0] Auto-detect Dataset ID ===
-            folder_name = Path(f).name
+            path_obj = Path(f)
+            current_name = path_obj.name
+            parent_name = path_obj.parent.name
+            status_msgs = []
             # 匹配 dataset1, dataset-1, dataset_nonOL_1 等中的数字
-            match = re.search(r"dataset[-_]?.*?(\d+)", folder_name, re.IGNORECASE)
-            if match:
-                ds_num = match.group(1)
+            # match = re.search(r"dataset[-_]?.*?(\d+)", current_name, re.IGNORECASE)
+            # 1. Dataset ID Detection
+            match_ds = re.search(r"dataset[-_]?.*?(\d+)", current_name, re.IGNORECASE)
+            if match_ds:
+                ds_num = match_ds.group(1)
                 self.dataset_edit.setText(f"ds{ds_num}")
-                self.status.setText(f"ℹ️ Auto-detected dataset ID: ds{ds_num}")
+                status_msgs.append(f"Auto-ID: ds{ds_num}")
             else:
-                self.status.setText("⚠️ Could not auto-detect 'dataset' number in folder name.")
-                QMessageBox.information(self, "Check ID", "Could not detect 'dataset' number in folder name.\nPlease check the ID field manually.")
+                status_msgs.append("No Dataset ID")
+
+            # 2. Aperture (OL) Detection
+            match_ol = re.search(r"OL\s*[#\-_]?\s*(\d+)", current_name, re.IGNORECASE)
+            source_level = "Current" # 用于调试日志
+            if not match_ol:
+                match_ol = re.search(r"OL\s*[#\-_]?\s*(\d+)", parent_name, re.IGNORECASE)
+                source_level = "Parent"
             
+            if match_ol:
+                try:
+                    raw_num = match_ol.group(1)
+                    ol_num = str(int(raw_num)) # 去除前导零，例如 "02" -> "2"
+                    
+                    # 尝试在下拉框中查找该数值
+                    idx = self.aperture_combo.findText(ol_num)
+                    
+                    if idx >= 0:
+                        # 情况A: 列表中已有 (0-4)，直接选中
+                        self.aperture_combo.setCurrentIndex(idx)
+                        status_msgs.append(f"Auto-OL: {ol_num}")
+                    else:
+                        # 情况B: 列表中没有 (比如 OL5, OL7)，这是导致你Bug的核心原因！
+                        # [Fix] 动态添加到下拉框并选中
+                        self.aperture_combo.addItem(ol_num)
+                        self.aperture_combo.setCurrentText(ol_num)
+                        status_msgs.append(f"Auto-OL: {ol_num} (Auto-Added)")
+                        
+                except Exception as e:
+                    print(f"OL Parse Error: {e}")
+                    pass
+            else:
+                status_msgs.append("OL Not Found")
+            
+            self.status.setText(" | ".join(status_msgs))
+            
+            if not match_ds:
+                 QMessageBox.information(self, "Check ID", "Could not detect 'dataset' number.\nPlease check ID manually.")
+
             self._update_preview()
 
     def _pick_single_file_for_dose(self):

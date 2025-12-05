@@ -1,6 +1,7 @@
 """
 DM4文件读取模块
 包含安全归一化算法，修复黑帧Bug
+[Fix OOM]: read_dm4_sequence 现在预分配内存(memmap)而不是使用 list.append
 """
 import numpy as np
 import dm4
@@ -8,22 +9,19 @@ from pathlib import Path
 from typing import Optional, Tuple
 import concurrent.futures
 from tqdm import tqdm
-
+from utils.memory_utils import create_huge_array
+import os
 
 def safe_normalize(data: np.ndarray, bit_depth: int = 8) -> np.ndarray:
     """
     安全归一化算法 - 修复黑帧Bug
-    使用百分位数裁剪异常值
     """
-    # 转为float32避免溢出
     data = data.astype(np.float32)
     
-    # 使用0.1和99.9百分位数裁剪异常值
     q001 = np.percentile(data, 0.1)
     q999 = np.percentile(data, 99.9)
     rng = q999 - q001
     
-    # 处理范围过小的情况（防止除零）
     if rng < 1e-6:
         glob_min = np.min(data)
         glob_max = np.max(data)
@@ -32,17 +30,13 @@ def safe_normalize(data: np.ndarray, bit_depth: int = 8) -> np.ndarray:
         if rng > 0:
             data = (data - glob_min) / rng * (2**bit_depth - 1)
         else:
-            # 全图相同值，返回全零
             data = np.zeros_like(data)
     else:
-        # 正常归一化
         data = np.clip(data, q001, q999)
         data = (data - q001) / rng * (2**bit_depth - 1)
     
-    # 处理NaN值
     data = np.nan_to_num(data, nan=0)
     
-    # 转换为目标位深度
     if bit_depth == 8:
         return data.astype(np.uint8)
     elif bit_depth == 16:
@@ -51,76 +45,62 @@ def safe_normalize(data: np.ndarray, bit_depth: int = 8) -> np.ndarray:
         return data.astype(np.float32)
 
 
-def read_single_dm4(filepath: str, bit_depth: int = 8) -> Optional[np.ndarray]:
+def read_single_dm4_into_buffer(filepath: str, 
+                                buffer_array: np.ndarray, 
+                                index: int,
+                                bit_depth: int = 8) -> bool:
     """
-    读取单个DM4文件
-    
-    Parameters:
-    -----------
-    filepath : str
-        DM4文件路径
-    bit_depth : int
-        输出位深度 (8/16/32)
-        
-    Returns:
-    --------
-    image : np.ndarray or None
-        2D图像数组，失败返回None
+    读取单个DM4文件并直接写入 buffer[index]
     """
     try:
         with dm4.DM4File.open(filepath) as dm4data:
             tags = dm4data.read_directory()
-            
-            # 尝试获取ImageData标签
             try:
                 image_data_tag = tags.named_subdirs['ImageList'].unnamed_subdirs[1].named_subdirs['ImageData']
             except (IndexError, KeyError):
                 try:
                     image_data_tag = tags.named_subdirs['ImageList'].unnamed_subdirs[0].named_subdirs['ImageData']
                 except Exception:
-                    return None
+                    return False
             
-            # 读取图像数据
             image_tag = image_data_tag.named_tags['Data']
             XDim = dm4data.read_tag_data(image_data_tag.named_subdirs['Dimensions'].unnamed_tags[0])
             YDim = dm4data.read_tag_data(image_data_tag.named_subdirs['Dimensions'].unnamed_tags[1])
             
-            # 转换为numpy数组
             np_array = np.array(dm4data.read_tag_data(image_tag), dtype=np.float32)
             np_array = np.reshape(np_array, (YDim, XDim))
             
-            # 安全归一化
-            return safe_normalize(np_array, bit_depth)
+            # Normalize and write directly to buffer
+            buffer_array[index] = safe_normalize(np_array, bit_depth)
+            return True
             
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
+        return False
+
+
+def get_first_image_shape(filepath: str) -> Optional[Tuple[int, int]]:
+    """读取第一个文件以获取尺寸"""
+    try:
+        with dm4.DM4File.open(filepath) as dm4data:
+            tags = dm4data.read_directory()
+            try:
+                image_data_tag = tags.named_subdirs['ImageList'].unnamed_subdirs[1].named_subdirs['ImageData']
+            except:
+                image_data_tag = tags.named_subdirs['ImageList'].unnamed_subdirs[0].named_subdirs['ImageData']
+            
+            XDim = dm4data.read_tag_data(image_data_tag.named_subdirs['Dimensions'].unnamed_tags[0])
+            YDim = dm4data.read_tag_data(image_data_tag.named_subdirs['Dimensions'].unnamed_tags[1])
+            return (YDim, XDim)
+    except:
         return None
 
-
 def read_dm4_sequence(folder_path: str, 
-                     bit_depth: int = 8,
-                     max_workers: int = 8,
-                     progress_callback=None) -> Tuple[np.ndarray, dict]:
+                      bit_depth: int = 8,
+                      max_workers: int = 8,
+                      progress_callback=None) -> Tuple[np.ndarray, dict]:
     """
-    读取文件夹中的DM4序列
-    
-    Parameters:
-    -----------
-    folder_path : str
-        包含DM4文件的文件夹路径
-    bit_depth : int
-        输出位深度
-    max_workers : int
-        并行线程数
-    progress_callback : callable
-        进度回调函数
-        
-    Returns:
-    --------
-    image_stack : np.ndarray
-        形状为 (T, Y, X) 的图像栈
-    metadata : dict
-        元数据字典
+    读取文件夹中的DM4序列 (OOM Safe)
     """
     folder = Path(folder_path)
     dm4_files = sorted(folder.glob('**/*.dm4'))
@@ -128,63 +108,56 @@ def read_dm4_sequence(folder_path: str,
     if not dm4_files:
         raise ValueError(f"No DM4 files found in {folder_path}")
     
-    print(f"Found {len(dm4_files)} DM4 files")
+    count = len(dm4_files)
+    print(f"Found {count} DM4 files")
     
-    # 并行读取
-    images = []
+    # 1. 预读取获取尺寸
+    shape = get_first_image_shape(str(dm4_files[0]))
+    if not shape:
+        raise ValueError("Failed to read dimensions from first file")
+    
+    H, W = shape
+    full_shape = (count, H, W)
+    dtype = np.uint8 if bit_depth == 8 else (np.uint16 if bit_depth == 16 else np.float32)
+    
+    # 2. 预分配大数组 (Memmap if huge)
+    image_stack, temp_file = create_huge_array(full_shape, dtype, fill_zeros=False)
+    
+    # 3. 并行读取并填入
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(read_single_dm4, str(f), bit_depth): i 
-                   for i, f in enumerate(dm4_files)}
+        # 提交任务：直接传入文件名、目标数组引用、目标索引
+        futures = {
+            executor.submit(read_single_dm4_into_buffer, str(f), image_stack, i, bit_depth): i 
+            for i, f in enumerate(dm4_files)
+        }
         
-        for future in tqdm(concurrent.futures.as_completed(futures), 
-                          total=len(futures), 
-                          desc="Loading DM4 files"):
-            idx = futures[future]
-            img = future.result()
-            if img is not None:
-                images.append((idx, img))
-            
+        completed = 0
+        for future in tqdm(concurrent.futures.as_completed(futures), total=count, desc="Loading DM4"):
+            res = future.result()
+            completed += 1
             if progress_callback:
-                progress_callback(len(images), len(dm4_files))
+                progress_callback(completed, count)
     
-    # 按索引排序并堆叠
-    images.sort(key=lambda x: x[0])
-    # 修复：stack 后强制连续
-    image_stack = np.ascontiguousarray(np.stack([img for _, img in images], axis=0))
+    # 4. Flush if memmap
+    if hasattr(image_stack, 'flush'):
+        image_stack.flush()
     
-    # 生成元数据
     metadata = {
         'source_folder': str(folder),
-        'num_frames': len(image_stack),
+        'num_frames': count,
         'bit_depth': bit_depth,
-        'shape': image_stack.shape,
-        'dtype': str(image_stack.dtype)
+        'shape': full_shape,
+        'dtype': str(dtype),
+        'memmap_path': temp_file
     }
     
     return image_stack, metadata
 
-
 def get_dm4_folders(root_path: str) -> list:
-    """
-    扫描根目录，找到所有包含DM4文件的子文件夹
-    
-    Parameters:
-    -----------
-    root_path : str
-        根目录路径
-        
-    Returns:
-    --------
-    folders : list
-        包含DM4文件的文件夹列表
-    """
     root = Path(root_path)
     dm4_folders = []
-    
     for subfolder in root.iterdir():
         if subfolder.is_dir():
-            # 检查是否包含dm4文件
             if list(subfolder.glob('*.dm4')):
                 dm4_folders.append(str(subfolder))
-    
     return dm4_folders

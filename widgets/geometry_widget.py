@@ -101,9 +101,10 @@ class BatchExportThread(QThread):
                 if create_denoise:
                     (output_dir / f"{base_name}{suffix_main}{aux_suffixes['lrtem']}").mkdir(exist_ok=True)
                     (output_dir / f"{base_name}{suffix_main}{aux_suffixes['hrtem']}").mkdir(exist_ok=True)
-                    (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask']}").mkdir(exist_ok=True)
+                    # (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask']}").mkdir(exist_ok=True)
                 
                 if create_refine:
+                    (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask']}").mkdir(exist_ok=True)
                     (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask_new']}").mkdir(exist_ok=True)
                 # ===============================================
 
