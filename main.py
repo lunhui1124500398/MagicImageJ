@@ -3,6 +3,30 @@ TEM Data Processing Workflow - Napari GUI
 统一的TEM数据处理平台
 [Fix] 增加了 resize 初始化，防止界面在启动时过大。
 """
+import sys
+import os
+
+# =========================================================================
+# 【关键修复】标准输出重定向
+# 解决 PyInstaller 打包无控制台模式下，tqdm 和 print 导致的崩溃问题
+# 原理：给 tqdm 一个“假的” write 方法，让它把文字写到虚空里，
+# 这样程序就不会崩，而你的 GUI 进度条 (QProgressBar) 依然可以正常接收信号！
+# =========================================================================
+class NullWriter:
+    def write(self, text):
+        pass # 什么都不做，假装写成功了
+    def flush(self):
+        pass
+    def isatty(self):
+        return False
+
+# 只有在打包后的环境 (frozen) 且没有控制台的情况下才劫持
+if getattr(sys, 'frozen', False):
+    if sys.stdout is None:
+        sys.stdout = NullWriter()
+    if sys.stderr is None:
+        sys.stderr = NullWriter()
+
 import napari
 from qtpy.QtWidgets import QTabWidget, QDockWidget, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLabel
 from qtpy.QtCore import Qt, QTimer, QSettings
@@ -15,6 +39,7 @@ from widgets.export_widget import ExportWidget
 from widgets.settings_widget import SettingsDialog, GlobalConfig
 import numpy as np
 import math
+
 
 class TEMWorkflow:
     def __init__(self):

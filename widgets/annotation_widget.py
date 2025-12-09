@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
                             QProgressDialog, QApplication,QScrollArea)
 from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QColor
+from utils.utils import resource_path
 import numpy as np
 import napari
 import cv2
@@ -353,10 +354,25 @@ class AnnotationWidget(QWidget):
     # ========== Logic: Pillow Drawing ==========
     
     def _get_font(self, size):
-        try: return ImageFont.truetype("arial.ttf", size)
+        # 1. 优先尝试加载打包进来的自带字体 (最稳妥，无视系统差异)
+        # 注意：这里 'assets/arial.ttf' 对应你项目里的实际相对路径
+        bundled_font_path = resource_path(os.path.join('assets', 'arial.ttf'))
+        
+        try:
+            return ImageFont.truetype(bundled_font_path, size)
+        except Exception as e:
+            # print(f"Bundled font failed: {e}") # 调试用
+            pass
+
+        # 2. 如果自带的失败了，尝试系统字体 (Fallback)
+        try: 
+            return ImageFont.truetype("arial.ttf", size)
         except:
-            try: return ImageFont.truetype("DejaVuSans.ttf", size)
-            except: return ImageFont.load_default()
+            try: 
+                return ImageFont.truetype("DejaVuSans.ttf", size)
+            except: 
+                # 3. 实在不行用默认位图字体 (很丑，但不会崩)
+                return ImageFont.load_default()
 
     def _draw_text_pil(self, img_rgba, text, x, y, font_size, color_rgb, anchor):
         pil_img = Image.fromarray(img_rgba)
