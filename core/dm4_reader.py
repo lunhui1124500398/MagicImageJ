@@ -11,6 +11,19 @@ import concurrent.futures
 from tqdm import tqdm
 from utils.memory_utils import create_huge_array
 import os
+import platform
+
+def fix_long_path(path_str: str) -> str:
+    """
+    修复 Windows 长路径问题
+    在绝对路径前加 \\?\
+    """
+    if platform.system() == 'Windows':
+        abs_path = os.path.abspath(path_str)
+        if not abs_path.startswith('\\\\?\\'):
+            return '\\\\?\\' + abs_path
+        return abs_path
+    return path_str
 
 def safe_normalize(data: np.ndarray, bit_depth: int = 8) -> np.ndarray:
     """

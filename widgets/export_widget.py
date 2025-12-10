@@ -270,6 +270,7 @@ class ExportWidget(QWidget):
         self.lbl_path = QLabel("No path selected")
         self.lbl_path.setStyleSheet("font-size: 10px; color: gray;")
         self.lbl_path.setWordWrap(True)
+        self.lbl_path.setMaximumWidth(200)
         
         btn_brow = QPushButton("📂 Browse")
         btn_brow.clicked.connect(self._browse)

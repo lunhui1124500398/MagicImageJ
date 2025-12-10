@@ -795,10 +795,33 @@ class GeometryWidget(QWidget):
         @roi_layer.bind_key(undo_key)
         def undo_batch_rect(layer):
             if layer.mode == 'add_rectangle' and len(layer.data) > 0:
-                layer.data = layer.data[:-1]
-                self.status_label.setText("↩️ Last ROI removed.")
-            elif layer.mode == 'select':
-                self.status_label.setText("ℹ️ Undo available in Draw Mode.")
+                # 1. 获取当前数据和特征
+                current_data = layer.data
+                current_features = layer.features
+                
+                # 2. 只有当数据存在时才执行
+                if len(current_data) > 0:
+                    # 暂时断开事件监听，防止 _on_batch_data_change 在状态不稳时触发
+                    self._is_updating = True 
+                    try:
+                        # 3. 同步切片：数据和特征都移除最后一个
+                        new_data = current_data[:-1]
+                        new_features = {k: v[:-1] for k, v in current_features.items()}
+                        
+                        # 4. 先清空选中，防止索引越界
+                        layer.selected_data = set()
+                        
+                        # 5. 同时赋值（先赋特征，再赋数据，通常更稳妥）
+                        layer.features = new_features
+                        layer.data = new_data
+                        
+                        self.status_label.setText("↩️ Last ROI removed.")
+                    except Exception as e:
+                        print(f"Undo Error: {e}")
+                    finally:
+                        self._is_updating = False
+                        # 强制刷新一下图层以确保显示正确
+                        layer.refresh()
 
         self.status_label.setText(f"✏️ Drawing on '{view_layer}'. (Ctrl+Z to Undo last)")
 

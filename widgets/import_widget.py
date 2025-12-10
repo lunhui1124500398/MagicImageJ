@@ -244,10 +244,15 @@ class ImportWidget(QWidget):
         last = self.settings.value("last_folder", "")
         if last and os.path.isdir(last):
             self.current_folder = last
-            self.folder_label.setText(last)
+            self._update_folder_label(last)
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
             self.pick_file_btn.setEnabled(True)
+    
+    def elide_text(self, text, max_len=60):
+        """[Fix] 缩短过长的文本，保留首尾"""
+        if len(text) <= max_len: return text
+        return text[:max_len//2-3] + "..." + text[-(max_len//2):]
     
     def _get_total_memory_gb(self):
         """获取系统物理内存 (GB)"""
@@ -310,6 +315,7 @@ class ImportWidget(QWidget):
         g_source = QGroupBox("1. Data Source"); l_source = QVBoxLayout(); l_source.setSpacing(4); l_source.setContentsMargins(8, 8, 8, 8)
         h_brow = QHBoxLayout(); btn_browse = QPushButton("📂 Browse Folder"); btn_browse.clicked.connect(self._browse_folder)
         h_brow.addWidget(btn_browse); self.folder_label = QLabel("None"); self.folder_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.folder_label.setWordWrap(True); self.folder_label.setMaximumWidth(280)
         l_source.addLayout(h_brow); l_source.addWidget(self.folder_label); g_source.setLayout(l_source); layout.addWidget(g_source)
 
         # Group 2: Scan Metadata
@@ -436,13 +442,18 @@ class ImportWidget(QWidget):
                 self.lbl_memory_warning.setVisible(True)
         else:
             self.lbl_memory_warning.setVisible(False)
+    
+    def _update_folder_label(self, path):
+        """[Fix] 更新标签文本，自动缩短过长路径"""
+        self.folder_label.setText(path)
+        self.folder_label.setToolTip(path) # 鼠标悬停显示全名
 
     def _browse_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Select Data Folder", self.settings.value("last_folder", ""))
         if f:
             self.current_folder = f
             self.settings.setValue("last_folder", f)
-            self.folder_label.setText(f)
+            self._update_folder_label(f)
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
             self.pick_file_btn.setEnabled(True)
@@ -543,7 +554,8 @@ class ImportWidget(QWidget):
         if info.get('mag', 0) > 0:
             m = info['mag']
             self.mag_edit.setText(f"{int(m/1000)}K" if m >= 1000 else str(int(m)))
-        self.meta_info_label.setText(f"Ref: {fname}\nDate: {info.get('date_fmt', 'N/A')}, Exp: {info.get('exposure', 0)}s\nPixel: {info.get('pixel_A', 0):.2f} Å")
+        short_name = fname if len(fname) < 20 else "..." + fname[-15:]
+        self.meta_info_label.setText(f"Ref: {short_name}\nDate: {info.get('date_fmt', 'N/A')}, Exp: {info.get('exposure', 0)}s\nPixel: {info.get('pixel_A', 0):.2f} Å")
         self._update_preview()
         self.create_archive_btn.setEnabled(True)
 
@@ -667,14 +679,21 @@ class ImportWidget(QWidget):
         self.status.setText(f"{'Moving' if move_mode else 'Copying'} raw data...")
         self.archive_thread = ArchiveThread(str(self.current_folder), str(raw_dest), move_mode=move_mode)
         # Pass move_mode and size_gb to callback
-        self.archive_thread.finished.connect(lambda: self._on_archive_done(move_mode, size_gb))
+        self.archive_thread.finished.connect(lambda: self._on_archive_done(move_mode, size_gb, raw_dest))
         self.archive_thread.error.connect(self._on_archive_error)
         self.archive_thread.start()
 
-    def _on_archive_done(self, was_moved, size_gb):
+    def _on_archive_done(self, was_moved, size_gb, new_path):
         self.archive_progress.setVisible(False)
         self.create_archive_btn.setEnabled(True)
         self.status.setText(f"✅ Archived: {Path(self.archive_root).name}")
+
+        if was_moved:
+            self.current_folder = str(new_path)
+            self._update_folder_label(str(new_path))
+            self.settings.setValue("last_folder", str(new_path))
+            # 刷新一下 ID 提取 (可选，确保一致性)
+            self.status.setText("ℹ️ Source path updated to archive location.")
         
         # [Req New] Popup with details
         if self.check_show_popup.isChecked():
@@ -724,5 +743,6 @@ class ImportWidget(QWidget):
         self.progress.setVisible(False)
         self.load_btn.setEnabled(True)
         name = f"Original_{Path(self.current_folder).name}"
+        if len(name) > 30: name = name[:15] + "..." + name[-10:]
         self.viewer.add_image(stack, name=name, metadata=meta, colormap='gray')
         self.status.setText(f"Loaded {len(stack)} frames.")
