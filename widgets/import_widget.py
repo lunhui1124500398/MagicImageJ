@@ -475,10 +475,10 @@ class ImportWidget(QWidget):
                 status_msgs.append("No Dataset ID")
 
             # 2. Aperture (OL) Detection
-            match_ol = re.search(r"OL\s*[#\-_]?\s*(\d+)", current_name, re.IGNORECASE)
+            match_ol = re.search(r"(?<!non)OL\s*[#\-_]?\s*(\d+)", current_name, re.IGNORECASE)
             source_level = "Current" # 用于调试日志
             if not match_ol:
-                match_ol = re.search(r"OL\s*[#\-_]?\s*(\d+)", parent_name, re.IGNORECASE)
+                match_ol = re.search(r"(?<!non)OL\s*[#\-_]?\s*(\d+)", parent_name, re.IGNORECASE)
                 source_level = "Parent"
             
             if match_ol:
