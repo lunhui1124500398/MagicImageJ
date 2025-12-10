@@ -17,6 +17,7 @@ from pathlib import Path
 import json
 import datetime
 import cv2
+from widgets.settings_widget import tr
 
 # 引入工具函数
 from utils.video_export import export_to_video, export_to_tiff_stack, get_available_codecs
@@ -136,27 +137,27 @@ class ExportWidget(QWidget):
         content_widget = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("<h3>💾 Export Data</h3>"))
+        layout.addWidget(QLabel(f"<h3>💾 {tr('Export')}</h3>"))
         
         # 1. Source Layer
         h_lay = QHBoxLayout()
-        h_lay.addWidget(QLabel("Source:"))
+        h_lay.addWidget(QLabel(tr("Source:")))
         self.layer_combo = QComboBox()
         self.layer_combo.currentTextChanged.connect(self._on_layer_changed)
         h_lay.addWidget(self.layer_combo)
         layout.addLayout(h_lay)
         
         # 刷新按钮
-        btn_refresh = QPushButton("🔄 Refresh Layers")
+        btn_refresh = QPushButton(f"🔄 {tr('Refresh Layers')}")
         btn_refresh.clicked.connect(self._refresh_layers)
         layout.addWidget(btn_refresh)
         
         # 2. Frame Range (修复：找回了遗漏的帧范围选择)
-        self.g_range = QGroupBox("Frame Range")
+        self.g_range = QGroupBox(tr("Frame Range"))
         l_range = QHBoxLayout()
-        self.radio_all = QRadioButton("All Frames")
+        self.radio_all = QRadioButton(tr("All Frames"))
         self.radio_all.setChecked(True)
-        self.radio_range = QRadioButton("Range")
+        self.radio_range = QRadioButton(tr("Range"))
         
         self.edit_frame_range = QLineEdit()
         self.edit_frame_range.setPlaceholderText("e.g. 0-10, 15, 20-25")
@@ -173,14 +174,14 @@ class ExportWidget(QWidget):
         layout.addWidget(self.g_range)
 
         # 3. Export Format Type
-        g_type = QGroupBox("Export Format")
+        g_type = QGroupBox(tr("Export Format"))
         l_type = QVBoxLayout()
         self.bg_type = QButtonGroup()
         
-        self.radio_vid = QRadioButton("Video (.mp4, .avi)")
+        self.radio_vid = QRadioButton(tr("Video (.mp4, .avi)"))
         self.radio_vid.setChecked(True)
-        self.radio_tiff = QRadioButton("TIFF Stack (.tiff)")
-        self.radio_seq = QRadioButton("Image Sequence (Folder)")
+        self.radio_tiff = QRadioButton(tr("TIFF Stack (.tiff)"))
+        self.radio_seq = QRadioButton(tr("Image Sequence (Folder)"))
         
         self.bg_type.addButton(self.radio_vid)
         self.bg_type.addButton(self.radio_tiff)
@@ -198,11 +199,11 @@ class ExportWidget(QWidget):
         layout.addWidget(g_type)
         
         # 4. Video Settings (FPS, Codec, Quality)
-        self.g_vid_set = QGroupBox("Video Options")
+        self.g_vid_set = QGroupBox(tr("Video Options"))
         l_vid = QVBoxLayout()
         
         h_fps = QHBoxLayout()
-        h_fps.addWidget(QLabel("FPS:"))
+        h_fps.addWidget(QLabel(tr("FPS:")))
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 99999)
         self.spin_fps.setValue(60)
@@ -210,14 +211,14 @@ class ExportWidget(QWidget):
         l_vid.addLayout(h_fps)
         
         h_codec = QHBoxLayout()
-        h_codec.addWidget(QLabel("Codec:"))
+        h_codec.addWidget(QLabel(tr("Codec:")))
         self.combo_codec = QComboBox()
         self.combo_codec.addItems(get_available_codecs())
         h_codec.addWidget(self.combo_codec)
         l_vid.addLayout(h_codec)
         
         h_qual = QHBoxLayout()
-        h_qual.addWidget(QLabel("Quality (0-100):"))
+        h_qual.addWidget(QLabel(tr("Quality (0-100):")))
         self.spin_qual = QSpinBox()
         self.spin_qual.setRange(1, 100)
         self.spin_qual.setValue(100)
@@ -228,18 +229,18 @@ class ExportWidget(QWidget):
         layout.addWidget(self.g_vid_set)
         
         # 5. Sequence Settings
-        self.g_seq_set = QGroupBox("Sequence Options")
+        self.g_seq_set = QGroupBox(tr("Sequence Options"))
         l_seq = QVBoxLayout()
         
         h_fmt = QHBoxLayout()
-        h_fmt.addWidget(QLabel("Format:"))
+        h_fmt.addWidget(QLabel(tr("Format:")))
         self.combo_img_fmt = QComboBox()
         self.combo_img_fmt.addItems(['png', 'jpg', 'bmp', 'tiff'])
         h_fmt.addWidget(self.combo_img_fmt)
         l_seq.addLayout(h_fmt)
         
         h_pat = QHBoxLayout()
-        h_pat.addWidget(QLabel("Pattern:"))
+        h_pat.addWidget(QLabel(tr("Pattern:")))
         self.edit_pattern = QLineEdit("frame_{:04d}")
         h_pat.addWidget(self.edit_pattern)
         l_seq.addLayout(h_pat)
@@ -249,30 +250,30 @@ class ExportWidget(QWidget):
         layout.addWidget(self.g_seq_set)
         
         # 6. Annotations Check
-        self.g_anno = QGroupBox("Overlay Annotations")
+        self.g_anno = QGroupBox(tr("Overlay Annotations"))
         self.g_anno.setCheckable(True)
         self.g_anno.setChecked(False)
         l_anno = QVBoxLayout()
         
-        self.check_sb = QCheckBox("Scale Bar")
+        self.check_sb = QCheckBox(tr("Scale Bar"))
         self.check_sb.setChecked(False)
-        self.check_ts = QCheckBox("Timestamp")
+        self.check_ts = QCheckBox(tr("Timestamp"))
         self.check_ts.setChecked(False)
         
         l_anno.addWidget(self.check_sb)
         l_anno.addWidget(self.check_ts)
-        l_anno.addWidget(QLabel("<i style='color:gray'>(Styles loaded from Annotation Tab)</i>"))
+        l_anno.addWidget(QLabel(f"<i style='color:gray'>{tr('Styles loaded from Annotation Tab')}</i>"))
         self.g_anno.setLayout(l_anno)
         layout.addWidget(self.g_anno)
         
         # 7. Output Path
         h_path = QHBoxLayout()
-        self.lbl_path = QLabel("No path selected")
+        self.lbl_path = QLabel(tr("No path selected"))
         self.lbl_path.setStyleSheet("font-size: 10px; color: gray;")
         self.lbl_path.setWordWrap(True)
         self.lbl_path.setMaximumWidth(200)
         
-        btn_brow = QPushButton("📂 Browse")
+        btn_brow = QPushButton(f"📂 {tr('Browse')}")
         btn_brow.clicked.connect(self._browse)
         
         h_path.addWidget(self.lbl_path)
@@ -285,13 +286,13 @@ class ExportWidget(QWidget):
         self.pbar.setFormat("%p%")
         layout.addWidget(self.pbar)
         
-        self.btn_run = QPushButton("🚀 Start Export")
+        self.btn_run = QPushButton(f"🚀 {tr('Start Export')}")
         self.btn_run.clicked.connect(self._start_export)
         self.btn_run.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 6px;")
         self.btn_run.setEnabled(False)
         layout.addWidget(self.btn_run)
         
-        self.lbl_status = QLabel("Ready")
+        self.lbl_status = QLabel(tr("Ready"))
         self.lbl_status.setWordWrap(True)
         layout.addWidget(self.lbl_status)
         
@@ -408,7 +409,7 @@ class ExportWidget(QWidget):
                 self.lbl_path.setText(last)
                 self.btn_run.setEnabled(True)
             else:
-                self.lbl_path.setText("No path selected")
+                self.lbl_path.setText(tr("No path selected"))
                 self.btn_run.setEnabled(False)
 
     def _get_export_params(self):

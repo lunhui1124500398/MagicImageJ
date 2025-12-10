@@ -25,6 +25,8 @@ import napari
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 import os
+from widgets.settings_widget import tr
+
 
 class AnnotationWidget(QWidget):
     def __init__(self, viewer):
@@ -73,47 +75,47 @@ class AnnotationWidget(QWidget):
         content_widget = QWidget()
         layout = QVBoxLayout()
         
-        title = QLabel("<h3>📏 ImageJ-Style Annotation (Lazy & Smart)</h3>")
+        title = QLabel(f"<h3>📏 {tr('Annotation (Lazy & Smart)')}</h3>")
         layout.addWidget(title)
         
         # 图层选择
         layer_box = QHBoxLayout()
-        layer_box.addWidget(QLabel("Source:"))
+        layer_box.addWidget(QLabel(tr("Source:")))
         self.layer_combo = QComboBox()
         self.layer_combo.currentTextChanged.connect(self._on_layer_selected)
         layer_box.addWidget(self.layer_combo)
         layout.addLayout(layer_box)
         
-        btn_refresh = QPushButton("🔄 Refresh Layers")
+        btn_refresh = QPushButton(f"🔄 {tr('Refresh Layers')}")
         btn_refresh.clicked.connect(self._refresh_layers)
         layout.addWidget(btn_refresh)
         
         # Tabs
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._create_scale_bar_tab(), "📏 Scale Bar")
-        self.tabs.addTab(self._create_label_tab(), "🏷️ Label")
+        self.tabs.addTab(self._create_scale_bar_tab(), f"📏 {tr('Scale Bar')}")
+        self.tabs.addTab(self._create_label_tab(), f"🏷️ {tr('Label')}")
         layout.addWidget(self.tabs)
         
         # 底部按钮
         btn_box = QVBoxLayout()
         
-        self.btn_preview = QPushButton("👁️ Initialize / Reset Preview")
+        self.btn_preview = QPushButton(f"👁️ {tr('Initialize / Reset Preview')}")
         self.btn_preview.clicked.connect(self._create_preview)
         self.btn_preview.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
         btn_box.addWidget(self.btn_preview)
         
-        self.btn_burn = QPushButton("🔥 Burn-in to New Layer")
+        self.btn_burn = QPushButton(f"🔥 {tr('Burn-in to New Layer')}")
         self.btn_burn.clicked.connect(self._apply_to_new_layer)
         self.btn_burn.setStyleSheet("background-color: #FF5722; color: white; font-weight: bold; padding: 8px;")
         btn_box.addWidget(self.btn_burn)
         
-        self.btn_clear = QPushButton("🗑️ Clear All")
+        self.btn_clear = QPushButton(f"🗑️ {tr('Clear All')}")
         self.btn_clear.clicked.connect(self._clear_preview)
         btn_box.addWidget(self.btn_clear)
         
         layout.addLayout(btn_box)
         
-        self.status_label = QLabel("Ready.")
+        self.status_label = QLabel(tr("Ready."))
         self.status_label.setStyleSheet("color: gray; font-style: italic;")
         layout.addWidget(self.status_label)
         
@@ -130,7 +132,7 @@ class AnnotationWidget(QWidget):
         
         # Enable
         h_top = QHBoxLayout()
-        self.use_scale_bar_check = QCheckBox("Enable")
+        self.use_scale_bar_check = QCheckBox(tr("Enable"))
         self.use_scale_bar_check.setChecked(True)
         self.use_scale_bar_check.stateChanged.connect(self._on_ui_param_change)
         h_top.addWidget(self.use_scale_bar_check)
@@ -138,20 +140,20 @@ class AnnotationWidget(QWidget):
         l.addLayout(h_top)
         
         # Quick Position Buttons (Smart Snap)
-        g_quick = QGroupBox("Quick Snap")
+        g_quick = QGroupBox(tr("Quick Snap"))
         l_quick = QGridLayout()
         # 使用更直观的图标
-        btn_ul = QPushButton("◤ Top-Left"); btn_ul.clicked.connect(lambda: self._snap_pos('scale', 'TL'))
-        btn_ur = QPushButton("Top-Right ◥"); btn_ur.clicked.connect(lambda: self._snap_pos('scale', 'TR'))
-        btn_ll = QPushButton("◣ Bottom-Left"); btn_ll.clicked.connect(lambda: self._snap_pos('scale', 'BL'))
-        btn_lr = QPushButton("Bottom-Right ◢"); btn_lr.clicked.connect(lambda: self._snap_pos('scale', 'BR'))
+        btn_ul = QPushButton(f"◤ {tr('Top-Left')}"); btn_ul.clicked.connect(lambda: self._snap_pos('scale', 'TL'))
+        btn_ur = QPushButton(f"{tr('Top-Right')} ◥"); btn_ur.clicked.connect(lambda: self._snap_pos('scale', 'TR'))
+        btn_ll = QPushButton(f"◣ {tr('Bottom-Left')}"); btn_ll.clicked.connect(lambda: self._snap_pos('scale', 'BL'))
+        btn_lr = QPushButton(f"{tr('Bottom-Right')} ◢"); btn_lr.clicked.connect(lambda: self._snap_pos('scale', 'BR'))
         l_quick.addWidget(btn_ul, 0, 0); l_quick.addWidget(btn_ur, 0, 1)
         l_quick.addWidget(btn_ll, 1, 0); l_quick.addWidget(btn_lr, 1, 1)
         g_quick.setLayout(l_quick)
         l.addWidget(g_quick)
 
         # Ratio
-        g_ratio = QGroupBox("Scale Ratio")
+        g_ratio = QGroupBox(tr("Scale Ratio"))
         l_ratio = QHBoxLayout()
         l_ratio.addWidget(QLabel("1 px ="))
         self.scale_ratio_spin = QDoubleSpinBox()
@@ -169,11 +171,11 @@ class AnnotationWidget(QWidget):
         l.addWidget(g_ratio)
         
         # Appearance
-        g_app = QGroupBox("Appearance")
+        g_app = QGroupBox(tr("Appearance"))
         l_app = QVBoxLayout()
         
         h_len = QHBoxLayout()
-        h_len.addWidget(QLabel("Bar Length:"))
+        h_len.addWidget(QLabel(tr("Bar Length:")))
         self.scale_length_spin = QDoubleSpinBox()
         self.scale_length_spin.setRange(0.001, 1000000)
         self.scale_length_spin.setValue(100.0) 
@@ -183,7 +185,7 @@ class AnnotationWidget(QWidget):
         h_len.addWidget(self.scale_length_spin)
         l_app.addLayout(h_len)
 
-        self.auto_size_check = QCheckBox("Auto BG Size (Smart)")
+        self.auto_size_check = QCheckBox(tr("Auto BG Size (Smart)"))
         self.auto_size_check.setChecked(True)
         self.auto_size_check.stateChanged.connect(self._on_auto_size_toggled)
         l_app.addWidget(self.auto_size_check)
@@ -197,26 +199,26 @@ class AnnotationWidget(QWidget):
             l_app.addLayout(h)
             return s
             
-        self.scale_thickness_spin = add_spin("Bar Thickness:", 1, 100, 8)
-        self.scale_font_spin = add_spin("Font Size (pt):", 6, 500, 36)
-        self.scale_padding_spin = add_spin("Padding:", 0, 100, 10)
-        self.scale_height_spin = add_spin("BG Height (px):", 10, 1000, 80)
+        self.scale_thickness_spin = add_spin(tr("Bar Thickness:"), 1, 100, 8)
+        self.scale_font_spin = add_spin(tr("Font Size (pt):"), 6, 500, 36)
+        self.scale_padding_spin = add_spin(tr("Padding:"), 0, 100, 10)
+        self.scale_height_spin = add_spin(tr("BG Height (px):"), 10, 1000, 80)
         
         self._on_auto_size_toggled()
 
         h_col = QHBoxLayout()
-        self.scale_color_btn = QPushButton("Text/Bar Color"); self.scale_color_btn.clicked.connect(self._choose_scale_color)
-        self.scale_bg_color_btn = QPushButton("BG Color"); self.scale_bg_color_btn.clicked.connect(self._choose_scale_bg_color)
+        self.scale_color_btn = QPushButton(tr("Text/Bar Color")); self.scale_color_btn.clicked.connect(self._choose_scale_color)
+        self.scale_bg_color_btn = QPushButton(tr("BG Color")); self.scale_bg_color_btn.clicked.connect(self._choose_scale_bg_color)
         h_col.addWidget(self.scale_color_btn); h_col.addWidget(self.scale_bg_color_btn)
         l_app.addLayout(h_col)
         
-        self.scale_use_bg_check = QCheckBox("Show Background")
+        self.scale_use_bg_check = QCheckBox(tr("Show Background"))
         self.scale_use_bg_check.setChecked(True)
         self.scale_use_bg_check.stateChanged.connect(self._on_ui_param_change)
         l_app.addWidget(self.scale_use_bg_check)
         
         h_alpha = QHBoxLayout()
-        h_alpha.addWidget(QLabel("BG Opacity:"))
+        h_alpha.addWidget(QLabel(tr("BG Opacity:")))
         self.scale_bg_alpha_slider = QSlider(Qt.Horizontal); self.scale_bg_alpha_slider.setRange(0, 100)
         self.scale_bg_alpha_slider.setValue(100)
         self.scale_bg_alpha_val_label = QLabel("100%")
@@ -248,7 +250,7 @@ class AnnotationWidget(QWidget):
         l = QVBoxLayout()
         
         h_top = QHBoxLayout()
-        self.use_label_check = QCheckBox("Enable Label")
+        self.use_label_check = QCheckBox(tr("Enable"))
         self.use_label_check.setChecked(True)
         self.use_label_check.stateChanged.connect(self._on_ui_param_change)
         h_top.addWidget(self.use_label_check)
@@ -256,18 +258,18 @@ class AnnotationWidget(QWidget):
         l.addLayout(h_top)
         
         # Quick Pos
-        g_quick = QGroupBox("Quick Snap")
+        g_quick = QGroupBox(tr("Quick Snap"))
         l_quick = QGridLayout()
-        btn_ul = QPushButton("◤ Top-Left"); btn_ul.clicked.connect(lambda: self._snap_pos('label', 'TL'))
-        btn_ur = QPushButton("Top-Right ◥"); btn_ur.clicked.connect(lambda: self._snap_pos('label', 'TR'))
-        btn_ll = QPushButton("◣ Bottom-Left"); btn_ll.clicked.connect(lambda: self._snap_pos('label', 'BL'))
-        btn_lr = QPushButton("Bottom-Right ◢"); btn_lr.clicked.connect(lambda: self._snap_pos('label', 'BR'))
+        btn_ul = QPushButton(f"◤ {tr('Top-Left')}"); btn_ul.clicked.connect(lambda: self._snap_pos('label', 'TL'))
+        btn_ur = QPushButton(f"{tr('Top-Right')} ◥"); btn_ur.clicked.connect(lambda: self._snap_pos('label', 'TR'))
+        btn_ll = QPushButton(f"◣ {tr('Bottom-Left')}"); btn_ll.clicked.connect(lambda: self._snap_pos('label', 'BL'))
+        btn_lr = QPushButton(f"{tr('Bottom-Right')} ◢"); btn_lr.clicked.connect(lambda: self._snap_pos('label', 'BR'))
         l_quick.addWidget(btn_ul, 0, 0); l_quick.addWidget(btn_ur, 0, 1)
         l_quick.addWidget(btn_ll, 1, 0); l_quick.addWidget(btn_lr, 1, 1)
         g_quick.setLayout(l_quick)
         l.addWidget(g_quick)
         
-        g_fmt = QGroupBox("Format")
+        g_fmt = QGroupBox(tr("Format"))
         l_fmt = QVBoxLayout()
         self.label_format_combo = QComboBox()
         self.label_format_combo.addItems(["00:00", "0", "0.0", "0.00", "Custom"]) 
@@ -286,23 +288,23 @@ class AnnotationWidget(QWidget):
         
         self.label_start_spin.valueChanged.connect(self._on_ui_param_change)
         self.label_interval_spin.valueChanged.connect(self._on_ui_param_change)
-        h_val.addWidget(QLabel("Start:")); h_val.addWidget(self.label_start_spin)
-        h_val.addWidget(QLabel("Step:")); h_val.addWidget(self.label_interval_spin)
+        h_val.addWidget(QLabel(tr("Start:"))); h_val.addWidget(self.label_start_spin)
+        h_val.addWidget(QLabel(tr("Step:"))); h_val.addWidget(self.label_interval_spin)
         l_fmt.addLayout(h_val)
         g_fmt.setLayout(l_fmt)
         l.addWidget(g_fmt)
         
-        g_app = QGroupBox("Appearance")
+        g_app = QGroupBox(tr("Appearance"))
         l_app = QVBoxLayout()
         
         h_font = QHBoxLayout()
-        h_font.addWidget(QLabel("Font Size (pt):"))
+        h_font.addWidget(QLabel(tr("Font Size (pt):")))
         self.label_font_spin = QSpinBox(); self.label_font_spin.setRange(6, 500); self.label_font_spin.setValue(32)
         self.label_font_spin.valueChanged.connect(self._on_ui_param_change)
         h_font.addWidget(self.label_font_spin)
         l_app.addLayout(h_font)
         
-        self.label_color_btn = QPushButton("Text Color"); self.label_color_btn.clicked.connect(self._choose_label_color)
+        self.label_color_btn = QPushButton(tr("Text Color")); self.label_color_btn.clicked.connect(self._choose_label_color)
         l_app.addWidget(self.label_color_btn)
         g_app.setLayout(l_app)
         l.addWidget(g_app)

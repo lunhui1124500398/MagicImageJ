@@ -66,7 +66,8 @@ def read_single_dm4_into_buffer(filepath: str,
     读取单个DM4文件并直接写入 buffer[index]
     """
     try:
-        with dm4.DM4File.open(filepath) as dm4data:
+        safe_path = fix_long_path(filepath)
+        with dm4.DM4File.open(safe_path) as dm4data:
             tags = dm4data.read_directory()
             try:
                 image_data_tag = tags.named_subdirs['ImageList'].unnamed_subdirs[1].named_subdirs['ImageData']

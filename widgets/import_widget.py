@@ -25,6 +25,7 @@ import gc
 import re
 import platform
 import ctypes
+from widgets.settings_widget import tr
 
 # 尝试导入 psutil 获取更准确的内存信息，如果没有则使用 ctypes (Windows) 或 os (Linux)
 try:
@@ -309,36 +310,36 @@ class ImportWidget(QWidget):
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         content = QWidget(); layout = QVBoxLayout(); layout.setSpacing(8)
         
-        layout.addWidget(QLabel("<h3>📂 Import & Archive</h3>"))
+        layout.addWidget(QLabel(f"<h3>📂 {tr('Import & Archive')}</h3>"))
 
         # Group 1: Data Source
-        g_source = QGroupBox("1. Data Source"); l_source = QVBoxLayout(); l_source.setSpacing(4); l_source.setContentsMargins(8, 8, 8, 8)
-        h_brow = QHBoxLayout(); btn_browse = QPushButton("📂 Browse Folder"); btn_browse.clicked.connect(self._browse_folder)
+        g_source = QGroupBox(tr("1. Data Source")); l_source = QVBoxLayout(); l_source.setSpacing(4); l_source.setContentsMargins(8, 8, 8, 8)
+        h_brow = QHBoxLayout(); btn_browse = QPushButton(f"📂 {tr('Browse Folder')}"); btn_browse.clicked.connect(self._browse_folder)
         h_brow.addWidget(btn_browse); self.folder_label = QLabel("None"); self.folder_label.setStyleSheet("color: gray; font-size: 11px;")
         self.folder_label.setWordWrap(True); self.folder_label.setMaximumWidth(280)
         l_source.addLayout(h_brow); l_source.addWidget(self.folder_label); g_source.setLayout(l_source); layout.addWidget(g_source)
 
         # Group 2: Scan Metadata
-        g_dose = QGroupBox("2. Scan Metadata"); l_dose = QVBoxLayout(); l_dose.setSpacing(4); l_dose.setContentsMargins(8, 8, 8, 8)
+        g_dose = QGroupBox(tr("2. Scan Metadata")); l_dose = QVBoxLayout(); l_dose.setSpacing(4); l_dose.setContentsMargins(8, 8, 8, 8)
         
         h_calc = QHBoxLayout()
-        self.calc_dose_btn = QPushButton("🧮 Calc Dose")
+        self.calc_dose_btn = QPushButton(f"🧮 {tr('Calc Dose')}")
         self.calc_dose_btn.setEnabled(False)
         self.calc_dose_btn.clicked.connect(self._calc_dose)
         h_calc.addWidget(self.calc_dose_btn)
         
-        h_calc.addWidget(QLabel("Img:"))
+        h_calc.addWidget(QLabel(tr("Img:")))
         self.dose_idx_spin = QSpinBox()
         self.dose_idx_spin.setRange(-1, 99999)
         self.dose_idx_spin.setValue(-1)
         self.dose_idx_spin.setSpecialValueText("Auto")
-        self.dose_idx_spin.setToolTip("Frame Index (-1 for Middle). Pick file to auto-set.")
+        self.dose_idx_spin.setToolTip(tr("Frame Index (-1 for Middle). Pick file to auto-set."))
         self.dose_idx_spin.setMinimumWidth(80)
         self.dose_idx_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         h_calc.addWidget(self.dose_idx_spin)
 
         self.pick_file_btn = QPushButton("📂")
-        self.pick_file_btn.setToolTip("Pick a specific .dm4 file from the folder to calculate dose")
+        self.pick_file_btn.setToolTip(tr("Pick a specific .dm4 file from the folder to calculate dose"))
         self.pick_file_btn.setFixedWidth(50)
         self.pick_file_btn.setEnabled(False)
         self.pick_file_btn.clicked.connect(self._pick_single_file_for_dose)
@@ -351,26 +352,26 @@ class ImportWidget(QWidget):
         h_calc.addStretch()
         l_dose.addLayout(h_calc)
         
-        self.meta_info_label = QLabel("Select folder to extract date, mag, pixel size..."); self.meta_info_label.setWordWrap(True); self.meta_info_label.setStyleSheet("font-size: 10px; color: gray;")
+        self.meta_info_label = QLabel(tr("Select folder to extract date, mag, pixel size...")); self.meta_info_label.setWordWrap(True); self.meta_info_label.setStyleSheet("font-size: 10px; color: gray;")
         l_dose.addWidget(self.meta_info_label); g_dose.setLayout(l_dose); layout.addWidget(g_dose)
 
         # Group 3: Archive Config
-        g_exp = QGroupBox("3. Archive Configuration"); g_exp.setStyleSheet("QGroupBox { border: 1px solid #2196F3; margin-top: 6px; } QGroupBox::title { color: #2196F3; }"); l_exp = QVBoxLayout(); l_exp.setSpacing(4); l_exp.setContentsMargins(8, 12, 8, 8)
-        h1 = QHBoxLayout(); self.substance_edit = QComboBox(); self.substance_edit.setEditable(True); self.substance_edit.setPlaceholderText("Sub (e.g. CRY2)");self.substance_edit.setMinimumWidth(100);
+        g_exp = QGroupBox(tr("3. Archive Configuration")); g_exp.setStyleSheet("QGroupBox { border: 1px solid #2196F3; margin-top: 6px; } QGroupBox::title { color: #2196F3; }"); l_exp = QVBoxLayout(); l_exp.setSpacing(4); l_exp.setContentsMargins(8, 12, 8, 8)
+        h1 = QHBoxLayout(); self.substance_edit = QComboBox(); self.substance_edit.setEditable(True); self.substance_edit.setPlaceholderText(tr("Sub (e.g. CRY2)"));self.substance_edit.setMinimumWidth(100);
         self._load_substance_history()
-        self.solvent_edit = QLineEdit(); self.solvent_edit.setPlaceholderText("Solv (Default: Water)")
+        self.solvent_edit = QLineEdit(); self.solvent_edit.setPlaceholderText(tr("Solv (Default: Water)"))
         self.dataset_edit = QLineEdit("ds1"); self.dataset_edit.setFixedWidth(50); self.dataset_edit.setPlaceholderText("ds#")
-        h1.addWidget(QLabel("Sub:")); h1.addWidget(self.substance_edit); h1.addWidget(QLabel("Solv:")); h1.addWidget(self.solvent_edit); h1.addWidget(QLabel("ID:")); h1.addWidget(self.dataset_edit); l_exp.addLayout(h1)
+        h1.addWidget(QLabel(tr("Sub:"))); h1.addWidget(self.substance_edit); h1.addWidget(QLabel(tr("Solv:"))); h1.addWidget(self.solvent_edit); h1.addWidget(QLabel(tr("ID:"))); h1.addWidget(self.dataset_edit); l_exp.addLayout(h1)
         
         h2 = QHBoxLayout(); self.aperture_combo = QComboBox(); self.aperture_combo.addItems([str(i) for i in range(5)])
-        self.mag_edit = QLineEdit("60K"); self.mag_edit.setPlaceholderText("Mag")
-        h2.addWidget(QLabel("OL# (0-4):")); h2.addWidget(self.aperture_combo); h2.addWidget(QLabel("Mag:")); h2.addWidget(self.mag_edit); l_exp.addLayout(h2)
+        self.mag_edit = QLineEdit("60K"); self.mag_edit.setPlaceholderText(tr("Mag"))
+        h2.addWidget(QLabel(tr("OL# (0-4):"))); h2.addWidget(self.aperture_combo); h2.addWidget(QLabel(tr("Mag:"))); h2.addWidget(self.mag_edit); l_exp.addLayout(h2)
         
         h3 = QHBoxLayout(); self.win_spin = QSpinBox(); self.win_spin.setValue(3); self.win_spin.setRange(1, 99)
         self.sigma_spin = QDoubleSpinBox(); self.sigma_spin.setValue(0.8); self.sigma_spin.setSingleStep(0.1)
-        h3.addWidget(QLabel("Avg Win:")); h3.addWidget(self.win_spin); h3.addWidget(QLabel("Gaus σ:")); h3.addWidget(self.sigma_spin); l_exp.addLayout(h3)
+        h3.addWidget(QLabel(tr("Avg Win:"))); h3.addWidget(self.win_spin); h3.addWidget(QLabel(tr("Gaus σ:"))); h3.addWidget(self.sigma_spin); l_exp.addLayout(h3)
         
-        l_exp.addWidget(QLabel("Additional Info (Saved to txt):")); self.buffer_edit = QTextEdit(); self.buffer_edit.setPlaceholderText("e.g. 50mM Tris, pH 7.5..."); self.buffer_edit.setMaximumHeight(45); l_exp.addWidget(self.buffer_edit)
+        l_exp.addWidget(QLabel(tr("Additional Info (Saved to txt):"))); self.buffer_edit = QTextEdit(); self.buffer_edit.setPlaceholderText("e.g. 50mM Tris, pH 7.5..."); self.buffer_edit.setMaximumHeight(45); l_exp.addWidget(self.buffer_edit)
         
         for w in [self.substance_edit, self.solvent_edit, self.dataset_edit, self.mag_edit, self.aperture_combo, self.win_spin, self.sigma_spin]:
             if isinstance(w, (QLineEdit, QTextEdit)): w.textChanged.connect(self._update_preview)
@@ -379,28 +380,28 @@ class ImportWidget(QWidget):
         g_exp.setLayout(l_exp); layout.addWidget(g_exp)
 
         # Group 4: Action
-        g_arc = QGroupBox("4. Action"); g_arc.setStyleSheet("QGroupBox { border: 1px solid #FF9800; margin-top: 6px; } QGroupBox::title { color: #FF9800; }"); l_arc = QVBoxLayout(); l_arc.setSpacing(6); l_arc.setContentsMargins(8, 12, 8, 8)
-        l_arc.addWidget(QLabel("Preview Folder Name:")); self.preview_label = QLabel("..."); self.preview_label.setWordWrap(True); self.preview_label.setStyleSheet("font-family: 'Segoe UI', sans-serif; font-size: 11px; color: #E0E0E0; background-color: #2D2D2D; padding: 8px; border: 1px solid #3E3E3E; border-radius: 4px;")
+        g_arc = QGroupBox(tr("4. Action")); g_arc.setStyleSheet("QGroupBox { border: 1px solid #FF9800; margin-top: 6px; } QGroupBox::title { color: #FF9800; }"); l_arc = QVBoxLayout(); l_arc.setSpacing(6); l_arc.setContentsMargins(8, 12, 8, 8)
+        l_arc.addWidget(QLabel(tr("Preview Folder Name:"))); self.preview_label = QLabel("..."); self.preview_label.setWordWrap(True); self.preview_label.setStyleSheet("font-family: 'Segoe UI', sans-serif; font-size: 11px; color: #E0E0E0; background-color: #2D2D2D; padding: 8px; border: 1px solid #3E3E3E; border-radius: 4px;")
         l_arc.addWidget(self.preview_label)
-        self.create_archive_btn = QPushButton("📦 Create Archive Folder"); self.create_archive_btn.clicked.connect(self._create_archive); self.create_archive_btn.setStyleSheet("background-color: #E65100; color: white; font-weight: bold; padding: 8px;"); self.create_archive_btn.setEnabled(False)
+        self.create_archive_btn = QPushButton(f"📦 {tr('Create Archive Folder')}"); self.create_archive_btn.clicked.connect(self._create_archive); self.create_archive_btn.setStyleSheet("background-color: #E65100; color: white; font-weight: bold; padding: 8px;"); self.create_archive_btn.setEnabled(False)
         l_arc.addWidget(self.create_archive_btn)
         self.archive_progress = QProgressBar(); self.archive_progress.setVisible(False); self.archive_progress.setRange(0, 0) # Indeterminate
         l_arc.addWidget(self.archive_progress)
         
         # [New Config] Show Popup Checkbox
-        self.check_show_popup = QCheckBox("Show Result Popup")
+        self.check_show_popup = QCheckBox(tr("Show Result Popup"))
         # Load from QSettings, default True. type=bool ensures correct parsing
         self.check_show_popup.setChecked(self.settings.value("show_archive_popup", True, type=bool))
         self.check_show_popup.stateChanged.connect(lambda v: self.settings.setValue("show_archive_popup", bool(v)))
-        self.check_show_popup.setToolTip("Show a popup message with size and mode details after archiving.")
+        self.check_show_popup.setToolTip(tr("Show a popup message with size and mode details after archiving."))
         l_arc.addWidget(self.check_show_popup)
         
         g_arc.setLayout(l_arc); layout.addWidget(g_arc)
 
         # Group 5: Load
-        g_load = QGroupBox("5. Load to Viewer"); l_load = QVBoxLayout(); l_load.setSpacing(4); l_load.setContentsMargins(8, 8, 8, 8)
-        h_params = QHBoxLayout(); h_params.addWidget(QLabel("Bit Depth:")); self.bit_depth_combo = QComboBox(); self.bit_depth_combo.addItems(["8", "16", "32"]); self.bit_depth_combo.setCurrentText("8"); h_params.addWidget(self.bit_depth_combo)
-        h_params.addWidget(QLabel("Workers:")); self.max_workers_spin = QSpinBox(); self.max_workers_spin.setRange(1, 128);  self.max_workers_spin.setValue(self.recommended_workers); 
+        g_load = QGroupBox(tr("5. Load to Viewer")); l_load = QVBoxLayout(); l_load.setSpacing(4); l_load.setContentsMargins(8, 8, 8, 8)
+        h_params = QHBoxLayout(); h_params.addWidget(QLabel(tr("Bit Depth:"))); self.bit_depth_combo = QComboBox(); self.bit_depth_combo.addItems(["8", "16", "32"]); self.bit_depth_combo.setCurrentText("8"); h_params.addWidget(self.bit_depth_combo)
+        h_params.addWidget(QLabel(tr("Workers:"))); self.max_workers_spin = QSpinBox(); self.max_workers_spin.setRange(1, 128);  self.max_workers_spin.setValue(self.recommended_workers); 
         # Tooltip 显示系统信息
         ram_info = f"{self.total_ram_gb:.1f} GB"
         tip = (f"System RAM: {ram_info}\n"
@@ -418,7 +419,7 @@ class ImportWidget(QWidget):
         # Connect signal
         self.max_workers_spin.valueChanged.connect(self._check_worker_count)
         
-        self.load_btn = QPushButton("🚀 Load Images"); self.load_btn.clicked.connect(self._load_data); self.load_btn.setEnabled(False); l_load.addWidget(self.load_btn)
+        self.load_btn = QPushButton(f"🚀 {tr('Load Images')}"); self.load_btn.clicked.connect(self._load_data); self.load_btn.setEnabled(False); l_load.addWidget(self.load_btn)
         self.progress = QProgressBar(); self.progress.setVisible(False); l_load.addWidget(self.progress)
         g_load.setLayout(l_load); layout.addWidget(g_load)
 

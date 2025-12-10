@@ -36,7 +36,7 @@ from widgets.geometry_widget import GeometryWidget
 from widgets.enhance_widget import EnhanceWidget
 from widgets.annotation_widget import AnnotationWidget
 from widgets.export_widget import ExportWidget
-from widgets.settings_widget import SettingsDialog, GlobalConfig
+from widgets.settings_widget import SettingsDialog, GlobalConfig, tr
 import numpy as np
 import math
 
@@ -72,7 +72,7 @@ class TEMWorkflow:
         common_font = '"Segoe UI", "Microsoft YaHei", "San Francisco", "Helvetica Neue", sans-serif'
 
         # (可选) 左侧加一个小标题，显得不那么空
-        lbl_title = QLabel("Workflow Tools")
+        lbl_title = QLabel(tr("Workflow Tools"))
         lbl_title.setStyleSheet(f"""
             color: #777; 
             font-weight: bold; 
@@ -84,7 +84,7 @@ class TEMWorkflow:
         
         h_bar.addStretch() # 弹簧：把右边的按钮顶过去
 
-        self.btn_ruler = QPushButton("📏 Measure")
+        self.btn_ruler = QPushButton(f"📏 {tr('Measure')}")
         self.btn_ruler.setCheckable(True) # 这是一个开关按钮
         self.btn_ruler.setToolTip("Toggle Measurement Tool (Draw lines to measure distance)")
         self.btn_ruler.setStyleSheet("""
@@ -98,7 +98,7 @@ class TEMWorkflow:
 
         # === 设置按钮 (移到这里) ===
         btn_settings = QPushButton("⚙️")
-        btn_settings.setToolTip("Global Settings & Shortcuts")
+        btn_settings.setToolTip(tr("Global Settings & Shortcuts"))
         btn_settings.setCursor(Qt.PointingHandCursor)
         # 字体大小可以放心设大一点，因为现在高度不受限制了
         btn_settings.setStyleSheet("""
@@ -187,27 +187,27 @@ class TEMWorkflow:
 
         # 1. 数据导入
         self.import_widget = ImportWidget(self.viewer)
-        self.tab_widget.addTab(self.import_widget, "📂 Import")
+        self.tab_widget.addTab(self.import_widget, f"📂 {tr('Import')}")
 
         # 2. 漂移矫正
         self.drift_widget = DriftCorrectionWidget(self.viewer)
-        self.tab_widget.addTab(self.drift_widget, "🔧 Drift Correction")
+        self.tab_widget.addTab(self.drift_widget, f"🔧 {tr('Drift Correction')}")
 
         # 3. 几何变换
         self.geometry_widget = GeometryWidget(self.viewer)
-        self.tab_widget.addTab(self.geometry_widget, "📐 Geometry")
+        self.tab_widget.addTab(self.geometry_widget, f"📐 {tr('Geometry')}")
 
         # 4. 图像增强
         self.enhance_widget = EnhanceWidget(self.viewer)
-        self.tab_widget.addTab(self.enhance_widget, "✨ Enhancement")
+        self.tab_widget.addTab(self.enhance_widget, f"✨ {tr('Enhancement')}")
 
         # 5. 标注工具
         self.annotation_widget = AnnotationWidget(self.viewer)
-        self.tab_widget.addTab(self.annotation_widget, "📝 Annotation")
+        self.tab_widget.addTab(self.annotation_widget, f"📝 {tr('Annotation')}")
 
         # 6. 导出
         self.export_widget = ExportWidget(self.viewer)
-        self.tab_widget.addTab(self.export_widget, "💾 Export")
+        self.tab_widget.addTab(self.export_widget, f"💾 {tr('Export')}")
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 

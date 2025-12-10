@@ -16,7 +16,7 @@ import napari
 import json
 from pathlib import Path
 import datetime
-from widgets.settings_widget import GlobalConfig
+from widgets.settings_widget import GlobalConfig, tr
 
 # JSON Encoder
 class NumpyEncoder(json.JSONEncoder):
@@ -121,30 +121,30 @@ class EnhanceWidget(QWidget):
         content_widget = QWidget()
         layout = QVBoxLayout()
         
-        title = QLabel("<h3>✨ Image Enhancement</h3>")
+        title = QLabel(f"<h3>✨ {tr('Enhancement')}</h3>")
         layout.addWidget(title)
 
         # 图层选择
         layer_layout = QHBoxLayout()
-        layer_layout.addWidget(QLabel("Target Layer:"))
+        layer_layout.addWidget(QLabel(tr("Target Layer:")))
         self.layer_combo = QComboBox()
         self.layer_combo.currentTextChanged.connect(self._on_layer_changed)
         layer_layout.addWidget(self.layer_combo)
         layout.addLayout(layer_layout)
         
-        refresh_btn = QPushButton("🔄 Refresh Layers")
+        refresh_btn = QPushButton(f"🔄 {tr('Refresh Layers')}")
         refresh_btn.clicked.connect(self._refresh_layers)
         layout.addWidget(refresh_btn)
 
         # ==========================================
         # Part 1: 滤波器设置 (Gaussian & Rolling)
         # ==========================================
-        filter_group = QGroupBox("1. Filters")
+        filter_group = QGroupBox(tr("1. Filters"))
         filter_layout = QVBoxLayout()
         
         # --- 高斯模糊 ---
         gaussian_layout = QHBoxLayout()
-        self.use_gaussian_check = QCheckBox("Gaussian Blur")
+        self.use_gaussian_check = QCheckBox(tr("Gaussian Blur"))
         #self.use_gaussian_check.stateChanged.connect(self._toggle_gaussian)
         gaussian_layout.addWidget(self.use_gaussian_check)
         
@@ -153,7 +153,7 @@ class EnhanceWidget(QWidget):
         self.ksize_slider.setValue(3)
         self.ksize_slider.setSingleStep(2)
         self.ksize_slider.valueChanged.connect(self._ensure_odd_ksize)
-        gaussian_layout.addWidget(QLabel("Kernel:"))
+        gaussian_layout.addWidget(QLabel(tr("Kernel:")))
         gaussian_layout.addWidget(self.ksize_slider)
         
         self.ksize_label = QLabel("3")
@@ -163,16 +163,16 @@ class EnhanceWidget(QWidget):
         self.sigma_spin.setRange(0.1, 10.0)
         self.sigma_spin.setValue(0.8)
         self.sigma_spin.setSingleStep(0.1)
-        gaussian_layout.addWidget(QLabel("Sigma:"))
+        gaussian_layout.addWidget(QLabel(tr("Sigma:")))
         gaussian_layout.addWidget(self.sigma_spin)
         filter_layout.addLayout(gaussian_layout)
 
         # --- 滚动平均 ---
         avg_layout = QHBoxLayout()
-        self.use_average_check = QCheckBox("Roll Avg")
+        self.use_average_check = QCheckBox(tr("Roll Avg"))
         # self.use_average_check.stateChanged.connect(self._toggle_average)
         avg_layout.addWidget(self.use_average_check)
-        avg_layout.addWidget(QLabel("Win:"))
+        avg_layout.addWidget(QLabel(tr("Win:")))
         self.window_spin = QSpinBox()
         self.window_spin.setRange(3, 51)
         self.window_spin.setSingleStep(2)
@@ -187,7 +187,7 @@ class EnhanceWidget(QWidget):
 
         # --- 线程数 ---
         thread_layout = QHBoxLayout()
-        thread_layout.addWidget(QLabel("Workers:"))
+        thread_layout.addWidget(QLabel(tr("Workers:")))
         self.max_workers_spin = QSpinBox()
         self.max_workers_spin.setRange(1, 32)
         self.max_workers_spin.setValue(8)
@@ -195,7 +195,7 @@ class EnhanceWidget(QWidget):
         filter_layout.addLayout(thread_layout)
 
         # --- 应用按钮 ---
-        self.apply_btn = QPushButton("Run Filters (Create Layer)")
+        self.apply_btn = QPushButton(tr("Run Filters (Create Layer)"))
         self.apply_btn.clicked.connect(self._apply_enhancement)
         filter_layout.addWidget(self.apply_btn)
         filter_group.setLayout(filter_layout)
@@ -204,7 +204,7 @@ class EnhanceWidget(QWidget):
         # ==========================================
         # Part 2: 对比度调节 (仿 ImageJ)
         # ==========================================
-        contrast_group = QGroupBox("2. Contrast & Brightness (Post-Process)")
+        contrast_group = QGroupBox(tr("2. Contrast & Brightness (Post-Process)"))
         contrast_layout = QVBoxLayout()
         
         self.hist_figure = Figure(figsize=(4, 2), dpi=100)
@@ -227,7 +227,7 @@ class EnhanceWidget(QWidget):
         grid_layout.addLayout(row1)
         
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Max:"))
+        row2.addWidget(QLabel(tr("Max:")))
         self.contrast_max_spin = QDoubleSpinBox()
         self.contrast_max_spin.setRange(-65535, 65535)
         self.contrast_max_spin.setDecimals(0)
@@ -237,16 +237,16 @@ class EnhanceWidget(QWidget):
         ctrl_layout.addLayout(grid_layout)
 
         btn_layout = QVBoxLayout()
-        self.auto_contrast_btn = QPushButton("Auto")
+        self.auto_contrast_btn = QPushButton(tr("Auto"))
         self.auto_contrast_btn.clicked.connect(self._auto_contrast)
         btn_layout.addWidget(self.auto_contrast_btn)
-        self.reset_contrast_btn = QPushButton("Reset")
+        self.reset_contrast_btn = QPushButton(tr("Reset"))
         self.reset_contrast_btn.clicked.connect(self._reset_contrast)
         btn_layout.addWidget(self.reset_contrast_btn)
         ctrl_layout.addLayout(btn_layout)
         contrast_layout.addLayout(ctrl_layout)
 
-        self.apply_contrast_btn = QPushButton("🔥 Apply (Burn to New Layer)")
+        self.apply_contrast_btn = QPushButton(f"🔥 {tr('Apply (Burn to New Layer)')}")
         self.apply_contrast_btn.clicked.connect(self._apply_contrast_burn)
         contrast_layout.addWidget(self.apply_contrast_btn)
         contrast_group.setLayout(contrast_layout)

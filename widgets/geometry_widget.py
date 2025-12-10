@@ -24,7 +24,7 @@ import napari
 import json
 import os
 import datetime
-from widgets.settings_widget import GlobalConfig
+from widgets.settings_widget import GlobalConfig, tr
 
 class BatchExportThread(QThread):
     """
@@ -237,103 +237,103 @@ class GeometryWidget(QWidget):
         content_widget = QWidget()
         layout = QVBoxLayout()
 
-        title = QLabel("<h3>📐 Geometry & Batch Crop</h3>")
+        title = QLabel(f"<h3>📐 {tr('Geometry & Batch Extraction (Multi-ROI)')}</h3>")
         layout.addWidget(title)
 
-        refresh_btn = QPushButton("🔄 Refresh All Layers")
+        refresh_btn = QPushButton(f"🔄 {tr('Refresh All Layers')}")
         refresh_btn.clicked.connect(self._refresh_layers)
         layout.addWidget(refresh_btn)
 
         # ========== 1. 旋转模块 ==========
-        rotate_group = QGroupBox("1. Rotation (Horizon)")
+        rotate_group = QGroupBox(tr("1. Rotation (Horizon)"))
         rotate_layout = QVBoxLayout()
         h_rot_layer = QHBoxLayout()
-        h_rot_layer.addWidget(QLabel("Target:"))
+        h_rot_layer.addWidget(QLabel(tr("Target:")))
         self.rotate_layer_combo = QComboBox()
         h_rot_layer.addWidget(self.rotate_layer_combo)
         rotate_layout.addLayout(h_rot_layer)
 
-        rotate_layout.addWidget(QLabel("Draw a line to define horizon:"))
-        draw_line_btn = QPushButton("✏️ Draw Horizon Line")
+        rotate_layout.addWidget(QLabel(tr("Draw a line to define horizon:")))
+        draw_line_btn = QPushButton(f"✏️ {tr('Draw Horizon Line')}")
         draw_line_btn.clicked.connect(self._draw_rotation_line)
         rotate_layout.addWidget(draw_line_btn)
 
         h_flip = QHBoxLayout()
-        btn_flip_h = QPushButton("↔️ Flip Horz")
+        btn_flip_h = QPushButton(f"↔️ {tr('Flip Horz')}")
         btn_flip_h.clicked.connect(lambda: self._apply_flip('horizontal'))
-        btn_flip_v = QPushButton("↕️ Flip Vert")
+        btn_flip_v = QPushButton(f"↕️ {tr('Flip Vert')}")
         btn_flip_v.clicked.connect(lambda: self._apply_flip('vertical'))
         h_flip.addWidget(btn_flip_h)
         h_flip.addWidget(btn_flip_v)
         rotate_layout.addLayout(h_flip)
         
         h_angle = QHBoxLayout()
-        h_angle.addWidget(QLabel("Angle:"))
+        h_angle.addWidget(QLabel(tr("Angle:")))
         self.angle_spin = QDoubleSpinBox()
         self.angle_spin.setRange(-360, 360); self.angle_spin.setDecimals(2)
         h_angle.addWidget(self.angle_spin)
-        calc_btn = QPushButton("📏 Line-Calc") 
-        calc_btn.setToolTip("Draw a line to calculate angle")
+        calc_btn = QPushButton(f"📏 {tr('Line-Calc')}") 
+        calc_btn.setToolTip(tr("Draw a line to calculate angle"))
         calc_btn.clicked.connect(self._draw_rotation_line)
         h_angle.addWidget(calc_btn)
         rotate_layout.addLayout(h_angle)
     
-        self.enlarge_check = QCheckBox("Enlarge Canvas (Fit All)")
-        self.enlarge_check.setToolTip("Expand image size to fit rotated content without cropping")
+        self.enlarge_check = QCheckBox(tr("Enlarge Canvas (Fit All)"))
+        self.enlarge_check.setToolTip(tr("Expand image size to fit rotated content without cropping"))
         self.enlarge_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_enlarge", bool(v)))
         rotate_layout.addWidget(self.enlarge_check)
 
-        apply_rotate_btn = QPushButton("✅ Apply Rotation")
+        apply_rotate_btn = QPushButton(f"✅ {tr('Apply Rotation')}")
         apply_rotate_btn.clicked.connect(self._apply_rotation)
         rotate_layout.addWidget(apply_rotate_btn)
         rotate_group.setLayout(rotate_layout)
         layout.addWidget(rotate_group)
 
         # ========== 2. 单次裁剪模块 ==========
-        crop_group = QGroupBox("2. Simple Crop (Single)")
+        crop_group = QGroupBox(tr("2. Simple Crop (Single)"))
         crop_layout = QVBoxLayout()
         
         h_crop_layer = QHBoxLayout()
-        h_crop_layer.addWidget(QLabel("Target:"))
+        h_crop_layer.addWidget(QLabel(tr("Target:")))
         self.simple_crop_combo = QComboBox()
         h_crop_layer.addWidget(self.simple_crop_combo)
         crop_layout.addLayout(h_crop_layer)
         
-        draw_rect_btn = QPushButton("✏️ Draw Rect")
+        draw_rect_btn = QPushButton(f"✏️ {tr('Draw Rect')}")
         draw_rect_btn.clicked.connect(self._draw_crop_rect)
         crop_layout.addWidget(draw_rect_btn)
-        apply_crop_btn = QPushButton("✂️ Apply Crop (New Layer)")
+        apply_crop_btn = QPushButton(f"✂️ {tr('Apply Crop (New Layer)')}")
         apply_crop_btn.clicked.connect(self._apply_crop)
         crop_layout.addWidget(apply_crop_btn)
         crop_group.setLayout(crop_layout)
         layout.addWidget(crop_group)
 
         # ========== 3. 批量ROI提取 (增强版) ==========
-        batch_group = QGroupBox("3. Batch Extraction (Multi-ROI)")
+        batch_group = QGroupBox(tr("3. Batch Extraction (Multi-ROI)"))
         batch_group.setStyleSheet("QGroupBox { border: 1px solid #4CAF50; margin-top: 10px; } QGroupBox::title { color: #4CAF50; }")
         batch_layout = QVBoxLayout()
 
         # View vs Data Layer
         layer_grid = QVBoxLayout()
         h_data = QHBoxLayout()
-        h_data.addWidget(QLabel("Data Layer (Crop Source):"))
+        h_data.addWidget(QLabel(tr("Data Layer (Crop Source):")))
         self.batch_data_combo = QComboBox()
         h_data.addWidget(self.batch_data_combo)
         layer_grid.addLayout(h_data)
 
         h_view = QHBoxLayout()
-        h_view.addWidget(QLabel("View Layer (Reference):"))
+        h_view.addWidget(QLabel(tr("View Layer (Reference):")))
         self.batch_view_combo = QComboBox()
         h_view.addWidget(self.batch_view_combo)
         layer_grid.addLayout(h_view)
         
         h_sync = QHBoxLayout()
-        self.sync_layers_btn = QPushButton("🔗 Sync Select")
-        self.sync_layers_btn.setToolTip("Set View Layer same as Data Layer")
+        self.sync_layers_btn = QPushButton(f"🔗 {tr('Sync Select')}")
+        self.sync_layers_btn.setToolTip(tr("Set View Layer same as Data Layer"))
         self.sync_layers_btn.clicked.connect(self._sync_batch_layers)
         h_sync.addWidget(self.sync_layers_btn)
 
-        self.peek_btn = QPushButton("👁️ Peek Data (Hold)")
+        self.peek_btn = QPushButton(f"👁️ {tr('Peek Data (Hold)')}")
         self.peek_btn.setToolTip("Hold to temporarily show Data Layer to check alignment")
         self.peek_btn.pressed.connect(self._peek_data_layer_show)
         self.peek_btn.released.connect(self._peek_data_layer_hide)
@@ -341,7 +341,7 @@ class GeometryWidget(QWidget):
         
         layer_grid.addLayout(h_sync)
         
-        self.lock_view_check = QCheckBox("🔒 Lock View Layer (Prevent auto-switching)")
+        self.lock_view_check = QCheckBox(f"🔒 {tr('Lock View Layer (Prevent auto-switching)')}")
         self.lock_view_check.setChecked(True)
         layer_grid.addWidget(self.lock_view_check)
         
@@ -352,21 +352,21 @@ class GeometryWidget(QWidget):
         name_layout = QHBoxLayout()
         
         # [Req 6.1] Date Input Field
-        name_layout.addWidget(QLabel("Date:"))
+        name_layout.addWidget(QLabel(tr("Date:")))
         self.date_edit = QLineEdit()
         # 尝试从配置加载日期，否则默认今天
         default_date = QSettings("NapariUser", "Global").value("current_date", datetime.datetime.now().strftime("%Y%m%d"))
         self.date_edit.setText(default_date)
         self.date_edit.setFixedWidth(75) 
-        self.date_edit.setToolTip("Date prefix (YYYYMMDD). Loaded from Archive or Today.")
+        self.date_edit.setToolTip(tr("Date prefix (YYYYMMDD). Loaded from Archive or Today."))
         name_layout.addWidget(self.date_edit)
 
-        name_layout.addWidget(QLabel("Sub:"))
+        name_layout.addWidget(QLabel(tr("Sub:")))
         self.sample_name_edit = QLineEdit("CRY2")
         name_layout.addWidget(self.sample_name_edit, 1)
 
         # [Req 3] Suffix Input (Flexible)
-        name_layout.addWidget(QLabel("Suffix:"))
+        name_layout.addWidget(QLabel(tr("Suffix:")))
         self.suffix_edit = QLineEdit("_origin")
         self.suffix_edit.setPlaceholderText("e.g. _origin, _contrasted")
         self.suffix_edit.setMinimumWidth(80)
@@ -375,12 +375,12 @@ class GeometryWidget(QWidget):
 
         # [Req 4 & 5] Checkboxes for extra folders
         h_checks = QHBoxLayout()
-        self.check_denoise = QCheckBox("Gen Denoise Folders")
-        self.check_denoise.setToolTip("Creates empty folders with Main Suffix + Configured Suffix (e.g. _contrasted_lrtem)")
+        self.check_denoise = QCheckBox(tr("Gen Denoise Folders"))
+        self.check_denoise.setToolTip(tr("Creates empty folders with Main Suffix + Configured Suffix (e.g. _contrasted_lrtem)"))
         
 
-        self.check_refine = QCheckBox("Gen Refine Folder")
-        self.check_refine.setToolTip("Creates empty folder with Main Suffix + Configured Suffix (e.g. _contrasted_mask_new)")
+        self.check_refine = QCheckBox(tr("Gen Refine Folder"))
+        self.check_refine.setToolTip(tr("Creates empty folder with Main Suffix + Configured Suffix (e.g. _contrasted_mask_new)"))
         
 
         h_checks.addWidget(self.check_denoise)
@@ -393,7 +393,7 @@ class GeometryWidget(QWidget):
         self.suffix_edit.editingFinished.connect(lambda: GlobalConfig.set("geo_suffix", self.suffix_edit.text()))
 
         format_layout = QHBoxLayout()
-        format_layout.addWidget(QLabel("Export Format:"))
+        format_layout.addWidget(QLabel(tr("Export Format:")))
         self.batch_format_combo = QComboBox()
         self.batch_format_combo.addItems(["PNG Sequence (Folder)","TIFF Stack (.tiff)"])
         format_layout.addWidget(self.batch_format_combo)
@@ -401,14 +401,14 @@ class GeometryWidget(QWidget):
 
         # Frame Filter
         frame_layout = QHBoxLayout()
-        frame_layout.addWidget(QLabel("Frame Filter:"))
+        frame_layout.addWidget(QLabel(tr("Frame Filter:")))
         self.batch_frame_edit = QLineEdit()
-        self.batch_frame_edit.setPlaceholderText("All (Default) or 0-10, 15...")
-        self.batch_frame_edit.setToolTip("Leave empty for All frames.\nOr use: 0-10, 15, 20-25")
+        self.batch_frame_edit.setPlaceholderText(tr("All (Default) or 0-10, 15..."))
+        self.batch_frame_edit.setToolTip(tr("Leave empty for All frames.\nOr use: 0-10, 15, 20-25"))
         frame_layout.addWidget(self.batch_frame_edit)
 
-        self.btn_set_specific_range = QPushButton("📌 Set for Selected")
-        self.btn_set_specific_range.setToolTip("Apply the text in the box to the CURRENTLY SELECTED ROI only.")
+        self.btn_set_specific_range = QPushButton(f"📌 {tr('Set for Selected')}")
+        self.btn_set_specific_range.setToolTip(tr("Apply the text in the box to the CURRENTLY SELECTED ROI only."))
         self.btn_set_specific_range.clicked.connect(self._set_range_for_selected_roi)
         self.btn_set_specific_range.setStyleSheet("background-color: #555; font-size: 10px; padding: 4px;")
         frame_layout.addWidget(self.btn_set_specific_range)
@@ -416,11 +416,11 @@ class GeometryWidget(QWidget):
 
         # Naming options
         naming_layout = QHBoxLayout()
-        self.keep_index_check = QCheckBox("Keep Original Frame Index")
+        self.keep_index_check = QCheckBox(tr("Keep Original Frame Index"))
         self.keep_index_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_keep_index", bool(v)))
         naming_layout.addWidget(self.keep_index_check)
 
-        naming_layout.addWidget(QLabel("Padding:"))
+        naming_layout.addWidget(QLabel(tr("Geo_Padding:")))
         self.padding_spin = QSpinBox()
         self.padding_spin.setRange(1, 12)
         self.padding_spin.setValue(5) 
@@ -429,23 +429,23 @@ class GeometryWidget(QWidget):
         naming_layout.addStretch()
         batch_layout.addLayout(naming_layout)
         
-        self.force_square_check = QCheckBox("Force Square Crops")
+        self.force_square_check = QCheckBox(tr("Force Square Crops"))
         self.force_square_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_force_square", bool(v)))
         batch_layout.addWidget(self.force_square_check)
 
         # Tools
         tools_layout = QHBoxLayout()
-        self.start_batch_btn = QPushButton("✏️ Start Draw")
+        self.start_batch_btn = QPushButton(f"✏️ {tr('Start Draw')}")
         self.start_batch_btn.clicked.connect(self._start_batch_mode)
         self.start_batch_btn.setStyleSheet("background-color: #444; font-weight: bold;")
         tools_layout.addWidget(self.start_batch_btn)
 
-        self.adjust_batch_btn = QPushButton("🖐️ Adjust")
+        self.adjust_batch_btn = QPushButton(f"🖐️ {tr('Adjust')}")
         self.adjust_batch_btn.clicked.connect(self._switch_to_select_mode)
         tools_layout.addWidget(self.adjust_batch_btn)
         batch_layout.addLayout(tools_layout)
 
-        self.export_batch_btn = QPushButton("💾 Export Crops & Map")
+        self.export_batch_btn = QPushButton(f"💾 {tr('Export Crops & Map')}")
         self.export_batch_btn.clicked.connect(self._export_batch_crops)
         self.export_batch_btn.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; padding: 6px;")
         batch_layout.addWidget(self.export_batch_btn)
@@ -812,8 +812,9 @@ class GeometryWidget(QWidget):
                         layer.selected_data = set()
                         
                         # 5. 同时赋值（先赋特征，再赋数据，通常更稳妥）
-                        layer.features = new_features
                         layer.data = new_data
+                        layer.features = new_features
+                        
                         
                         self.status_label.setText("↩️ Last ROI removed.")
                     except Exception as e:
