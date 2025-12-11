@@ -28,8 +28,9 @@ if getattr(sys, 'frozen', False):
         sys.stderr = NullWriter()
 
 import napari
-from qtpy.QtWidgets import QTabWidget, QDockWidget, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLabel
+from qtpy.QtWidgets import QTabWidget, QDockWidget, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QApplication
 from qtpy.QtCore import Qt, QTimer, QSettings
+from qtpy.QtGui import QFont
 from widgets.import_widget import ImportWidget
 from widgets.drift_widget import DriftCorrectionWidget
 from widgets.geometry_widget import GeometryWidget
@@ -47,6 +48,16 @@ class TEMWorkflow:
         QSettings("NapariUser", "Global").remove("archive_path")
         # === Fix: Set a reasonable default size to prevent layout overflow ===
         self.viewer.window.resize(1200, 800)
+
+        # font_family = ' "Segoe UI", "Microsoft YaHei", "PingFang SC", "Helvetica Neue", sans-serif'
+        # 针对 Napari 的 Qt 主窗口应用样式
+        app = QApplication.instance()
+        if app:
+            # 优先使用微软雅黑/苹方，无衬线字体作为回退
+            font = QFont("Microsoft YaHei")
+            font.setStyleHint(QFont.SansSerif)
+            font.setPointSize(10) # 设置字号 10pt
+            app.setFont(font)
         
         self._setup_widgets()
         # 使用 QTimer.singleShot 确保在 Napari 界面完全加载后执行初始化隐藏

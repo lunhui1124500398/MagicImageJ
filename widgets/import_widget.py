@@ -313,11 +313,22 @@ class ImportWidget(QWidget):
         layout.addWidget(QLabel(f"<h3>📂 {tr('Import & Archive')}</h3>"))
 
         # Group 1: Data Source
-        g_source = QGroupBox(tr("1. Data Source")); l_source = QVBoxLayout(); l_source.setSpacing(4); l_source.setContentsMargins(8, 8, 8, 8)
+        g_source = QGroupBox(tr("1. Data Source")); l_source = QVBoxLayout(); l_source.setSpacing(5); l_source.setContentsMargins(8, 15, 8, 8)
         h_brow = QHBoxLayout(); btn_browse = QPushButton(f"📂 {tr('Browse Folder')}"); btn_browse.clicked.connect(self._browse_folder)
-        h_brow.addWidget(btn_browse); self.folder_label = QLabel("None"); self.folder_label.setStyleSheet("color: gray; font-size: 11px;")
-        self.folder_label.setWordWrap(True); self.folder_label.setMaximumWidth(280)
-        l_source.addLayout(h_brow); l_source.addWidget(self.folder_label); g_source.setLayout(l_source); layout.addWidget(g_source)
+        # 给按钮一个合理的固定宽度，防止它抢占过多空间
+        btn_browse.setFixedWidth(160)
+        
+        self.folder_label = QLabel(tr("None")) 
+        # 设置样式为灰色小字，保持原生风格
+        self.folder_label.setStyleSheet("color: #AAAAAA; font-size: 11px;") 
+        self.folder_label.setWordWrap(True) # 允许长路径换行
+        # 设置SizePolicy，让它在水平方向尽可能伸展
+        self.folder_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        h_brow.addWidget(btn_browse); h_brow.addWidget(self.folder_label)
+        l_source.addLayout(h_brow); 
+        # l_source.addWidget(self.folder_label)
+        g_source.setLayout(l_source); layout.addWidget(g_source)
 
         # Group 2: Scan Metadata
         g_dose = QGroupBox(tr("2. Scan Metadata")); l_dose = QVBoxLayout(); l_dose.setSpacing(4); l_dose.setContentsMargins(8, 8, 8, 8)
@@ -448,6 +459,7 @@ class ImportWidget(QWidget):
         """[Fix] 更新标签文本，自动缩短过长路径"""
         self.folder_label.setText(path)
         self.folder_label.setToolTip(path) # 鼠标悬停显示全名
+        # self.folder_label.setCursorPosition(len(path))
 
     def _browse_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Select Data Folder", self.settings.value("last_folder", ""))
