@@ -1,13 +1,13 @@
 """
-内存管理工具模块 (V6 - 安全路径版 + 弹窗预警)
+内存管理工具模块 (V8 - 完整增强版)
 功能：
-1. 智能分配大数组 (RAM vs Disk)。
-2. 读取 JSON 配置文件。
-3. 自动清理：
-   - 启动时清理陈旧文件(>24h)。
-   - [New] 空间预警：若占用>10GB，通过系统弹窗(MessageBox)提醒用户，而非控制台输出。
-   - [New] 安全脚本：清理脚本(.bat)强制生成在用户缓存目录，防止误删系统Temp文件。
-   - 退出时启动外部进程强制删除被锁文件。
+1. 智能分配大数组 (RAM vs Disk/Memmap)。
+2. [关键] C盘防爆机制：在分配大内存前检查物理内存，防止 pagefile.sys 撑爆 C 盘。
+3. 线程安全弹窗：使用 Windows API 实现后台线程的阻塞式询问。
+4. 自动清理：
+   - 启动时清理陈旧文件 (>24h)。
+   - 退出时强制清理。
+   - 提供独立清理脚本 (Detached Cleaner) 处理被锁文件。
 """
 
 # 注意：为了避免循环导入，这里我们手动复制一下简单的读取逻辑，或者使用之前定义的 _load_json_config_value
@@ -24,6 +24,14 @@ import weakref
 import subprocess
 import platform
 from pathlib import Path
+import ctypes
+
+# 尝试导入 psutil 获取更准确的内存信息
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 # 全局变量
 SESSION_TEMP_FILES = set()
@@ -47,6 +55,62 @@ def get_cache_dir():
         if path.exists() and path.is_dir():
             return str(path)
     return None
+
+def get_available_ram_gb():
+    """
+    获取系统当前可用物理内存 (GB)
+    优先使用 psutil，失败则使用 Windows API，最后回退默认值。
+    """
+    try:
+        # 1. 尝试 psutil (跨平台，最准确)
+        if PSUTIL_AVAILABLE:
+            return psutil.virtual_memory().available / (1024**3)
+    except:
+        pass
+
+    try:
+        # 2. 尝试 Windows API (无需额外库)
+        if platform.system() == "Windows":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullAvailPhys / (1024**3)
+    except:
+        pass
+
+    # 3. 实在不行返回一个默认安全值 (16GB)，避免误报阻断流程
+    return 16.0
+
+def show_system_ask_dialog(title, message):
+    """
+    [Thread-Safe] 显示系统级询问弹窗 (Windows Only)
+    返回: True (Yes/Continue), False (No/Cancel)
+    即便在子线程调用，也会阻塞直到用户点击，且不会导致 Qt 崩溃。
+    """
+    if platform.system() == "Windows":
+        try:
+            # MB_YESNO (0x04) | MB_ICONWARNING (0x30) | MB_SYSTEMMODAL (0x1000)
+            # 返回值: IDYES = 6, IDNO = 7
+            ret = ctypes.windll.user32.MessageBoxW(0, message, title, 0x00000004 | 0x00000030 | 0x00001000)
+            return ret == 6
+        except:
+            return True # 如果弹窗失败，默认允许继续（避免卡死）
+    else:
+        # 非 Windows 环境简单打印
+        print(f"[WARNING] {title}: {message}")
+        return True
 
 def show_system_warning(title, message):
     """
@@ -202,11 +266,46 @@ def create_huge_array(shape, dtype, fill_zeros=False):
     elements = np.prod(shape)
     itemsize = np.dtype(dtype).itemsize
     nbytes = elements * itemsize
-    
+    gb_needed = nbytes / (1024**3)
+
     # 阈值
     gb_limit = float(_load_json_config_value("sys_ram_threshold_gb", 4.0))
     threshold = gb_limit * 1024**3 
 
+    warn_threshold_gb = float(_load_json_config_value("sys_mem_warn_gb", 4.0))
+    if gb_needed > warn_threshold_gb: 
+        avail_ram = get_available_ram_gb()
+        # 判定标准：如果需求量 > 当前可用物理内存的 95%
+        # Windows 此时极大概率会开始疯狂换页(Swapping)到 Pagefile (C盘)
+        if gb_needed > avail_ram * 0.95:
+            # 获取语言配置
+            lang = _load_json_config_value("language", "en")
+            is_cn = (lang == "zh_CN")
+            
+            if is_cn:
+                title = "内存严重不足警告"
+                msg = (f"即将分配: {gb_needed:.1f} GB\n"
+                       f"当前可用物理内存: {avail_ram:.1f} GB\n\n"
+                       f"警告：此操作已超出物理内存余量！\n"
+                       f"在临时文件完全写入硬盘前，Windows 将被迫使用虚拟内存，"
+                       f"这会导致系统卡顿并急剧消耗 C 盘 (pagefile.sys) 空间。\n\n"
+                       f"是否仍要继续？")
+            else:
+                title = "Critical Memory Warning"
+                msg = (f"Allocating: {gb_needed:.1f} GB\n"
+                       f"Available RAM: {avail_ram:.1f} GB\n\n"
+                       f"Warning: This exceeds available physical memory!\n"
+                       f"Windows will be forced to use the Pagefile on C: drive, "
+                       f"which may cause system freeze and disk space exhaustion.\n\n"
+                       f"Do you want to continue anyway?")
+
+            # 调用线程安全的系统弹窗 (阻塞等待)
+            user_agreed = show_system_ask_dialog(title, msg)
+            
+            if not user_agreed:
+                # 用户选择否，抛出异常中断操作
+                raise MemoryError("Operation cancelled by user to prevent system freeze.")
+            
     if nbytes > threshold:
         cache_dir = get_cache_dir()
         
@@ -236,7 +335,11 @@ def create_huge_array(shape, dtype, fill_zeros=False):
             weakref.finalize(arr, finalizer_callback)
             
             return arr, temp_path
-            
+        
+        except MemoryError as me:
+            # 透传上面的取消异常
+            raise me
+        
         except Exception as e:
             # 这里可以保留 print 到控制台，作为最后的调试手段，普通用户看不到也不影响
             print(f"Memmap Error: {e}")

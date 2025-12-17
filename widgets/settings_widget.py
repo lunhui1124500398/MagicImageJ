@@ -289,6 +289,19 @@ TRANS_CN = {
     "If an array exceeds this size, create it on Disk (memmap).": "如果数组超过此大小，则在磁盘上创建它(memmap)",
     "Warn if cache folder usage exceeds this size.": "如果缓存文件夹使用量超过此大小则发出警告",
     "If raw data folder > this size, MOVE instead of COPY during archive.": "如果原始数据文件夹大于此大小，则在归档过程中移动而不是复制",
+
+    # === 新增翻译 ===
+    "Memory Warning": "内存警告",
+    "Pagefile Warning Body": "Allocating {0:.1f} GB. Available RAM: {1:.1f} GB.\n\nSince the data hasn't been flushed to disk yet, this operation exceeds physical RAM and may force Windows to expand 'pagefile.sys', occupying C: drive space.\n\nContinue?",
+    # 注意：为了让中文显示更友好，我们在代码里用 tr() 获取这个key时，会返回下面的中文
+    # 但由于字典key是英文原文，我们需要把中文翻译写在value里。
+    # 这里有点特殊，因为正文带有格式化参数 {0} {1}，建议直接用英文做Key，中文做Value
+    
+    "Allocating {0:.1f} GB. Available RAM: {1:.1f} GB.\n\nThis operation exceeds physical RAM and may cause Windows to expand 'pagefile.sys' on C: drive.\n\nContinue?": 
+    "即将分配 {0:.1f} GB。当前可用内存: {1:.1f} GB。\n\n此操作超出物理内存，且临时文件尚未完全写入磁盘，可能导致 Windows 强制扩大 C 盘的虚拟内存文件 (pagefile.sys)。\n\n是否继续？",
+
+    "Memmap Warning Threshold:": "内存分配预警阈值:",
+    "Show warning if single allocation exceeds this size (Check RAM vs C: drive).": "若单次分配超过此大小则预警 (可能物理内存撑不住，殃及C盘)。",
 }
 
 def tr(text):
@@ -360,6 +373,7 @@ class GlobalConfig:
         "sys_ram_threshold_gb": 4.0,
         "sys_disk_warn_gb": 10.0,
         "sys_move_threshold_gb": 30.0,
+        "sys_mem_warn_gb":4.0,
         "show_archive_popup": True
     }
 
@@ -658,11 +672,21 @@ class SettingsDialog(QDialog):
         self.sys_ram = QDoubleSpinBox(); self.sys_ram.setRange(0.1, 1024); self.sys_ram.setSuffix(" GB"); self.sys_ram.setValue(float(GlobalConfig.get("sys_ram_threshold_gb")))
         self.sys_disk = QDoubleSpinBox(); self.sys_disk.setRange(0.1, 10240); self.sys_disk.setSuffix(" GB"); self.sys_disk.setValue(float(GlobalConfig.get("sys_disk_warn_gb")))
         self.sys_move = QDoubleSpinBox(); self.sys_move.setRange(0.1, 10240); self.sys_move.setSuffix(" GB"); self.sys_move.setValue(float(GlobalConfig.get("sys_move_threshold_gb")))
+        self.sys_mem_warn = QDoubleSpinBox()
+        self.sys_mem_warn.setRange(0, 1024)
+        self.sys_mem_warn.setSuffix(" GB")
+        self.sys_mem_warn.setSingleStep(1)
+        self.sys_mem_warn.setValue(float(GlobalConfig.get("sys_mem_warn_gb")))
 
         form.addRow(tr("RAM vs Disk Limit:"), self.sys_ram)
         l_hint1 = QLabel(tr("If an array exceeds this size, create it on Disk (memmap)."))
         l_hint1.setStyleSheet("color: gray; font-size: 9pt; margin-bottom: 10px;")
         form.addRow("", l_hint1)
+
+        form.addRow(tr("Memmap Warning Threshold:"), self.sys_mem_warn)
+        l_hint_new = QLabel(tr("Show warning if single allocation exceeds this size (Check RAM vs C: drive)."))
+        l_hint_new.setStyleSheet("color: gray; font-size: 9pt; margin-bottom: 10px;")
+        form.addRow("", l_hint_new)
 
         form.addRow(tr("Disk Space Warning:"), self.sys_disk)
         l_hint2 = QLabel(tr("Warn if cache folder usage exceeds this size."))
@@ -748,6 +772,7 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("sys_ram_threshold_gb", self.sys_ram.value(), emit_signal=False)
         GlobalConfig.set("sys_disk_warn_gb", self.sys_disk.value(), emit_signal=False)
         GlobalConfig.set("sys_move_threshold_gb", self.sys_move.value(), emit_signal=False)
+        GlobalConfig.set("sys_mem_warn_gb", self.sys_mem_warn.value(), emit_signal=False)
 
         # Save Shortcuts
         for key, edit in self.key_edits.items():
