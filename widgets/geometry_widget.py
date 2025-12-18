@@ -11,7 +11,7 @@
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QHBoxLayout, QComboBox, QGroupBox, 
                             QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, 
-                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox)
+                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication)
 from qtpy.QtCore import Qt, QTimer, QSettings, QThread, Signal
 import numpy as np
 from pathlib import Path
@@ -443,7 +443,29 @@ class GeometryWidget(QWidget):
         self.adjust_batch_btn = QPushButton(f"🖐️ {tr('Adjust')}")
         self.adjust_batch_btn.clicked.connect(self._switch_to_select_mode)
         tools_layout.addWidget(self.adjust_batch_btn)
+        
+        self.clear_all_btn = QPushButton("🗑️")
+        self.clear_all_btn.setToolTip(tr("Clear All Overlays (ROIs, Lines, Measures)"))
+        self.clear_all_btn.setFixedWidth(40) 
+        self.clear_all_btn.setStyleSheet("background-color: #555; color: #FF5252; font-weight: bold;")
+        self.clear_all_btn.clicked.connect(self._clear_all_overlays) # 绑定新函数
+        tools_layout.addWidget(self.clear_all_btn)
+        
         batch_layout.addLayout(tools_layout)
+
+        # === [新增] ROI 导入导出按钮行 ===
+        h_roi_io = QHBoxLayout()
+        btn_save_roi = QPushButton(f"💾 {tr('Save ROIs')}")
+        btn_save_roi.clicked.connect(self._save_rois_to_json)
+        btn_save_roi.setToolTip("Save ROI coordinates + Reference Map")
+        
+        btn_load_roi = QPushButton(f"📂 {tr('Load ROIs')}")
+        btn_load_roi.clicked.connect(self._load_rois_from_json)
+        btn_load_roi.setToolTip("Load ROI JSON & Auto-load Image")
+        
+        h_roi_io.addWidget(btn_save_roi)
+        h_roi_io.addWidget(btn_load_roi)
+        batch_layout.addLayout(h_roi_io)
 
         self.export_batch_btn = QPushButton(f"💾 {tr('Export Crops & Map')}")
         self.export_batch_btn.clicked.connect(self._export_batch_crops)
@@ -753,7 +775,22 @@ class GeometryWidget(QWidget):
     def _start_batch_mode(self):
         view_layer = self.batch_view_combo.currentText()
         if not view_layer: return
-        
+
+        # 1. 如果图层已存在，进入恢复模式 (Resume)
+        if "Batch_ROI" in self.viewer.layers:
+            layer = self.viewer.layers["Batch_ROI"]
+            layer.mode = 'add_rectangle'
+            self.status_label.setText(f"✏️ Resuming Draw on '{view_layer}'.")
+            
+            # 仅清理互斥性极强的辅助线，保留 ROI
+            self._clear_residue(["Crop_ROI", "Rotation_Line"]) 
+            
+            if self.lock_view_check.isChecked():
+                self._force_view_active = True
+                self._enforce_view_visibility()
+            return
+
+        # 2. 如果图层不存在，初始化新图层 (Initialize)
         self._clear_residue(["Batch_ROI", "Rotation_Line", "Crop_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
         
         if self.lock_view_check.isChecked():
@@ -782,49 +819,42 @@ class GeometryWidget(QWidget):
                 'anchor': 'upper_left', 
                 'translation': [-5, -5]
             },
-            features={
-                'label': [], 
-                'frame_range': [], 
-                'frame_info': []
-            }
+            features={'label': [], 'frame_range': [], 'frame_info': []}
         )
+        
         roi_layer.events.data.connect(self._on_batch_data_change)
+        # 绑定点击背景事件
+        roi_layer.mouse_drag_callbacks.append(self._on_click_background_switch)
+
         roi_layer.mode = 'add_rectangle'
         
+        # 绑定撤销 (保持原有逻辑)
         undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
         @roi_layer.bind_key(undo_key)
         def undo_batch_rect(layer):
             if layer.mode == 'add_rectangle' and len(layer.data) > 0:
-                # 1. 获取当前数据和特征
-                current_data = layer.data
-                current_features = layer.features
-                
-                # 2. 只有当数据存在时才执行
-                if len(current_data) > 0:
-                    # 暂时断开事件监听，防止 _on_batch_data_change 在状态不稳时触发
-                    self._is_updating = True 
-                    try:
-                        # 3. 同步切片：数据和特征都移除最后一个
-                        new_data = current_data[:-1]
-                        new_features = {k: v[:-1] for k, v in current_features.items()}
-                        
-                        # 4. 先清空选中，防止索引越界
-                        layer.selected_data = set()
-                        
-                        # 5. 同时赋值（先赋特征，再赋数据，通常更稳妥）
-                        layer.data = new_data
-                        layer.features = new_features
-                        
-                        
-                        self.status_label.setText("↩️ Last ROI removed.")
-                    except Exception as e:
-                        print(f"Undo Error: {e}")
-                    finally:
-                        self._is_updating = False
-                        # 强制刷新一下图层以确保显示正确
-                        layer.refresh()
+                self._is_updating = True 
+                try:
+                    layer.data = layer.data[:-1]
+                    layer.features = {k: v[:-1] for k, v in layer.features.items()}
+                    layer.selected_data = set()
+                    self.status_label.setText("↩️ Last ROI removed.")
+                except: pass
+                finally:
+                    self._is_updating = False
+                    layer.refresh()
 
-        self.status_label.setText(f"✏️ Drawing on '{view_layer}'. (Ctrl+Z to Undo last)")
+        self.status_label.setText(f"✏️ Drawing on '{view_layer}'. (New Layer)")
+        self._last_shape_count = 0
+    
+    # === [新增] 点击背景切回绘制 ===
+    def _on_click_background_switch(self, layer, event):
+        if layer.mode == 'select':
+            # 检查是否点击了空白处 (get_value 返回 None 表示背景)
+            val = layer.get_value(event.position, world=True, view_direction=event.view_direction, dims_displayed=event.dims_displayed)
+            if val is None:
+                layer.mode = 'add_rectangle'
+                self.status_label.setText("✏️ Switched to Draw Mode")
 
     def _set_range_for_selected_roi(self):
         if "Batch_ROI" not in self.viewer.layers: return
@@ -874,6 +904,18 @@ class GeometryWidget(QWidget):
     def _on_batch_data_change(self, event=None):
         if self._is_updating: return
         if "Batch_ROI" not in self.viewer.layers: return
+        
+        layer = self.viewer.layers["Batch_ROI"]
+        current_count = len(layer.data)
+
+        # 交互优化：画完自动切换到 Select 模式
+        if hasattr(self, '_last_shape_count') and current_count > self._last_shape_count:
+            if layer.mode == 'add_rectangle':
+                layer.selected_data = {current_count - 1}
+                layer.mode = 'select'
+                self.status_label.setText("🖐️ Adjust Mode (Click bg to draw)")
+        
+        self._last_shape_count = current_count
         
         view_layer_name = self.batch_view_combo.currentText()
         if view_layer_name not in self.viewer.layers: return
@@ -939,6 +981,184 @@ class GeometryWidget(QWidget):
             
         finally:
             self._is_updating = False
+    
+    # === [新增] 全面清理 (带弹窗保护) ===
+    def _clear_all_overlays(self):
+        targets = ["Batch_ROI", "Rotation_Line", "Crop_ROI", "Interaction_Box", 
+                   "Preview_Overlay", "Drift_ROI", "Measurements"]
+        
+        has_residue = any(name in self.viewer.layers for name in targets)
+        if not has_residue:
+            self.status_label.setText("⚠️ Nothing to clear.")
+            return
+
+        if GlobalConfig.get("show_clear_warning"):
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Clear All Overlays?")
+            msg_box.setText("Clear ALL temporary drawings (ROIs, Lines, etc.)?")
+            msg_box.setInformativeText("This action cannot be undone.")
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg_box.setDefaultButton(QMessageBox.No)
+            
+            cb_dont_ask = QCheckBox("Do not ask again")
+            msg_box.setCheckBox(cb_dont_ask)
+            
+            if msg_box.exec_() == QMessageBox.No: return
+            
+            if cb_dont_ask.isChecked():
+                GlobalConfig.set("show_clear_warning", False)
+
+        self._clear_residue(targets)
+        self.status_label.setText("🗑️ Canvas cleared.")
+        if hasattr(self, '_last_shape_count'): self._last_shape_count = 0
+
+    # === [新增] 智能保存 ROI (含参考图和TIFF提示) ===
+    def _save_rois_to_json(self):
+        if "Batch_ROI" not in self.viewer.layers: return
+        roi_layer = self.viewer.layers["Batch_ROI"]
+        if len(roi_layer.data) == 0: return
+
+        view_layer_name = self.batch_view_combo.currentText()
+        if not view_layer_name or view_layer_name not in self.viewer.layers:
+            self.status_label.setText("❌ Ref image missing.")
+            return
+        target_layer = self.viewer.layers[view_layer_name]
+
+        start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
+        default_name = f"ROIs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path_str, _ = QFileDialog.getSaveFileName(self, "Save ROI JSON", str(Path(start_dir) / default_name), "JSON (*.json)")
+        if not path_str: return
+        
+        try:
+            json_path = Path(path_str)
+            rois_data = []
+            feats = roi_layer.features
+            for i, poly in enumerate(roi_layer.data):
+                rois_data.append({
+                    "id": i, "coordinates": poly.tolist(),
+                    "label": str(feats['label'][i]) if i < len(feats['label']) else str(i),
+                    "frame_range": str(feats['frame_range'][i]) if i < len(feats['frame_range']) else "",
+                    "frame_info": str(feats['frame_info'][i]) if i < len(feats['frame_info']) else ""
+                })
+
+            env_info = {
+                "source_layer_name": view_layer_name,
+                "shape": target_layer.data.shape,
+                "drift_applied": target_layer.metadata.get("is_drift_result", False),
+                "rotation_applied": "Rotated" in view_layer_name
+            }
+
+            data_dump = {
+                "version": "1.1", "type": "MagicImageJ_ROI",
+                "timestamp": str(datetime.datetime.now()),
+                "environment": env_info, "rois": rois_data
+            }
+
+            with open(json_path, 'w', encoding='utf-8') as f: json.dump(data_dump, f, indent=2)
+
+            # 生成参考图
+            ref_png = json_path.with_name(json_path.stem + "_ref.png")
+            self._save_reference_snapshot(target_layer, roi_layer, ref_png)
+            msg = f"✅ Saved JSON & Ref Map."
+
+            # 智能提示保存 TIFF
+            is_processed = any(k in view_layer_name for k in ["Rotated", "Corrected", "Enh", "Cropped"])
+            if is_processed:
+                reply = QMessageBox.question(self, "Save Image Stack?",
+                    f"Layer '{view_layer_name}' seems processed.\nSave TIFF stack to ensure future alignment?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if reply == QMessageBox.Yes:
+                    tiff_path = json_path.with_name(f"{view_layer_name}.tiff")
+                    if export_to_tiff_stack(target_layer.data, str(tiff_path)): msg += "\nTIFF Saved."
+            
+            self.status_label.setText(msg)
+            QMessageBox.information(self, "Success", msg)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+    
+    def _save_reference_snapshot(self, img_layer, roi_layer, save_path):
+        try:
+            current_step = self.viewer.dims.current_step[0]
+            idx = max(0, min(current_step, img_layer.data.shape[0] - 1))
+            frame = img_layer.data[idx]
+            
+            if frame.dtype != np.uint8:
+                mn, mx = frame.min(), frame.max()
+                if mx > mn: frame = ((frame - mn) / (mx - mn) * 255).astype(np.uint8)
+                else: frame = frame.astype(np.uint8)
+            
+            pil_img = Image.fromarray(frame).convert("RGB")
+            draw = ImageDraw.Draw(pil_img)
+            try: font = ImageFont.truetype("arial.ttf", 20)
+            except: font = ImageFont.load_default()
+            
+            for i, poly in enumerate(roi_layer.data):
+                ys, xs = poly[:, 0], poly[:, 1]
+                x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+                draw.rectangle([x1, y1, x2, y2], outline="#00FF00", width=3)
+                label = str(roi_layer.features['label'][i]) if i < len(roi_layer.features['label']) else str(i+1)
+                draw.text((x1+5, y1+5), label, fill="#00FF00", font=font)
+            
+            draw.text((10, 10), f"Ref Frame: {idx}\nLayer: {img_layer.name}", fill="yellow", font=font)
+            pil_img.save(save_path)
+        except Exception as e: print(f"Ref snap failed: {e}")
+
+    # === [新增] 智能加载 ROI (含 Auto TIFF) ===
+    def _load_rois_from_json(self):
+        start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
+        path_str, _ = QFileDialog.getOpenFileName(self, "Load ROI JSON", start_dir, "JSON (*.json)")
+        if not path_str: return
+        json_path = Path(path_str)
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f: data_dump = json.load(f)
+            if data_dump.get("type") != "MagicImageJ_ROI": raise ValueError("Invalid Format")
+
+            # 智能检测关联图片
+            env = data_dump.get("environment", {})
+            src_name = env.get("source_layer_name", "Recovered")
+            tiff_a = json_path.with_suffix(".tiff")
+            tiff_b = json_path.parent / f"{src_name}.tiff"
+            target_tiff = tiff_a if tiff_a.exists() else (tiff_b if tiff_b.exists() else None)
+
+            loaded_layer = None
+            if target_tiff:
+                if QMessageBox.question(self, "Load Image?", f"Found linked image:\n{target_tiff.name}\nLoad it?", 
+                                      QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                    self.status_label.setText(f"Loading {target_tiff.name}...")
+                    QApplication.processEvents()
+                    import tifffile
+                    new_layer = self.viewer.add_image(tifffile.imread(str(target_tiff)), name=src_name, colormap='gray')
+                    self.batch_data_combo.setCurrentText(new_layer.name)
+                    self.batch_view_combo.setCurrentText(new_layer.name)
+                    loaded_layer = new_layer.name
+
+            # 恢复 ROI
+            if "Batch_ROI" not in self.viewer.layers: self._start_batch_mode()
+            layer = self.viewer.layers["Batch_ROI"]
+            
+            new_data, new_lbl, new_rng, new_inf = [], [], [], []
+            for item in data_dump.get("rois", []):
+                new_data.append(np.array(item["coordinates"]))
+                new_lbl.append(item.get("label", ""))
+                new_rng.append(item.get("frame_range", ""))
+                new_inf.append(item.get("frame_info", ""))
+
+            self._is_updating = True
+            layer.data = new_data
+            layer.features = {'label': new_lbl, 'frame_range': new_rng, 'frame_info': new_inf}
+            self._is_updating = False
+            layer.refresh()
+            self._last_shape_count = len(new_data)
+            
+            if "Batch_ROI" in self.viewer.layers:
+                self.viewer.layers.selection.active = self.viewer.layers["Batch_ROI"]
+                self.viewer.layers["Batch_ROI"].mode = 'select'
+
+            self.status_label.setText(f"✅ Loaded {len(new_data)} ROIs.")
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
 
     def _export_batch_crops(self):
         # 1. 基础校验

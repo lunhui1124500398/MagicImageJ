@@ -154,6 +154,7 @@ TRANS_CN = {
     "Adjust": "调整",
     "Export Crops & Map": "导出裁剪图与概览",
     "Export Format:": "导出格式:",
+    "Show Warning when Clearing Overlays": "清除覆盖层时显示警告",
     
     # Enhance Widget
     "1. Filters": "1. 滤波器",
@@ -338,6 +339,7 @@ class GlobalConfig:
         "cache_dir": "", 
         
         # Geometry Defaults
+        "show_clear_warning": True,
         "geo_suffix": "_origin",
         "geo_padding": 5,
         "geo_keep_index": True,   # [New] 保持序号
@@ -525,6 +527,14 @@ class SettingsDialog(QDialog):
         f_algo.addRow(tr("Drift Kernel:"), self.drift_k_spin)
         f_algo.addRow(tr("Max Workers:"), self.drift_w_spin)
         g_algo.setLayout(f_algo); l.addWidget(g_algo)
+
+        g_ui = QGroupBox(tr("Interaction Settings"))
+        f_ui = QFormLayout()
+        self.warn_clear_check = QCheckBox(tr("Show Warning when Clearing Overlays"))
+        self.warn_clear_check.setChecked(bool(GlobalConfig.get("show_clear_warning")))
+        f_ui.addRow(self.warn_clear_check)
+        g_ui.setLayout(f_ui)
+        l.addWidget(g_ui)
 
         g_enh = QGroupBox(tr("Image Enhancement Defaults"))
         f_enh = QFormLayout()
@@ -736,6 +746,9 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("drift_auto_calc", self.drift_auto_check.isChecked(), emit_signal=False) # [New]
         GlobalConfig.set("drift_kernel", self.drift_k_spin.value(), emit_signal=False)
         GlobalConfig.set("drift_workers", self.drift_w_spin.value(), emit_signal=False)
+
+        if hasattr(self, 'warn_clear_check'):
+            GlobalConfig.set("show_clear_warning", self.warn_clear_check.isChecked(), emit_signal=False)
 
         # 3. Save Enhancement
         GlobalConfig.set("enh_use_gaussian", self.enh_gaus_check.isChecked(), emit_signal=False) # [New]
