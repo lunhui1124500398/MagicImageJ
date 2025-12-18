@@ -30,7 +30,7 @@ if getattr(sys, 'frozen', False):
 import napari
 from qtpy.QtWidgets import QTabWidget, QDockWidget, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QApplication
 from qtpy.QtCore import Qt, QTimer, QSettings
-from qtpy.QtGui import QFont
+from qtpy.QtGui import QFont, QIcon
 from widgets.import_widget import ImportWidget
 from widgets.drift_widget import DriftCorrectionWidget
 from widgets.geometry_widget import GeometryWidget
@@ -40,14 +40,35 @@ from widgets.export_widget import ExportWidget
 from widgets.settings_widget import SettingsDialog, GlobalConfig, tr
 import numpy as np
 import math
+import ctypes
+from utils.utils import resource_path
+from napari.qt import get_qapp
 
 
 class TEMWorkflow:
     def __init__(self):
+        if os.name == 'nt':
+            myappid = 'WHKTZ.YSImageJ.TEMWORKFLOW.V1'  # 任意唯一的字符串
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         self.viewer = napari.Viewer(title="TEM Data Processing Workflow-YSImageJ")
         QSettings("NapariUser", "Global").remove("archive_path")
         # === Fix: Set a reasonable default size to prevent layout overflow ===
         self.viewer.window.resize(1200, 800)
+
+        icon_path = resource_path(os.path.join("assets", "app_icon.ico"))
+        print(f"DEBUG: Loading icon from: {icon_path}")
+        
+        if os.path.exists(icon_path):
+            app_icon = QIcon(icon_path)
+            # 获取 Napari 的底层 Qt 窗口对象 (QMainWindow)
+            qt_window = self.viewer.window._qt_window
+            # 设置窗口图标
+            qt_window.setWindowIcon(app_icon)
+            app = get_qapp()
+            app.setWindowIcon(app_icon)
+            self.viewer.window._qt_window.setWindowIcon(app_icon)
+        else:
+            print(f"Warning: Icon file not found at {icon_path}")
 
         # font_family = ' "Segoe UI", "Microsoft YaHei", "PingFang SC", "Helvetica Neue", sans-serif'
         # 针对 Napari 的 Qt 主窗口应用样式

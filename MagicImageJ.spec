@@ -16,6 +16,11 @@ my_hiddenimports = []
 
 mydatas = [
     ('assets/arial.ttf', 'assets'),
+    ('assets/app_icon.ico', 'assets'),
+]
+
+add_files = [
+    ('assets','assets'),
 ]
 
 # ========================================================
@@ -84,7 +89,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=my_binaries,
-    datas=my_datas,
+    datas=my_datas+add_files,
     hiddenimports=my_hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -115,6 +120,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon = 'assets/app_icon.ico',
 )
 
 coll = COLLECT(
