@@ -26,6 +26,76 @@ import os
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
 
+# ==========================================
+#  新增：后台图像读取线程 (防止界面卡死)
+# ==========================================
+class BatchImageLoaderThread(QThread):
+    """
+    后台批量读取图像数据 (TIFF 或 PNG序列)
+    按顺序读取列表中的任务，每完成一个发射一次信号
+    """
+    # 信号定义: (data_array, layer_name, role)
+    # role: 'data', 'view', or 'none' (用于后续自动设置下拉框)
+    item_ready = Signal(object, str, str) 
+    finished_all = Signal()
+    error = Signal(str)
+
+    def __init__(self, tasks):
+        """
+        tasks: list of dict {'path': Path, 'mode': 'tiff'/'stack', 'name': str, 'role': str}
+        """
+        super().__init__()
+        self.tasks = tasks
+
+    def run(self):
+        try:
+            for task in self.tasks:
+                if self.isInterruptionRequested(): break
+                
+                path = task['path']
+                mode = task['mode']
+                name = task['name']
+                role = task.get('role', 'none')
+                
+                data = None
+                if mode == 'tiff':
+                    import tifffile
+                    data = tifffile.imread(str(path))
+                elif mode == 'stack':
+                    # 读取文件夹下的所有图像
+                    files = sorted([f for f in path.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.tif', '.tiff']])
+                    if not files:
+                        self.error.emit(f"Empty folder: {name}")
+                        continue
+                    
+                    # 读取第一帧获取尺寸和类型
+                    first = cv2.imread(str(files[0]), cv2.IMREAD_UNCHANGED)
+                    if first is None: 
+                        self.error.emit(f"Failed to read first frame of {name}")
+                        continue
+                    
+                    # 预分配内存
+                    count = len(files)
+                    shape = (count, *first.shape)
+                    dtype = first.dtype
+                    data = np.zeros(shape, dtype=dtype)
+                    
+                    data[0] = first
+                    for i in range(1, count):
+                        img = cv2.imread(str(files[i]), cv2.IMREAD_UNCHANGED)
+                        if img is not None:
+                            data[i] = img
+                
+                if data is not None:
+                    self.item_ready.emit(data, name, role)
+                
+            self.finished_all.emit()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
 class BatchExportThread(QThread):
     """
     后台导出线程 (增强版)
@@ -457,11 +527,11 @@ class GeometryWidget(QWidget):
         h_roi_io = QHBoxLayout()
         btn_save_roi = QPushButton(f"💾 {tr('Save ROIs')}")
         btn_save_roi.clicked.connect(self._save_rois_to_json)
-        btn_save_roi.setToolTip("Save ROI coordinates + Reference Map")
+        btn_save_roi.setToolTip(tr("Save ROI coordinates + Reference Map"))
         
         btn_load_roi = QPushButton(f"📂 {tr('Load ROIs')}")
         btn_load_roi.clicked.connect(self._load_rois_from_json)
-        btn_load_roi.setToolTip("Load ROI JSON & Auto-load Image")
+        btn_load_roi.setToolTip(tr("Load ROI JSON & Auto-load Image"))
         
         h_roi_io.addWidget(btn_save_roi)
         h_roi_io.addWidget(btn_load_roi)
@@ -1013,25 +1083,116 @@ class GeometryWidget(QWidget):
         self.status_label.setText("🗑️ Canvas cleared.")
         if hasattr(self, '_last_shape_count'): self._last_shape_count = 0
 
+    def _detect_image_source(self, base_path, layer_name):
+        """
+        辅助函数：根据 JSON 路径和图层名，嗅探是否存在 TIFF 或 PNG 序列
+        返回: (Path, mode) or (None, None)
+        """
+        if not layer_name: return None, None
+
+        names_to_check = [
+            f"{layer_name}_ViewRef", 
+            f"{layer_name}_DataRef", 
+            layer_name
+        ]
+        
+        # 候选路径策略
+        candidates = []
+        for name in names_to_check:
+            # 1. 同级目录下的文件/文件夹
+            candidates.append((base_path.with_name(f"{name}.tiff"), 'tiff'))
+            candidates.append((base_path.with_name(f"{name}.tif"), 'tiff'))
+            candidates.append((base_path.with_name(f"{name}_Seq"), 'stack'))
+            
+            # 2. 父目录下的文件/文件夹
+            candidates.append((base_path.parent / f"{name}.tiff", 'tiff'))
+            candidates.append((base_path.parent / f"{name}_Seq", 'stack'))
+            candidates.append((base_path.parent / name, 'stack'))
+
+        for p, mode in candidates:
+            if p.exists():
+                if mode == 'stack':
+                    # 简单检查文件夹里是否有图
+                    if any(p.glob("*.png")) or any(p.glob("*.jpg")): return p, mode
+                else:
+                    return p, mode
+        return None, None
+
     # === [新增] 智能保存 ROI (含参考图和TIFF提示) ===
+    # === [核心逻辑修改] 智能保存 ROI (处理 Same vs Different Layers) ===
     def _save_rois_to_json(self):
         if "Batch_ROI" not in self.viewer.layers: return
         roi_layer = self.viewer.layers["Batch_ROI"]
         if len(roi_layer.data) == 0: return
-
+        
         view_layer_name = self.batch_view_combo.currentText()
+        data_layer_name = self.batch_data_combo.currentText()
+        
         if not view_layer_name or view_layer_name not in self.viewer.layers:
             self.status_label.setText("❌ Ref image missing.")
             return
-        target_layer = self.viewer.layers[view_layer_name]
+        
+        # 确定保存策略
+        save_target_layers = [] # list of (layer_obj, suffix)
+        format_ext = None # 初始化变量
+        
+        # 1. 检测是否需要保存参考图
+        layers_are_same = (view_layer_name == data_layer_name)
+        
+        # 构建询问对话框
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Save Reference Images?")
+        
+        text = "Saving ROI JSON.\nDo you also want to save the reference image(s)?"
+        if not layers_are_same:
+            text += f"\n\nNote: Data Layer and View Layer are DIFFERENT.\nData: {data_layer_name}\nView: {view_layer_name}"
+        msg_box.setText(text)
+        
+        # 按钮设计
+        btn_tiff = msg_box.addButton("TIFF Stack", QMessageBox.ActionRole)
+        btn_png = msg_box.addButton("PNG Sequence", QMessageBox.ActionRole)
+        btn_skip = msg_box.addButton("Skip Images", QMessageBox.RejectRole)
+        
+        msg_box.exec_()
+        choice = msg_box.clickedButton()
+        
+        if choice == btn_skip:
+            pass # Just save JSON
+        else:
+            format_ext = 'tiff' if choice == btn_tiff else 'png_seq'
+            
+            # 如果图层不同，询问保存哪一个
+            if not layers_are_same:
+                sub_box = QMessageBox(self)
+                sub_box.setWindowTitle("Select Layers")
+                sub_box.setText("Which layer(s) should be saved as reference?")
+                btn_both = sub_box.addButton("Save Both", QMessageBox.ActionRole)
+                btn_data = sub_box.addButton("Data Only", QMessageBox.ActionRole)
+                btn_view = sub_box.addButton("View Only", QMessageBox.ActionRole)
+                sub_box.exec_()
+                
+                sub_choice = sub_box.clickedButton()
+                if sub_choice == btn_both:
+                    save_target_layers.append((self.viewer.layers[data_layer_name], "_DataRef"))
+                    save_target_layers.append((self.viewer.layers[view_layer_name], "_ViewRef"))
+                elif sub_choice == btn_data:
+                    save_target_layers.append((self.viewer.layers[data_layer_name], "_DataRef"))
+                elif sub_choice == btn_view:
+                    save_target_layers.append((self.viewer.layers[view_layer_name], "_ViewRef"))
+            else:
+                # 相同，直接保存一个
+                save_target_layers.append((self.viewer.layers[view_layer_name], ""))
 
+        # 开始文件操作
         start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
         default_name = f"ROIs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path_str, _ = QFileDialog.getSaveFileName(self, "Save ROI JSON", str(Path(start_dir) / default_name), "JSON (*.json)")
+        
         if not path_str: return
+        json_path = Path(path_str)
         
         try:
-            json_path = Path(path_str)
+            # 1. 保存 JSON
             rois_data = []
             feats = roi_layer.features
             for i, poly in enumerate(roi_layer.data):
@@ -1041,39 +1202,62 @@ class GeometryWidget(QWidget):
                     "frame_range": str(feats['frame_range'][i]) if i < len(feats['frame_range']) else "",
                     "frame_info": str(feats['frame_info'][i]) if i < len(feats['frame_info']) else ""
                 })
-
+            
             env_info = {
                 "source_layer_name": view_layer_name,
-                "shape": target_layer.data.shape,
-                "drift_applied": target_layer.metadata.get("is_drift_result", False),
+                "data_layer_name": data_layer_name,
                 "rotation_applied": "Rotated" in view_layer_name
             }
-
+            
             data_dump = {
-                "version": "1.1", "type": "MagicImageJ_ROI",
+                "version": "1.2", "type": "MagicImageJ_ROI",
                 "timestamp": str(datetime.datetime.now()),
                 "environment": env_info, "rois": rois_data
             }
-
+            
             with open(json_path, 'w', encoding='utf-8') as f: json.dump(data_dump, f, indent=2)
+            msg = f"✅ Saved JSON."
 
-            # 生成参考图
+            # 2. 执行图像保存
+            for layer_obj, suffix in save_target_layers:
+                safe_name = f"{layer_obj.name}{suffix}"
+                # 如果是PNG序列，建立文件夹
+                if format_ext == 'png_seq':
+                    seq_folder = json_path.parent / f"{safe_name}_Seq"
+                    seq_folder.mkdir(parents=True, exist_ok=True)
+                    
+                    # 使用进度条防止卡死
+                    prog = QProgressDialog(f"Saving {safe_name} Sequence...", "Cancel", 0, len(layer_obj.data), self)
+                    prog.setWindowModality(Qt.WindowModal)
+                    prog.show()
+                    
+                    for i, frame in enumerate(layer_obj.data):
+                        if prog.wasCanceled(): break
+                        save_path = seq_folder / f"{i:05d}.png"
+                        # 简易归一化以确保 PNG 可视化
+                        if frame.dtype != np.uint8:
+                            mn, mx = frame.min(), frame.max()
+                            if mx > mn: frame_out = ((frame - mn) / (mx - mn) * 255).astype(np.uint8)
+                            else: frame_out = frame.astype(np.uint8)
+                        else: frame_out = frame
+                        cv2.imwrite(str(save_path), frame_out)
+                        prog.setValue(i)
+                    prog.close()
+                    msg += f"\nSaved Seq: {seq_folder.name}"
+                    
+                # 如果是TIFF
+                elif format_ext == 'tiff':
+                    tiff_path = json_path.parent / f"{safe_name}.tiff"
+                    if export_to_tiff_stack(layer_obj.data, str(tiff_path)):
+                        msg += f"\nSaved TIFF: {tiff_path.name}"
+
+            # 3. 总是保存一张 Ref Snapshot (PNG) 方便快速预览
             ref_png = json_path.with_name(json_path.stem + "_ref.png")
-            self._save_reference_snapshot(target_layer, roi_layer, ref_png)
-            msg = f"✅ Saved JSON & Ref Map."
-
-            # 智能提示保存 TIFF
-            is_processed = any(k in view_layer_name for k in ["Rotated", "Corrected", "Enh", "Cropped"])
-            if is_processed:
-                reply = QMessageBox.question(self, "Save Image Stack?",
-                    f"Layer '{view_layer_name}' seems processed.\nSave TIFF stack to ensure future alignment?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-                if reply == QMessageBox.Yes:
-                    tiff_path = json_path.with_name(f"{view_layer_name}.tiff")
-                    if export_to_tiff_stack(target_layer.data, str(tiff_path)): msg += "\nTIFF Saved."
+            self._save_reference_snapshot(self.viewer.layers[view_layer_name], roi_layer, ref_png)
             
             self.status_label.setText(msg)
             QMessageBox.information(self, "Success", msg)
+
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
     
@@ -1104,61 +1288,228 @@ class GeometryWidget(QWidget):
             pil_img.save(save_path)
         except Exception as e: print(f"Ref snap failed: {e}")
 
+    # =========================================================
+    #  新增辅助函数：负责弹窗询问 + 文件选择 + 模式判断
+    # =========================================================
+    def _prompt_user_for_file(self, layer_name, title_prefix=""):
+        """
+        弹出对话框询问用户是否手动查找文件。
+        返回: (path, mode) 或 (None, None)
+        """
+        reply = QMessageBox.question(
+            self, 
+            f"{title_prefix}Image Not Found", 
+            f"Could not auto-locate image for layer:\n\n'{layer_name}'\n\nBrowse for it manually?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return None, None
+
+        # 打开文件选择器 (支持 TIFF 或 PNG/JPG 序列中的任意一张)
+        start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, 
+            f"Select Image for '{layer_name}'", 
+            start_dir, 
+            "Images (*.tiff *.tif *.png *.jpg *.bmp)"
+        )
+        
+        if not path_str:
+            return None, None
+            
+        p = Path(path_str)
+        # 智能判断：如果是 tiff 则为单文件模式，否则假设选中了序列中的一张，取其父文件夹
+        mode = 'tiff' if p.suffix.lower() in ['.tiff', '.tif'] else 'stack'
+        final_path = p if mode == 'tiff' else p.parent
+        
+        return final_path, mode
+
     # === [新增] 智能加载 ROI (含 Auto TIFF) ===
+    # === [核心逻辑升级] 智能加载 ROI (探测报告 + 用户确认 + 手动回退) ===
     def _load_rois_from_json(self):
         start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
         path_str, _ = QFileDialog.getOpenFileName(self, "Load ROI JSON", start_dir, "JSON (*.json)")
         if not path_str: return
+        
         json_path = Path(path_str)
-
         try:
             with open(json_path, 'r', encoding='utf-8') as f: data_dump = json.load(f)
             if data_dump.get("type") != "MagicImageJ_ROI": raise ValueError("Invalid Format")
-
-            # 智能检测关联图片
+            
             env = data_dump.get("environment", {})
-            src_name = env.get("source_layer_name", "Recovered")
-            tiff_a = json_path.with_suffix(".tiff")
-            tiff_b = json_path.parent / f"{src_name}.tiff"
-            target_tiff = tiff_a if tiff_a.exists() else (tiff_b if tiff_b.exists() else None)
-
-            loaded_layer = None
-            if target_tiff:
-                if QMessageBox.question(self, "Load Image?", f"Found linked image:\n{target_tiff.name}\nLoad it?", 
-                                      QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
-                    self.status_label.setText(f"Loading {target_tiff.name}...")
-                    QApplication.processEvents()
-                    import tifffile
-                    new_layer = self.viewer.add_image(tifffile.imread(str(target_tiff)), name=src_name, colormap='gray')
-                    self.batch_data_combo.setCurrentText(new_layer.name)
-                    self.batch_view_combo.setCurrentText(new_layer.name)
-                    loaded_layer = new_layer.name
-
-            # 恢复 ROI
-            if "Batch_ROI" not in self.viewer.layers: self._start_batch_mode()
-            layer = self.viewer.layers["Batch_ROI"]
+            view_name = env.get("source_layer_name", "Recovered_View")
+            data_name = env.get("data_layer_name", view_name) 
             
-            new_data, new_lbl, new_rng, new_inf = [], [], [], []
-            for item in data_dump.get("rois", []):
-                new_data.append(np.array(item["coordinates"]))
-                new_lbl.append(item.get("label", ""))
-                new_rng.append(item.get("frame_range", ""))
-                new_inf.append(item.get("frame_info", ""))
-
-            self._is_updating = True
-            layer.data = new_data
-            layer.features = {'label': new_lbl, 'frame_range': new_rng, 'frame_info': new_inf}
-            self._is_updating = False
-            layer.refresh()
-            self._last_shape_count = len(new_data)
+            # 1. 自动探测阶段
+            path_view, mode_view = self._detect_image_source(json_path, view_name)
             
-            if "Batch_ROI" in self.viewer.layers:
-                self.viewer.layers.selection.active = self.viewer.layers["Batch_ROI"]
-                self.viewer.layers["Batch_ROI"].mode = 'select'
+            is_same_layer = (data_name == view_name)
+            path_data, mode_data = (None, None)
+            if not is_same_layer:
+                path_data, mode_data = self._detect_image_source(json_path, data_name)
+            
+            # 2. 构建探测报告 (HTML 格式)
+            msg_text = "<b>Image Source Detection Report:</b><br><br>"
+            
+            # View Layer 报告
+            msg_text += f"<b>View Layer:</b> {view_name}<br>"
+            if path_view:
+                msg_text += f"&nbsp;&nbsp;✅ Found: {path_view.name} ({mode_view})<br>"
+            else:
+                msg_text += f"&nbsp;&nbsp;❌ Not Found (Auto-detection failed)<br>"
+                
+            # Data Layer 报告
+            if is_same_layer:
+                 msg_text += f"<br><b>Data Layer:</b> (Same as View Layer)<br>"
+            else:
+                msg_text += f"<br><b>Data Layer:</b> {data_name}<br>"
+                if path_data:
+                    msg_text += f"&nbsp;&nbsp;✅ Found: {path_data.name} ({mode_data})<br>"
+                else:
+                    msg_text += f"&nbsp;&nbsp;❌ Not Found (Auto-detection failed)<br>"
+            
+            msg_text += "<br>---------------------------------<br>"
+            msg_text += "Do you want to load these images?"
 
-            self.status_label.setText(f"✅ Loaded {len(new_data)} ROIs.")
+            # 3. 弹窗询问用户
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Confirm Import Sources")
+            msg_box.setTextFormat(Qt.RichText) # 启用 HTML 渲染
+            msg_box.setText(msg_text)
+            
+            # 动态添加按钮
+            # 只要探测到了至少一个文件，就允许 Auto Load
+            has_auto_candidate = (path_view is not None) or (path_data is not None)
+            
+            btn_auto = None
+            if has_auto_candidate:
+                btn_auto = msg_box.addButton("✅ Auto Load Detected", QMessageBox.ActionRole)
+            
+            btn_manual = msg_box.addButton("🛠️ Manual Select", QMessageBox.ActionRole)
+            btn_skip = msg_box.addButton("Skip Images (ROIs Only)", QMessageBox.RejectRole)
+            
+            msg_box.exec_()
+            choice = msg_box.clickedButton()
+            
+            tasks_to_run = []
+            
+            # 4. 根据用户选择构建任务
+            if choice == btn_skip:
+                self._restore_rois_to_layer(data_dump)
+                return
+
+            elif choice == btn_auto:
+                # 用户确认无误，使用探测到的路径
+                if is_same_layer:
+                    if path_view:
+                        tasks_to_run.append({'path': path_view, 'mode': mode_view, 'name': view_name, 'role': 'both'})
+                else:
+                    if path_data:
+                        tasks_to_run.append({'path': path_data, 'mode': mode_data, 'name': data_name, 'role': 'data'})
+                    if path_view:
+                        tasks_to_run.append({'path': path_view, 'mode': mode_view, 'name': view_name, 'role': 'view'})
+            
+            elif choice == btn_manual:
+                # 用户觉得不对，进入手动选择流程
+                if is_same_layer:
+                    # View/Data 同层 -> 选一次
+                    p, m = self._prompt_user_for_file(view_name, title_prefix="[View/Data] ")
+                    if p: tasks_to_run.append({'path': p, 'mode': m, 'name': view_name, 'role': 'both'})
+                else:
+                    # View Layer -> 选一次
+                    # 询问是否需要加载 View
+                    if QMessageBox.question(self, "Load View Layer?", f"Load image for View Layer: '{view_name}'?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                        p_v, m_v = self._prompt_user_for_file(view_name, title_prefix="[View Layer] ")
+                        if p_v: tasks_to_run.append({'path': p_v, 'mode': m_v, 'name': view_name, 'role': 'view'})
+                    
+                    # Data Layer -> 选一次
+                    if QMessageBox.question(self, "Load Data Layer?", f"Load image for Data Layer: '{data_name}'?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                        p_d, m_d = self._prompt_user_for_file(data_name, title_prefix="[Data Layer] ")
+                        if p_d: tasks_to_run.append({'path': p_d, 'mode': m_d, 'name': data_name, 'role': 'data'})
+
+            # 5. 提交任务给后台线程
+            if tasks_to_run:
+                count = len(tasks_to_run)
+                self.load_progress = QProgressDialog(f"Loading {count} image(s)...", "Cancel", 0, 0, self)
+                self.load_progress.setWindowModality(Qt.WindowModal)
+                self.load_progress.show()
+                
+                # 初始化线程并传入任务列表
+                self.loader_thread = BatchImageLoaderThread(tasks_to_run)
+                
+                # 连接信号
+                self.loader_thread.item_ready.connect(self._on_single_image_loaded)
+                # 全部完成后，关闭进度条并加载 ROI
+                self.loader_thread.finished_all.connect(lambda: (self.load_progress.close(), self._restore_rois_to_layer(data_dump)))
+                self.loader_thread.error.connect(lambda e: self.status_label.setText(f"Load Error: {e}"))
+                
+                self.loader_thread.start()
+            else:
+                # 用户可能在手动选择时取消了所有操作，或者 auto 模式下没有有效路径
+                # 此时直接恢复 ROI
+                self._restore_rois_to_layer(data_dump)
+
         except Exception as e:
-            QMessageBox.critical(self, "Load Error", str(e))
+            QMessageBox.critical(self, "JSON Load Error", str(e))
+    
+    def _on_single_image_loaded(self, data, name, role):
+        """
+        后台线程加载完一张图片后触发此函数。
+        data: 图片数据 (numpy array)
+        name: 图层名称
+        role: 'data' (仅设为数据层), 'view' (仅设为视图层), 'both' (同时设为两者)
+        """
+        if data is None: return
+        
+        try:
+            # 1. 将数据添加到 Napari 视图中
+            # colormap='gray' 是默认设置，您可以根据需要调整
+            new_layer = self.viewer.add_image(data, name=name, colormap='gray')
+            
+            # 2. 根据 role 自动选中下拉框
+            # 这样用户就不用手动去 ComboBox 里再选一次了
+            if role == 'data':
+                self.batch_data_combo.setCurrentText(new_layer.name)
+            elif role == 'view':
+                self.batch_view_combo.setCurrentText(new_layer.name)
+            elif role == 'both':
+                self.batch_data_combo.setCurrentText(new_layer.name)
+                self.batch_view_combo.setCurrentText(new_layer.name)
+                
+            # 3. 强制刷新一下下拉框状态（有时候添加新图层后 Combo 不会自动刷新）
+            # 注意：_refresh_layers 已经在 layer inserted 事件中绑定了，
+            # 但为了确保 setCurrentText 生效，这里不做额外操作通常也可以。
+            
+        except Exception as e:
+            print(f"Error adding layer '{name}' to viewer: {e}")
+            # 如果出错，给用户一个非阻塞的提示（可选）
+            self.status_label.setText(f"❌ Failed to add layer: {name}")
+
+    def _restore_rois_to_layer(self, data_dump):
+        # 恢复 ROI
+        if "Batch_ROI" not in self.viewer.layers: self._start_batch_mode()
+        layer = self.viewer.layers["Batch_ROI"]
+        
+        new_data, new_lbl, new_rng, new_inf = [], [], [], []
+        for item in data_dump.get("rois", []):
+            new_data.append(np.array(item["coordinates"]))
+            new_lbl.append(item.get("label", ""))
+            new_rng.append(item.get("frame_range", ""))
+            new_inf.append(item.get("frame_info", ""))
+
+        self._is_updating = True
+        layer.data = new_data
+        layer.features = {'label': new_lbl, 'frame_range': new_rng, 'frame_info': new_inf}
+        self._is_updating = False
+        layer.refresh()
+        self._last_shape_count = len(new_data)
+        
+        if "Batch_ROI" in self.viewer.layers:
+            self.viewer.layers.selection.active = self.viewer.layers["Batch_ROI"]
+            self.viewer.layers["Batch_ROI"].mode = 'select'
+
+        self.status_label.setText(f"✅ Loaded {len(new_data)} ROIs.")
 
     def _export_batch_crops(self):
         # 1. 基础校验

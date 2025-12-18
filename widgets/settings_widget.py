@@ -155,6 +155,17 @@ TRANS_CN = {
     "Export Crops & Map": "导出裁剪图与概览",
     "Export Format:": "导出格式:",
     "Show Warning when Clearing Overlays": "清除覆盖层时显示警告",
+    'Save ROIs':"保存ROIs",
+    "Load ROIs":"加载ROIs",
+    "Save ROI coordinates + Reference Map":"保存 ROI 坐标 + 参考图",
+    "Load ROI JSON & Auto-load Image":"加载 ROI JSON & 自动加载图像",
+    "Saving ROI JSON.\nDo you also want to save the reference image(s)?":"保存 ROI JSON。\n是否也要保存参考图像？",
+    "Which layer(s) should be saved as reference?":"应保存为参考的图层是？",
+    "TIFF Stack":"TIFF 堆栈",
+    "PNG Sequence":"PNG 序列",
+    "Skip Images":"跳过图像",
+    "Save Reference Images?":"是否保存参考图像？",
+
     
     # Enhance Widget
     "1. Filters": "1. 滤波器",
