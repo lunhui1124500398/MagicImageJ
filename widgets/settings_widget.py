@@ -165,6 +165,10 @@ TRANS_CN = {
     "PNG Sequence":"PNG 序列",
     "Skip Images":"跳过图像",
     "Save Reference Images?":"是否保存参考图像？",
+    "Select Layers":"选择图层",
+    "Save Both":"保存两者",
+    "Data Only":"仅数据",
+    "View Only":"仅视图",
 
     
     # Enhance Widget

@@ -845,23 +845,29 @@ class GeometryWidget(QWidget):
     def _start_batch_mode(self):
         view_layer = self.batch_view_combo.currentText()
         if not view_layer: return
-
+        
         # 1. 如果图层已存在，进入恢复模式 (Resume)
         if "Batch_ROI" in self.viewer.layers:
             layer = self.viewer.layers["Batch_ROI"]
             layer.mode = 'add_rectangle'
+            # === 【重要】重新绑定事件（防止丢失） ===
+            try:
+                layer.events.set_data.disconnect(self._on_selection_change)
+            except:
+                pass
+            layer.events.set_data.connect(self._on_selection_change)
+
+            self._bind_smart_mode_switch(layer)
+            
             self.status_label.setText(f"✏️ Resuming Draw on '{view_layer}'.")
-            
-            # 仅清理互斥性极强的辅助线，保留 ROI
-            self._clear_residue(["Crop_ROI", "Rotation_Line"]) 
-            
+            self._clear_residue(["Crop_ROI", "Rotation_Line", "Interaction_Box","Drift_ROI","Measurements"]) 
             if self.lock_view_check.isChecked():
                 self._force_view_active = True
                 self._enforce_view_visibility()
             return
 
         # 2. 如果图层不存在，初始化新图层 (Initialize)
-        self._clear_residue(["Batch_ROI", "Rotation_Line", "Crop_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI"])
+        self._clear_residue(["Batch_ROI", "Rotation_Line", "Crop_ROI", "Interaction_Box", "Preview_Overlay", "Drift_ROI","Measurements"])
         
         if self.lock_view_check.isChecked():
             self._force_view_active = True
@@ -894,9 +900,11 @@ class GeometryWidget(QWidget):
         
         roi_layer.events.data.connect(self._on_batch_data_change)
         # 绑定点击背景事件
-        roi_layer.mouse_drag_callbacks.append(self._on_click_background_switch)
+        roi_layer.events.set_data.connect(self._on_selection_change) 
 
         roi_layer.mode = 'add_rectangle'
+
+        self._bind_smart_mode_switch(roi_layer)
         
         # 绑定撤销 (保持原有逻辑)
         undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
@@ -913,18 +921,167 @@ class GeometryWidget(QWidget):
                 finally:
                     self._is_updating = False
                     layer.refresh()
-
+        switch_key = GlobalConfig.get_napari_shortcut("shortcut_switch_mode")
         self.status_label.setText(f"✏️ Drawing on '{view_layer}'. (New Layer)")
         self._last_shape_count = 0
     
-    # === [新增] 点击背景切回绘制 ===
-    def _on_click_background_switch(self, layer, event):
-        if layer.mode == 'select':
-            # 检查是否点击了空白处 (get_value 返回 None 表示背景)
-            val = layer.get_value(event.position, world=True, view_direction=event.view_direction, dims_displayed=event.dims_displayed)
-            if val is None:
+    def _bind_smart_mode_switch(self, layer):
+        """
+        使用 napari 的鼠标事件，更精确地处理交互
+        """
+        
+        self._last_click_time = 0
+        self._double_click_threshold = 0.3
+        self._mouse_press_pos = None
+        self._drag_threshold = 5
+        
+        # === 【方案1】使用 mouse_double_click 事件（推荐）===
+        @layer.mouse_double_click_callbacks.append
+        def on_double_click(layer, event):
+            """双击事件专用处理"""
+            if layer.mode != 'select':
+                return
+            
+            # 检查是否双击在背景上
+            clicked_on_shape = False
+            click_pos = event.position
+            
+            for shape_data in layer.data:
+                ys, xs = shape_data[:, 0], shape_data[:, 1]
+                y_min, y_max = np.min(ys), np.max(ys)
+                x_min, x_max = np.min(xs), np.max(xs)
+                
+                click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
+                click_x = click_pos[-1]
+                
+                if y_min <= click_y <= y_max and x_min <= click_x <= x_max:
+                    clicked_on_shape = True
+                    break
+            
+            # 双击背景 → 切换到绘制模式
+            if not clicked_on_shape:
                 layer.mode = 'add_rectangle'
-                self.status_label.setText("✏️ Switched to Draw Mode")
+                layer.selected_data = set()
+                self.status_label.setText("✏️ Draw Mode (double-click bg)")
+        
+        # === 【可选】单击背景取消选择（不切换模式）===
+        self._is_dragging = False
+        self._press_pos = None
+        
+        @layer.mouse_drag_callbacks.append  
+        def track_drag(layer, event):
+            """追踪拖拽，区分点击和拖拽"""
+            if layer.mode != 'select':
+                return
+            
+            if event.type == 'mouse_press':
+                self._press_pos = np.array(event.position)
+                self._is_dragging = False
+                
+            elif event.type == 'mouse_move' and self._press_pos is not None:
+                current_pos = np.array(event.position)
+                distance = np.linalg.norm(current_pos - self._press_pos)
+                if distance > self._drag_threshold:
+                    self._is_dragging = True
+                    
+            elif event.type == 'mouse_release':
+                # 单击背景（非拖拽）→ 取消选择
+                if not self._is_dragging and self._press_pos is not None:
+                    clicked_on_shape = False
+                    click_pos = event.position
+                    
+                    for shape_data in layer.data:
+                        ys, xs = shape_data[:, 0], shape_data[:, 1]
+                        y_min, y_max = np.min(ys), np.max(ys)
+                        x_min, x_max = np.min(xs), np.max(xs)
+                        click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
+                        click_x = click_pos[-1]
+                        
+                        if y_min <= click_y <= y_max and x_min <= click_x <= x_max:
+                            clicked_on_shape = True
+                            break
+                    
+                    if not clicked_on_shape:
+                        layer.selected_data = set()
+                        self.status_label.setText("🖐️ Select Mode (double-click bg to draw)")
+                
+                self._press_pos = None
+                self._is_dragging = False
+    
+    def _on_selection_change(self, event=None):
+        pass
+        # """当用户点击背景时，自动切回绘制模式"""
+        # if "Batch_ROI" not in self.viewer.layers: 
+        #     return
+        # layer = self.viewer.layers["Batch_ROI"]
+        
+        # # 条件：
+        # # 1. 当前是 select 模式
+        # # 2. 没有选中任何ROI（selected_data 为空）
+        # # 3. 至少已经画了一个ROI（避免初始化时误触发）
+        # if (layer.mode == 'select' and 
+        #     len(layer.selected_data) == 0 and 
+        #     len(layer.data) > 0):
+        #     layer.mode = 'add_rectangle'
+        #     self.status_label.setText("✏️ Auto-switched to Draw Mode (clicked background)")
+
+    # === [新增] 点击背景切回绘制 ===
+    # === [核心逻辑] 点击背景 -> 自动切换回绘制模式 (相当于按 R) ===
+    # def _on_click_background_switch(self, layer, event):
+    #     """
+    #     交互逻辑优化 V3 (QTimer 延迟):
+    #     解决 Napari 原生逻辑覆盖问题。
+    #     原理：让 Napari 先处理完所有的点击和状态刷新，
+    #     然后我们通过 QTimer 延迟 50ms 强制执行模式切换。
+    #     """
+    #     # 只在选择模式下生效
+    #     if layer.mode != 'select':
+    #         return
+
+    #     # 1. 记录按下位置
+    #     start_pos = event.pos
+
+    #     # 2. 等待释放
+    #     yield
+    #     while event.type == 'mouse_move':
+    #         yield
+
+    #     # --- 鼠标释放后 ---
+
+    #     # 3. 判断是否为点击 (防抖)
+    #     drag_distance = np.linalg.norm(np.array(event.pos) - np.array(start_pos))
+    #     if drag_distance > 3:
+    #         return # 是拖拽，不处理
+
+    #     # 4. 判断是否点击了背景
+    #     # 注意：这里我们不做过多的异常捕获，直接信任 get_value
+    #     # 如果 Napari 版本更新导致 get_value 行为改变，这里可能需要调整
+    #     val = None
+    #     try:
+    #         val = layer.get_value(
+    #             event.position, 
+    #             world=True, 
+    #             view_direction=event.view_direction, 
+    #             dims_displayed=event.dims_displayed
+    #         )
+    #     except:
+    #         # 回退兼容
+    #         try: val = layer.get_value(event.position, world=True)
+    #         except: pass
+
+    #     # 5. 如果是背景 (None)，则【延迟】切换
+    #     if val is None:
+            
+    #         def do_switch():
+    #             # 再次检查 (防止用户手速极快已经切走了)
+    #             if layer.mode == 'select':
+    #                 layer.selected_data = set() # 再次确保清空
+    #                 layer.mode = 'add_rectangle'
+    #                 self.status_label.setText("✏️ Drawing Mode (Auto-switch)")
+    #                 layer.refresh()
+
+    #         # 关键：延迟 20ms 执行，避开 Napari 内部事件循环的冲突
+    #         QTimer.singleShot(20, do_switch)
 
     def _set_range_for_selected_roi(self):
         if "Batch_ROI" not in self.viewer.layers: return
@@ -978,12 +1135,19 @@ class GeometryWidget(QWidget):
         layer = self.viewer.layers["Batch_ROI"]
         current_count = len(layer.data)
 
+        # 🔄 先记录是否需要切换模式，但不立即执行
+        should_switch_to_select = (
+            hasattr(self, '_last_shape_count') and 
+            current_count > self._last_shape_count and 
+            layer.mode == 'add_rectangle'
+        )
+
         # 交互优化：画完自动切换到 Select 模式
-        if hasattr(self, '_last_shape_count') and current_count > self._last_shape_count:
-            if layer.mode == 'add_rectangle':
-                layer.selected_data = {current_count - 1}
-                layer.mode = 'select'
-                self.status_label.setText("🖐️ Adjust Mode (Click bg to draw)")
+        # if hasattr(self, '_last_shape_count') and current_count > self._last_shape_count:
+        #     if layer.mode == 'add_rectangle':
+        #         layer.selected_data = {current_count - 1}
+        #         layer.mode = 'select'
+        #         self.status_label.setText("🖐️ Adjust Mode (Click bg to draw)")
         
         self._last_shape_count = current_count
         
@@ -1051,6 +1215,12 @@ class GeometryWidget(QWidget):
             
         finally:
             self._is_updating = False
+
+        if should_switch_to_select:
+            layer.selected_data = {current_count - 1}
+            layer.mode = 'select'
+            self.status_label.setText("🖐️ Adjust Mode (Click bg to draw)")
+
     
     # === [新增] 全面清理 (带弹窗保护) ===
     def _clear_all_overlays(self):
@@ -1141,17 +1311,17 @@ class GeometryWidget(QWidget):
         
         # 构建询问对话框
         msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Save Reference Images?")
+        msg_box.setWindowTitle(tr("Save Reference Images?"))
         
-        text = "Saving ROI JSON.\nDo you also want to save the reference image(s)?"
+        text = tr("Saving ROI JSON.\nDo you also want to save the reference image(s)?")
         if not layers_are_same:
             text += f"\n\nNote: Data Layer and View Layer are DIFFERENT.\nData: {data_layer_name}\nView: {view_layer_name}"
         msg_box.setText(text)
         
         # 按钮设计
-        btn_tiff = msg_box.addButton("TIFF Stack", QMessageBox.ActionRole)
-        btn_png = msg_box.addButton("PNG Sequence", QMessageBox.ActionRole)
-        btn_skip = msg_box.addButton("Skip Images", QMessageBox.RejectRole)
+        btn_tiff = msg_box.addButton(tr("TIFF Stack"), QMessageBox.ActionRole)
+        btn_png = msg_box.addButton(tr("PNG Sequence"), QMessageBox.ActionRole)
+        btn_skip = msg_box.addButton(tr("Skip Images"), QMessageBox.RejectRole)
         
         msg_box.exec_()
         choice = msg_box.clickedButton()
@@ -1164,11 +1334,11 @@ class GeometryWidget(QWidget):
             # 如果图层不同，询问保存哪一个
             if not layers_are_same:
                 sub_box = QMessageBox(self)
-                sub_box.setWindowTitle("Select Layers")
-                sub_box.setText("Which layer(s) should be saved as reference?")
-                btn_both = sub_box.addButton("Save Both", QMessageBox.ActionRole)
-                btn_data = sub_box.addButton("Data Only", QMessageBox.ActionRole)
-                btn_view = sub_box.addButton("View Only", QMessageBox.ActionRole)
+                sub_box.setWindowTitle(tr("Select Layers"))
+                sub_box.setText(tr("Which layer(s) should be saved as reference?"))
+                btn_both = sub_box.addButton(tr("Save Both"), QMessageBox.ActionRole)
+                btn_data = sub_box.addButton(tr("Data Only"), QMessageBox.ActionRole)
+                btn_view = sub_box.addButton(tr("View Only"), QMessageBox.ActionRole)
                 sub_box.exec_()
                 
                 sub_choice = sub_box.clickedButton()
