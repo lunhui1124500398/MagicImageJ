@@ -169,6 +169,18 @@ TRANS_CN = {
     "Save Both":"保存两者",
     "Data Only":"仅数据",
     "View Only":"仅视图",
+    "Saved JSON":"成功保存到json文件",
+    "Confirm Import Sources":"确认导入数据源",
+    "Image Source Detection Report":"图像源自动检测报告",
+    "View Layer":"参考层(看到的)",
+    "Data Layer":"数据层(扣取的)",
+    "Same as View Layer":"与参考层相同",
+    "Do you want to load these images?": "您想要导入这些图片吗?",
+    "Found":"找到",
+    'Not Found (Auto-detection failed)':"未找到(自动探测失败)",
+    "Auto Load Detected":"自动导入检测图层",
+    "Manual Select":"人工选择",
+    "Skip Images (ROIs Only)":"跳过图层(仅导入Rois)",
 
     
     # Enhance Widget

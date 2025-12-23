@@ -52,6 +52,8 @@ class TEMWorkflow:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         self.viewer = napari.Viewer(title="TEM Data Processing Workflow-YSImageJ")
         QSettings("NapariUser", "Global").remove("archive_path")
+        # === [新增代码] 启动时清除 Dataset ID，防止不归档时出现上次的 ID ===
+        QSettings("NapariUser", "Global").remove("current_dataset_id")
         # === Fix: Set a reasonable default size to prevent layout overflow ===
         self.viewer.window.resize(1200, 800)
 

@@ -1386,7 +1386,7 @@ class GeometryWidget(QWidget):
             }
             
             with open(json_path, 'w', encoding='utf-8') as f: json.dump(data_dump, f, indent=2)
-            msg = f"✅ Saved JSON."
+            msg = f"✅ {tr('Saved JSON')}."
 
             # 2. 执行图像保存
             for layer_obj, suffix in save_target_layers:
@@ -1413,7 +1413,7 @@ class GeometryWidget(QWidget):
                         cv2.imwrite(str(save_path), frame_out)
                         prog.setValue(i)
                     prog.close()
-                    msg += f"\nSaved Seq: {seq_folder.name}"
+                    msg += f"\n{tr('Saved Seq')}: {seq_folder.name}"
                     
                 # 如果是TIFF
                 elif format_ext == 'tiff':
@@ -1520,31 +1520,31 @@ class GeometryWidget(QWidget):
                 path_data, mode_data = self._detect_image_source(json_path, data_name)
             
             # 2. 构建探测报告 (HTML 格式)
-            msg_text = "<b>Image Source Detection Report:</b><br><br>"
+            msg_text = f"<b>{tr('Image Source Detection Report')}:</b><br><br>"
             
             # View Layer 报告
-            msg_text += f"<b>View Layer:</b> {view_name}<br>"
+            msg_text += f"<b>{tr('View Layer')}:</b> {view_name}<br>"
             if path_view:
-                msg_text += f"&nbsp;&nbsp;✅ Found: {path_view.name} ({mode_view})<br>"
+                msg_text += f"&nbsp;&nbsp;✅ {tr('Found')}: {path_view.name} ({mode_view})<br>"
             else:
-                msg_text += f"&nbsp;&nbsp;❌ Not Found (Auto-detection failed)<br>"
+                msg_text += f"&nbsp;&nbsp;❌ {tr('Not Found (Auto-detection failed)')}<br>"
                 
             # Data Layer 报告
             if is_same_layer:
-                 msg_text += f"<br><b>Data Layer:</b> (Same as View Layer)<br>"
+                 msg_text += f"<br><b>{tr('Data Layer')}:</b> ({tr('Same as View Layer')})<br>"
             else:
-                msg_text += f"<br><b>Data Layer:</b> {data_name}<br>"
+                msg_text += f"<br><b>{tr('Data Layer')}:</b> {data_name}<br>"
                 if path_data:
-                    msg_text += f"&nbsp;&nbsp;✅ Found: {path_data.name} ({mode_data})<br>"
+                    msg_text += f"&nbsp;&nbsp;✅ {tr('Found')}: {path_data.name} ({mode_data})<br>"
                 else:
-                    msg_text += f"&nbsp;&nbsp;❌ Not Found (Auto-detection failed)<br>"
+                    msg_text += f"&nbsp;&nbsp;❌ {tr('Not Found (Auto-detection failed)')}<br>"
             
             msg_text += "<br>---------------------------------<br>"
-            msg_text += "Do you want to load these images?"
+            msg_text += tr("Do you want to load these images?")
 
             # 3. 弹窗询问用户
             msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Confirm Import Sources")
+            msg_box.setWindowTitle(tr("Confirm Import Sources"))
             msg_box.setTextFormat(Qt.RichText) # 启用 HTML 渲染
             msg_box.setText(msg_text)
             
@@ -1554,10 +1554,10 @@ class GeometryWidget(QWidget):
             
             btn_auto = None
             if has_auto_candidate:
-                btn_auto = msg_box.addButton("✅ Auto Load Detected", QMessageBox.ActionRole)
+                btn_auto = msg_box.addButton(f"✅ {tr('Auto Load Detected')}", QMessageBox.ActionRole)
             
-            btn_manual = msg_box.addButton("🛠️ Manual Select", QMessageBox.ActionRole)
-            btn_skip = msg_box.addButton("Skip Images (ROIs Only)", QMessageBox.RejectRole)
+            btn_manual = msg_box.addButton(f"🛠️ {tr('Manual Select')}", QMessageBox.ActionRole)
+            btn_skip = msg_box.addButton(tr("Skip Images (ROIs Only)"), QMessageBox.RejectRole)
             
             msg_box.exec_()
             choice = msg_box.clickedButton()
@@ -1707,7 +1707,7 @@ class GeometryWidget(QWidget):
         if not date_str:
             date_str = datetime.datetime.now().strftime("%Y%m%d")
             
-        ds_id = QSettings("NapariUser", "Global").value("current_dataset_id", "ds1")
+        ds_id = QSettings("NapariUser", "Global").value("current_dataset_id", "")
         sub_name = self.sample_name_edit.text().strip() or "Sample"
         
         archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
