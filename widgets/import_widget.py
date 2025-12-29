@@ -315,6 +315,7 @@ class ImportWidget(QWidget):
         # Group 1: Data Source
         g_source = QGroupBox(tr("1. Data Source")); l_source = QVBoxLayout(); l_source.setSpacing(5); l_source.setContentsMargins(8, 15, 8, 8)
         h_brow = QHBoxLayout(); btn_browse = QPushButton(f"📂 {tr('Browse Folder')}"); btn_browse.clicked.connect(self._browse_folder)
+        btn_browse.setToolTip(tr("Select DM4 folder for dose calculation and archive"))
         # 给按钮一个合理的固定宽度，防止它抢占过多空间
         btn_browse.setFixedWidth(160)
         
@@ -327,7 +328,21 @@ class ImportWidget(QWidget):
 
         h_brow.addWidget(btn_browse); h_brow.addWidget(self.folder_label)
         l_source.addLayout(h_brow); 
-        # l_source.addWidget(self.folder_label)
+        
+        # === [新增] PNG/TIFF 快速导入按钮 ===
+        h_quick_import = QHBoxLayout()
+        btn_load_png = QPushButton(f"📂 {tr('Load PNG Seq')}")
+        btn_load_png.setToolTip(tr("Quickly load a PNG sequence folder to viewer"))
+        btn_load_png.clicked.connect(self._load_png_sequence)
+        
+        btn_load_tiff = QPushButton(f"📂 {tr('Load TIFF')}")
+        btn_load_tiff.setToolTip(tr("Quickly load a TIFF stack file to viewer"))
+        btn_load_tiff.clicked.connect(self._load_tiff_stack)
+        
+        h_quick_import.addWidget(btn_load_png)
+        h_quick_import.addWidget(btn_load_tiff)
+        l_source.addLayout(h_quick_import)
+        
         g_source.setLayout(l_source); layout.addWidget(g_source)
 
         # Group 2: Scan Metadata
@@ -759,3 +774,96 @@ class ImportWidget(QWidget):
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         self.viewer.add_image(stack, name=name, metadata=meta, colormap='gray')
         self.status.setText(f"Loaded {len(stack)} frames.")
+
+    # === [新增] PNG 序列导入 ===
+    def _load_png_sequence(self):
+        """加载 PNG 序列文件夹"""
+        from qtpy.QtWidgets import QProgressDialog
+        from qtpy.QtCore import Qt
+        import cv2
+        
+        start_path = self.settings.value("last_folder", str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, tr("Select PNG Sequence Folder"), start_path)
+        if not folder:
+            return
+        
+        folder_path = Path(folder)
+        png_files = sorted(list(folder_path.glob("*.png")))
+        
+        if not png_files:
+            QMessageBox.warning(self, tr("No Images"), tr("No PNG files found in the selected folder."))
+            return
+        
+        # 进度条
+        progress = QProgressDialog(f"{tr('Loading')} {len(png_files)} PNG files...", tr("Cancel"), 0, len(png_files), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(500)
+        
+        try:
+            frames = []
+            for i, f in enumerate(png_files):
+                if progress.wasCanceled():
+                    self.status.setText(tr("Loading canceled."))
+                    return
+                
+                img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    # 如果是彩色图，转为灰度
+                    if len(img.shape) == 3:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    frames.append(img)
+                progress.setValue(i + 1)
+            
+            progress.close()
+            
+            if not frames:
+                QMessageBox.warning(self, tr("Error"), tr("Could not read any valid images."))
+                return
+                
+            stack = np.array(frames)
+            name = f"PNG_{folder_path.name}"
+            if len(name) > 30:
+                name = name[:15] + "..." + name[-10:]
+            
+            self.viewer.add_image(stack, name=name, colormap='gray')
+            self.status.setText(f"✅ {tr('Loaded')} {len(stack)} PNG frames.")
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, tr("Error"), str(e))
+            self.status.setText(f"❌ Error: {e}")
+
+    # === [新增] TIFF Stack 导入 ===
+    def _load_tiff_stack(self):
+        """加载 TIFF Stack 文件"""
+        import tifffile
+        
+        start_path = self.settings.value("last_folder", str(Path.home()))
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select TIFF Stack File"), start_path, 
+            "TIFF Files (*.tiff *.tif)"
+        )
+        if not file_path:
+            return
+        
+        try:
+            self.status.setText(tr("Loading TIFF..."))
+            stack = tifffile.imread(file_path)
+            
+            # 确保是3D数组 (T, H, W)
+            if stack.ndim == 2:
+                stack = stack[np.newaxis, ...]  # 单帧转为 (1, H, W)
+            elif stack.ndim == 4:
+                # 可能是 (T, H, W, C)，取第一个通道
+                stack = stack[..., 0]
+            
+            name = f"TIFF_{Path(file_path).stem}"
+            if len(name) > 30:
+                name = name[:15] + "..." + name[-10:]
+            
+            self.viewer.add_image(stack, name=name, colormap='gray')
+            self.status.setText(f"✅ {tr('Loaded')} {len(stack)} TIFF frames.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, tr("Error"), str(e))
+            self.status.setText(f"❌ Error: {e}")

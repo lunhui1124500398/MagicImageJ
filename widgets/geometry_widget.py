@@ -536,6 +536,20 @@ class GeometryWidget(QWidget):
         h_roi_io.addWidget(btn_save_roi)
         h_roi_io.addWidget(btn_load_roi)
         batch_layout.addLayout(h_roi_io)
+        
+        # === [新增] PNG/TIFF 快速导入按钮 ===
+        h_quick_import = QHBoxLayout()
+        btn_load_png = QPushButton(f"📂 {tr('Load PNG Seq')}")
+        btn_load_png.setToolTip(tr("Quickly load a PNG sequence folder"))
+        btn_load_png.clicked.connect(self._quick_load_png_sequence)
+        
+        btn_load_tiff = QPushButton(f"📂 {tr('Load TIFF')}")
+        btn_load_tiff.setToolTip(tr("Quickly load a TIFF stack file"))
+        btn_load_tiff.clicked.connect(self._quick_load_tiff_stack)
+        
+        h_quick_import.addWidget(btn_load_png)
+        h_quick_import.addWidget(btn_load_tiff)
+        batch_layout.addLayout(h_quick_import)
 
         self.export_batch_btn = QPushButton(f"💾 {tr('Export Crops & Map')}")
         self.export_batch_btn.clicked.connect(self._export_batch_crops)
@@ -1657,8 +1671,23 @@ class GeometryWidget(QWidget):
             self.status_label.setText(f"❌ Failed to add layer: {name}")
 
     def _restore_rois_to_layer(self, data_dump):
-        # 恢复 ROI
-        if "Batch_ROI" not in self.viewer.layers: self._start_batch_mode()
+        """恢复 ROI - 不依赖 _start_batch_mode 以处理无图层的情况"""
+        # 如果 Batch_ROI 图层不存在，直接创建（不要求必须有图层存在）
+        if "Batch_ROI" not in self.viewer.layers:
+            box_col = GlobalConfig.get("style_batch_box_color")
+            width = int(GlobalConfig.get("style_batch_width"))
+            txt_col = GlobalConfig.get("style_batch_text_color")
+            font_size = int(GlobalConfig.get("style_batch_font_size"))
+            
+            roi_layer = self.viewer.add_shapes(
+                name="Batch_ROI", shape_type='rectangle',
+                edge_color=box_col, face_color=[0, 1, 0, 0.05], edge_width=width,
+                text={'string': '{label}\n{frame_info}', 'size': font_size, 
+                      'color': txt_col, 'anchor': 'upper_left', 'translation': [-5, -5]},
+                features={'label': [], 'frame_range': [], 'frame_info': []}
+            )
+            roi_layer.events.data.connect(self._on_batch_data_change)
+        
         layer = self.viewer.layers["Batch_ROI"]
         
         new_data, new_lbl, new_rng, new_inf = [], [], [], []
@@ -1849,3 +1878,107 @@ class GeometryWidget(QWidget):
         # 这里的样式参数会在 _draw_crop_rect 调用时实时读取 GlobalConfig.get()，无需刷新 UI 控件
 
         for w in widgets: w.blockSignals(False)
+
+    # === [新增] PNG 序列快速导入 ===
+    def _quick_load_png_sequence(self):
+        """快速加载 PNG 序列文件夹"""
+        from qtpy.QtWidgets import QProgressDialog, QFileDialog
+        from qtpy.QtCore import Qt, QSettings
+        
+        start_path = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, tr("Select PNG Sequence Folder"), start_path)
+        if not folder:
+            return
+        
+        folder_path = Path(folder)
+        png_files = sorted(list(folder_path.glob("*.png")))
+        
+        if not png_files:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(self, tr("No Images"), tr("No PNG files found in the selected folder."))
+            return
+        
+        # 进度条
+        progress = QProgressDialog(f"{tr('Loading')} {len(png_files)} PNG files...", tr("Cancel"), 0, len(png_files), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(500)
+        
+        try:
+            frames = []
+            for i, f in enumerate(png_files):
+                if progress.wasCanceled():
+                    self.status_label.setText(tr("Loading canceled."))
+                    return
+                
+                img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    if len(img.shape) == 3:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    frames.append(img)
+                progress.setValue(i + 1)
+            
+            progress.close()
+            
+            if not frames:
+                from qtpy.QtWidgets import QMessageBox
+                QMessageBox.warning(self, tr("Error"), tr("Could not read any valid images."))
+                return
+                
+            stack = np.array(frames)
+            name = f"PNG_{folder_path.name}"
+            if len(name) > 30:
+                name = name[:15] + "..." + name[-10:]
+            
+            new_layer = self.viewer.add_image(stack, name=name, colormap='gray')
+            
+            # 自动选中新加载的图层
+            self.batch_view_combo.setCurrentText(new_layer.name)
+            self.batch_data_combo.setCurrentText(new_layer.name)
+            self.status_label.setText(f"✅ {tr('Loaded')} {len(stack)} PNG frames.")
+            
+        except Exception as e:
+            progress.close()
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.critical(self, tr("Error"), str(e))
+            self.status_label.setText(f"❌ Error: {e}")
+
+    # === [新增] TIFF Stack 快速导入 ===
+    def _quick_load_tiff_stack(self):
+        """快速加载 TIFF Stack 文件"""
+        import tifffile
+        from qtpy.QtWidgets import QFileDialog
+        from qtpy.QtCore import QSettings
+        
+        start_path = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, tr("Select TIFF Stack File"), start_path, 
+            "TIFF Files (*.tiff *.tif)"
+        )
+        if not file_path:
+            return
+        
+        try:
+            self.status_label.setText(tr("Loading TIFF..."))
+            stack = tifffile.imread(file_path)
+            
+            # 确保是3D数组 (T, H, W)
+            if stack.ndim == 2:
+                stack = stack[np.newaxis, ...]
+            elif stack.ndim == 4:
+                stack = stack[..., 0]
+            
+            name = f"TIFF_{Path(file_path).stem}"
+            if len(name) > 30:
+                name = name[:15] + "..." + name[-10:]
+            
+            new_layer = self.viewer.add_image(stack, name=name, colormap='gray')
+            
+            # 自动选中新加载的图层
+            self.batch_view_combo.setCurrentText(new_layer.name)
+            self.batch_data_combo.setCurrentText(new_layer.name)
+            self.status_label.setText(f"✅ {tr('Loaded')} {len(stack)} TIFF frames.")
+            
+        except Exception as e:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.critical(self, tr("Error"), str(e))
+            self.status_label.setText(f"❌ Error: {e}")

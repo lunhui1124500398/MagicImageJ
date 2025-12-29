@@ -181,6 +181,25 @@ TRANS_CN = {
     "Auto Load Detected":"自动导入检测图层",
     "Manual Select":"人工选择",
     "Skip Images (ROIs Only)":"跳过图层(仅导入Rois)",
+    
+    # === PNG/TIFF 快速导入 ===
+    "Load PNG Seq": "加载PNG序列",
+    "Load TIFF": "加载TIFF",
+    "Quickly load a PNG sequence folder": "快速加载PNG序列文件夹",
+    "Quickly load a TIFF stack file": "快速加载TIFF堆栈文件",
+    "Quickly load a PNG sequence folder to viewer": "快速加载PNG序列到视图",
+    "Quickly load a TIFF stack file to viewer": "快速加载TIFF堆栈到视图",
+    "Select PNG Sequence Folder": "选择PNG序列文件夹",
+    "Select TIFF Stack File": "选择TIFF堆栈文件",
+    "Select DM4 folder for dose calculation and archive": "选择DM4文件夹以计算剂量和归档",
+    "No Images": "无图像",
+    "No PNG files found in the selected folder.": "所选文件夹中没有找到PNG文件。",
+    "Loading": "加载中",
+    "Loading canceled.": "加载已取消。",
+    "Could not read any valid images.": "无法读取任何有效图像。",
+    "Loaded": "已加载",
+    "Loading TIFF...": "正在加载TIFF...",
+    "Error": "错误",
 
     
     # Enhance Widget
