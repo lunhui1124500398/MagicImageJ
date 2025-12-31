@@ -37,6 +37,7 @@ from widgets.geometry_widget import GeometryWidget
 from widgets.enhance_widget import EnhanceWidget
 from widgets.annotation_widget import AnnotationWidget
 from widgets.export_widget import ExportWidget
+from widgets.recovery_widget import RecoveryWidget
 from widgets.settings_widget import SettingsDialog, GlobalConfig, tr
 import numpy as np
 import math
@@ -243,6 +244,10 @@ class TEMWorkflow:
         self.export_widget = ExportWidget(self.viewer)
         self.tab_widget.addTab(self.export_widget, f"💾 {tr('Export')}")
 
+        # 7. 会话恢复
+        self.recovery_widget = RecoveryWidget(self.viewer)
+        self.tab_widget.addTab(self.recovery_widget, f"🔄 {tr('Recovery')}")
+
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         # === 4. 将 Tab 加入主布局 ===
@@ -442,9 +447,38 @@ class TEMWorkflow:
 
     def run(self):
         napari.run()
+        # 正常退出时标记会话完成
+        try:
+            from utils.session_logger import get_logger
+            get_logger().mark_completed()
+        except:
+            pass
 
 def main():
+    # 初始化 SessionLogger
+    try:
+        from utils.session_logger import get_logger
+        get_logger()  # 确保单例被创建
+    except Exception as e:
+        print(f"SessionLogger init failed: {e}")
+    
     app = TEMWorkflow()
+    
+    # 延迟执行恢复检查 (等待 UI 完全加载)
+    def check_recovery():
+        try:
+            from widgets.recovery_dialog import check_and_show_recovery
+            recovered_actions = check_and_show_recovery(app.viewer.window._qt_window)
+            if recovered_actions:
+                print(f"[Recovery] Recovered {len(recovered_actions)} actions ")
+                # 这里可以根据 recovered_actions 执行实际恢复逻辑
+                # 目前仅显示信息，实际重放需要更复杂的逻辑
+                app.viewer.status = f"✅ Session recovery: {len(recovered_actions)} actions loaded"
+        except Exception as e:
+            print(f"Recovery check failed: {e}")
+    
+    QTimer.singleShot(500, check_recovery)
+    
     app.run()
 
 if __name__ == '__main__':

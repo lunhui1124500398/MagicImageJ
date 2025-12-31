@@ -587,20 +587,10 @@ class EnhanceWidget(QWidget):
             self.status_label.setText(f"❌ Error: {str(e)}")
 
     def _log_action(self, key, info):
+        """使用 SessionLogger 记录操作"""
         try:
-            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-            if not archive_path: return
-            log_path = Path(archive_path) / "processing_log.json"
-            if log_path.exists():
-                with open(log_path, 'r') as f: data = json.load(f)
-            else: data = {}
-            
-            if key not in data: data[key] = []
-            info['timestamp'] = str(datetime.datetime.now())
-            data[key].append(info)
-            
-            with open(log_path, 'w') as f:
-                json.dump(data, f, indent=2, cls=NumpyEncoder)
+            from utils.session_logger import get_logger
+            get_logger().log_action("enhance", key, info)
         except Exception as e:
             print(f"Log error: {e}")
     

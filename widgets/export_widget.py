@@ -567,24 +567,14 @@ class ExportWidget(QWidget):
         self.btn_run.setEnabled(True)
 
     def _log_export(self, path, params):
+        """使用 SessionLogger 记录导出操作"""
         try:
-            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-            if archive_path:
-                log_file = Path(archive_path) / "processing_log.json"
-                data = {}
-                if log_file.exists():
-                    with open(log_file, 'r') as f: data = json.load(f)
-                
-                if "exports" not in data: data["exports"] = []
-                entry = {
-                    "timestamp": str(datetime.datetime.now()),
-                    "file": str(Path(path).name),
-                    "type": self.export_thread.export_type,
-                    "params": params
-                }
-                data["exports"].append(entry)
-                
-                with open(log_file, 'w') as f: json.dump(data, f, indent=2)
+            from utils.session_logger import get_logger
+            get_logger().log_action("export", "export_media", {
+                "file": str(Path(path).name),
+                "type": self.export_thread.export_type,
+                "params": params
+            })
         except Exception as e:
             print(f"Log failed: {e}")
     

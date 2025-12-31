@@ -25,6 +25,7 @@ import json
 import os
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
+from utils.session_logger import get_logger
 
 # ==========================================
 #  新增：后台图像读取线程 (防止界面卡死)
@@ -773,6 +774,15 @@ class GeometryWidget(QWidget):
                     self.viewer.layers.remove(layer)
                     self.status_label.setText("↩️ Rotation Undone.")
                 self.status_label.setText(f"✅ Rotated {angle:.1f}° (Expand={expand})")
+                
+                # === [日志记录] 旋转操作 ===
+                try:
+                    get_logger().log_action("geometry", "rotate", {
+                        "source_layer": layer_name,
+                        "angle": angle,
+                        "expand": expand
+                    })
+                except: pass
             except Exception as e:
                 self.status_label.setText(f"Error showing result: {e}")
         
@@ -797,6 +807,14 @@ class GeometryWidget(QWidget):
             self.simple_crop_combo.setCurrentText(new_name)
             self.viewer.layers.selection.active = self.viewer.layers[new_name]
             self.status_label.setText(f"✅ Applied {direction} flip.")
+            
+            # === [日志记录] 翻转操作 ===
+            try:
+                get_logger().log_action("geometry", "flip", {
+                    "source_layer": layer_name,
+                    "direction": direction
+                })
+            except: pass
         except Exception as e:
             self.status_label.setText(f"Error: {e}")
 
@@ -854,6 +872,14 @@ class GeometryWidget(QWidget):
             self.status_label.setText("↩️ Crop Undone.")
 
         self.status_label.setText(f"✅ Crop applied. Press '{undo_key}' to Undo.")
+        
+        # === [日志记录] 裁剪操作 ===
+        try:
+            get_logger().log_action("geometry", "crop", {
+                "source_layer": target,
+                "bbox": list(bbox)  # [x1, y1, x2, y2]
+            })
+        except: pass
 
     # --- Batch Crop Logic ---
     def _start_batch_mode(self):
@@ -1234,6 +1260,27 @@ class GeometryWidget(QWidget):
             layer.selected_data = {current_count - 1}
             layer.mode = 'select'
             self.status_label.setText("🖐️ Adjust Mode (Click bg to draw)")
+        
+        # === [SessionLogger] 记录 ROI 快照用于恢复 ===
+        try:
+            view_layer_name = self.batch_view_combo.currentText()
+            data_layer_name = self.batch_data_combo.currentText()
+            
+            rois_snapshot = []
+            for i, poly in enumerate(layer.data):
+                rois_snapshot.append({
+                    "coordinates": poly.tolist(),
+                    "label": str(layer.features['label'][i]) if i < len(layer.features['label']) else str(i),
+                    "frame_range": str(layer.features['frame_range'][i]) if i < len(layer.features['frame_range']) else ""
+                })
+            
+            get_logger().log_action("geometry", "update_batch_rois", {
+                "view_layer": view_layer_name,
+                "data_layer": data_layer_name,
+                "roi_count": len(rois_snapshot),
+                "rois": rois_snapshot
+            })
+        except: pass
 
     
     # === [新增] 全面清理 (带弹窗保护) ===
@@ -1438,6 +1485,16 @@ class GeometryWidget(QWidget):
             # 3. 总是保存一张 Ref Snapshot (PNG) 方便快速预览
             ref_png = json_path.with_name(json_path.stem + "_ref.png")
             self._save_reference_snapshot(self.viewer.layers[view_layer_name], roi_layer, ref_png)
+            
+            # === [SessionLogger] 记录 ROI 保存操作 ===
+            try:
+                get_logger().log_action("geometry", "save_rois", {
+                    "json_path": str(json_path),
+                    "roi_count": len(rois_data),
+                    "view_layer": view_layer_name,
+                    "data_layer": data_layer_name
+                })
+            except: pass
             
             self.status_label.setText(msg)
             QMessageBox.information(self, "Success", msg)

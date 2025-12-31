@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
+from utils.session_logger import get_logger
 
 # 导入核心算法
 from core.drift_correction import (calculate_drift_curve, 
@@ -401,7 +402,7 @@ class DriftCorrectionWidget(QWidget):
                 corrected_stack, 
                 name=new_layer_name, 
                 colormap='gray', 
-                metadata={'source': source_layer_name, 'is_drift_result': True}
+                metadata={'source': source_layer_name, 'is_drift_result': True, 'action_id': None}
             )
 
             self.correction_history.append(new_layer)
@@ -420,7 +421,9 @@ class DriftCorrectionWidget(QWidget):
             self.viewer.layers.selection.active = new_layer
             self.status_label.setText(f"✅ Previewing: {new_layer_name}. Press 'Crtl+Z' to Undo.")
 
-            self._log_drift_action(source_layer_name)
+            # 使用 SessionLogger 记录操作
+            action_id = self._log_drift_action(source_layer_name)
+            new_layer.metadata['action_id'] = action_id
         
         except Exception as e:
             self.status_label.setText(f"❌ Apply Error: {str(e)}")
@@ -447,41 +450,34 @@ class DriftCorrectionWidget(QWidget):
             roi_layer.mode = 'select' # 或者 'add_rectangle' 根据偏好
             
         self.status_label.setText(f"↩️ {tr('Undone. Adjust ROI and try again.')}")
+        
+        # 记录撤回操作
+        action_id = layer_to_remove.metadata.get('action_id')
+        if action_id:
+            try:
+                get_logger().log_undo(action_id)
+            except:
+                pass
 
-    def _log_drift_action(self, source_layer):
-        """Save parameters to processing_log.json"""
+    def _log_drift_action(self, source_layer) -> str:
+        """使用 SessionLogger 记录漂移矫正操作"""
         try:
-            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-            if not archive_path: return
-            
-            log_path = Path(archive_path) / "processing_log.json"
-            if log_path.exists():
-                try:
-                    with open(log_path, 'r') as f: data = json.load(f)
-                except: data = {}
-            else: data = {}
-
-            if "drift_correction" not in data: data["drift_correction"] = []
-            
             max_drift = np.max(np.abs(self.current_drifts), axis=0)
             
-            entry = {
-                "timestamp": str(datetime.datetime.now()),
+            params = {
                 "source_layer": source_layer,
                 "template_frame": self.template_spin.value(),
                 "roi_bbox": self._get_roi_bbox(),
                 "kernel_size": self.kernel_spin.value(),
-                "max_shift_x": max_drift[0],
-                "max_shift_y": max_drift[1]
+                "max_shift_x": float(max_drift[0]),
+                "max_shift_y": float(max_drift[1])
             }
             
-            data["drift_correction"].append(entry)
-            
-            with open(log_path, 'w') as f:
-                json.dump(data, f, indent=2, cls=NumpyEncoder)
-                
+            action_id = get_logger().log_action("drift", "apply_correction", params)
+            return action_id
         except Exception as e:
             print(f"Failed to log drift: {e}")
+            return ""
 
     def _redraw_roi(self):
         # 清理所有历史

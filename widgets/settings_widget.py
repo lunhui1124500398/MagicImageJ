@@ -200,6 +200,97 @@ TRANS_CN = {
     "Loaded": "已加载",
     "Loading TIFF...": "正在加载TIFF...",
     "Error": "错误",
+    
+    # === Session & Recovery ===
+    "Session & Recovery": "会话与恢复",
+    "Session Log Settings": "会话日志设置",
+    "Default Log Directory:": "默认日志目录:",
+    "Select Log Directory": "选择日志目录",
+    "Used when no archive path is set. Leave empty to use system default.": "归档路径未设置时使用。留空则使用系统默认路径。",
+    "Default Substance:": "默认样品名:",
+    "Default Dataset ID:": "默认数据集编号:",
+    "Recovery Settings": "恢复设置",
+    "Ask before recovering session": "恢复会话前询问",
+    "If unchecked, will attempt automatic recovery without asking.": "取消勾选则自动恢复，不再询问。",
+    
+    # === Recovery Dialog ===
+    "Session Recovery": "会话恢复",
+    "Incomplete Session Detected": "检测到未完成的会话",
+    "Session ID": "会话ID",
+    "Created": "创建时间",
+    "Substance": "样品名",
+    "Dataset": "数据集",
+    "Warning: Log file may have been modified": "警告: 日志文件可能已被修改",
+    "Recoverable Actions": "可恢复的操作",
+    "Select All": "全选",
+    "Deselect All": "取消全选",
+    "Only selected actions will be displayed. Undone actions are automatically excluded.": "仅显示选中的操作。已撤回的操作已自动排除。",
+    "Skip Recovery": "跳过恢复",
+    "Recover Selected": "恢复选中项",
+    "Required Data Sources": "需要的数据源",
+    "Important: You must load these files FIRST before recovery can work!": "重要: 恢复前必须先加载这些文件!",
+    "Please use Import tab to load the data, then close this dialog.": "请使用导入标签页加载数据，然后关闭此对话框。",
+    "Auto-import data sources on recovery": "恢复时自动导入数据源",
+    "If checked, will try to auto-load data files. Otherwise manual selection only.": "勾选后自动加载数据文件，否则仅手动选择。",
+    "Data source found": "已找到数据源",
+    "Data source NOT found (may have been moved)": "未找到数据源 (可能已移动)",
+    "Auto Import": "自动导入",
+    "Manual Select": "手动选择",
+    "Skip": "跳过",
+    "Data Source Import": "数据源导入",
+    "Session Log Location": "会话日志位置",
+    "System Default Path": "系统默认路径",
+    "Open Log Folder": "打开日志文件夹",
+    "Manual Recovery": "手动恢复",
+    "Recovery complete": "恢复完成",
+    "actions recovered": "个操作已恢复",
+    "No incomplete sessions found, or recovery was skipped.": "未找到未完成的会话，或已跳过恢复。",
+    
+    # === Recovery Widget (独立组件) ===
+    "Recovery": "会话恢复",
+    "Session List": "会话列表",
+    "Refresh Sessions": "刷新会话列表",
+    "No incomplete sessions": "没有未完成的会话",
+    "Click Refresh to check again": "点击刷新重新检查",
+    "Session Details": "会话详情",
+    "Abandon Session": "放弃此会话",
+    "Session abandoned": "会话已放弃",
+    "Are you sure you want to abandon this session? This cannot be undone.": "确定要放弃此会话吗？此操作无法撤销。",
+    "No actions selected for recovery.": "未选择任何操作进行恢复。",
+    "Select Log File": "选择日志文件",
+    "Recent Sessions": "历史会话",
+    "No sessions found": "未找到会话记录",
+    "Start Recovery": "开始恢复",
+    "Please load data sources first": "请先加载数据源",
+    "completed": "已完成",
+    "in_progress": "进行中",
+    "crashed": "崩溃",
+    "recovered": "已恢复",
+    "abandoned": "已放弃",
+    "Manual Mode": "手动模式",
+    "Current": "当前",
+    "Not selected": "未选择",
+    "Max Sessions to Keep:": "最大保留会话数:",
+    "Older sessions will be automatically cleaned up.": "超出的旧会话将自动清理。",
+    "Recovery Mode:": "恢复模式:",
+    "Auto (fully automatic)": "自动 (完全自动执行)",
+    "Review (confirm each step)": "审查 (每步确认)",
+    "Replaying drift correction...": "正在重放漂移矫正...",
+    "Drift correction replayed successfully": "漂移矫正重放成功",
+    "Continue with this result?": "继续使用此结果吗?",
+    "Data Source Detection": "数据源检测",
+    "Auto-detected data source": "自动检测到数据源",
+    "Do you want to import this?": "是否要导入此数据?",
+    "Import Detected": "导入检测到的",
+    "Manual Select": "手动选择",
+    "Skip Import": "跳过导入",
+    "Data source not found": "未找到数据源",
+    "Export Confirmation": "导出确认",
+    "The session contains export operations. Do you want to re-export?": "会话包含导出操作。是否要重新导出?",
+    "PNG Sequence": "PNG 序列",
+    "TIFF Stack": "TIFF 堆栈",
+    "Video (MP4)": "视频 (MP4)",
+    "Skip Export": "跳过导出",
 
     
     # Enhance Widget
@@ -422,7 +513,18 @@ class GlobalConfig:
         "sys_disk_warn_gb": 10.0,
         "sys_move_threshold_gb": 30.0,
         "sys_mem_warn_gb":4.0,
-        "show_archive_popup": True
+        "show_archive_popup": True,
+        
+        # Session & Recovery
+        "session_log_dir": "",
+        "session_substance_default": "Sample",
+        "session_dataset_default": "ds1",
+        "session_ask_on_recovery": True,
+        "session_auto_import_data": True,  # 恢复时是否尝试自动导入数据
+        "session_max_keep": 20,  # 最大保留会话数
+        "session_recovery_mode": "review",  # 恢复模式: "auto"(全自动) 或 "review"(每步确认)
+        "session_auto_detect_source": True,  # 恢复前自动检测数据源
+        "session_confirm_export": True  # 导出操作前询问用户
     }
 
     @classmethod
@@ -504,8 +606,11 @@ class SettingsDialog(QDialog):
 
         # === Tab 3: System Thresholds (New) ===
         tabs.addTab(self._create_system_tab(), f"⚙️ {tr('System Thresholds')}")
+        
+        # === Tab 4: Session & Recovery (New) ===
+        tabs.addTab(self._create_session_tab(), f"📋 {tr('Session & Recovery')}")
 
-        # === Tab 4: Shortcuts (Existing) ===
+        # === Tab 5: Shortcuts (Existing) ===
         tabs.addTab(self._create_shortcuts_tab(), f"⌨️ {tr('Shortcuts')}")
 
         layout.addWidget(tabs)
@@ -757,6 +862,94 @@ class SettingsDialog(QDialog):
         g_res.setLayout(form); l.addWidget(g_res)
         l.addStretch(); w.setLayout(l)
         return w
+    
+    def _create_session_tab(self):
+        """Session & Recovery 标签页"""
+        w = QWidget()
+        l = QVBoxLayout()
+        
+        # === Group 1: Log Directory ===
+        g_log = QGroupBox(tr("Session Log Settings"))
+        f_log = QFormLayout()
+        
+        # 默认日志目录
+        self.session_log_dir = QLineEdit(str(GlobalConfig.get("session_log_dir")))
+        btn_browse_log = QPushButton("📂")
+        btn_browse_log.setFixedWidth(40)
+        btn_browse_log.clicked.connect(lambda: self.session_log_dir.setText(
+            QFileDialog.getExistingDirectory(self, tr("Select Log Directory")) or self.session_log_dir.text()
+        ))
+        h_log = QHBoxLayout()
+        h_log.addWidget(self.session_log_dir)
+        h_log.addWidget(btn_browse_log)
+        f_log.addRow(tr("Default Log Directory:"), h_log)
+        
+        l_hint_log = QLabel(tr("Used when no archive path is set. Leave empty to use system default."))
+        l_hint_log.setStyleSheet("color: gray; font-size: 9pt;")
+        f_log.addRow("", l_hint_log)
+        
+        # 默认物质名
+        self.session_substance = QLineEdit(str(GlobalConfig.get("session_substance_default")))
+        self.session_substance.setPlaceholderText("e.g. CRY2, BSA")
+        f_log.addRow(tr("Default Substance:"), self.session_substance)
+        
+        # 默认 Dataset ID
+        self.session_dataset = QLineEdit(str(GlobalConfig.get("session_dataset_default")))
+        self.session_dataset.setPlaceholderText("e.g. ds1, ds2")
+        f_log.addRow(tr("Default Dataset ID:"), self.session_dataset)
+        
+        g_log.setLayout(f_log)
+        l.addWidget(g_log)
+        
+        # === Group 2: Recovery Settings ===
+        g_rec = QGroupBox(tr("Recovery Settings"))
+        f_rec = QFormLayout()
+        
+        self.session_ask_recovery = QCheckBox(tr("Ask before recovering session"))
+        self.session_ask_recovery.setChecked(bool(GlobalConfig.get("session_ask_on_recovery")))
+        self.session_ask_recovery.setToolTip(tr("If unchecked, will attempt automatic recovery without asking."))
+        f_rec.addRow(self.session_ask_recovery)
+        
+        self.session_auto_import = QCheckBox(tr("Auto-import data sources on recovery"))
+        self.session_auto_import.setChecked(bool(GlobalConfig.get("session_auto_import_data")))
+        self.session_auto_import.setToolTip(tr("If checked, will try to auto-load data files. Otherwise manual selection only."))
+        f_rec.addRow(self.session_auto_import)
+        
+        g_rec.setLayout(f_rec)
+        l.addWidget(g_rec)
+        
+        # === Group 3: 日志位置信息 ===
+        g_info = QGroupBox(tr("Session Log Location"))
+        f_info = QVBoxLayout()
+        
+        # 显示系统默认路径
+        from pathlib import Path
+        default_path = Path.home() / ".napari_tem" / "sessions"
+        self.lbl_default_path = QLabel(f"<b>{tr('System Default Path')}:</b><br><code>{default_path}</code>")
+        self.lbl_default_path.setWordWrap(True)
+        self.lbl_default_path.setStyleSheet("background: #333; padding: 8px; border-radius: 4px;")
+        f_info.addWidget(self.lbl_default_path)
+        
+        h_btns = QHBoxLayout()
+        
+        # 打开日志文件夹按钮
+        btn_open_folder = QPushButton(f"📂 {tr('Open Log Folder')}")
+        btn_open_folder.clicked.connect(self._open_log_folder)
+        h_btns.addWidget(btn_open_folder)
+        
+        # 手动恢复按钮
+        btn_manual_recovery = QPushButton(f"🔄 {tr('Manual Recovery')}")
+        btn_manual_recovery.clicked.connect(self._trigger_manual_recovery)
+        btn_manual_recovery.setStyleSheet("background-color: #2196F3;")
+        h_btns.addWidget(btn_manual_recovery)
+        
+        f_info.addLayout(h_btns)
+        g_info.setLayout(f_info)
+        l.addWidget(g_info)
+        
+        l.addStretch()
+        w.setLayout(l)
+        return w
 
     def _create_shortcuts_tab(self):
         w = QWidget()
@@ -832,6 +1025,14 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("sys_disk_warn_gb", self.sys_disk.value(), emit_signal=False)
         GlobalConfig.set("sys_move_threshold_gb", self.sys_move.value(), emit_signal=False)
         GlobalConfig.set("sys_mem_warn_gb", self.sys_mem_warn.value(), emit_signal=False)
+        
+        # Save Session & Recovery
+        if hasattr(self, 'session_log_dir'):
+            GlobalConfig.set("session_log_dir", self.session_log_dir.text(), emit_signal=False)
+            GlobalConfig.set("session_substance_default", self.session_substance.text(), emit_signal=False)
+            GlobalConfig.set("session_dataset_default", self.session_dataset.text(), emit_signal=False)
+            GlobalConfig.set("session_ask_on_recovery", self.session_ask_recovery.isChecked(), emit_signal=False)
+            GlobalConfig.set("session_auto_import_data", self.session_auto_import.isChecked(), emit_signal=False)
 
         # Save Shortcuts
         for key, edit in self.key_edits.items():
@@ -853,3 +1054,44 @@ class SettingsDialog(QDialog):
                 self.reject()
             except Exception as e:
                 print(e)
+    
+    def _open_log_folder(self):
+        """打开日志文件夹"""
+        from pathlib import Path
+        import subprocess
+        import platform
+        
+        # 确定日志目录
+        user_dir = GlobalConfig.get("session_log_dir")
+        if user_dir and Path(user_dir).exists():
+            log_dir = Path(user_dir)
+        else:
+            log_dir = Path.home() / ".napari_tem" / "sessions"
+        
+        # 确保目录存在
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 打开文件夹
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["explorer", str(log_dir)])
+            elif platform.system() == "Darwin":
+                subprocess.run(["open", str(log_dir)])
+            else:
+                subprocess.run(["xdg-open", str(log_dir)])
+        except Exception as e:
+            QMessageBox.warning(self, tr("Error"), f"Could not open folder: {e}")
+    
+    def _trigger_manual_recovery(self):
+        """手动触发恢复对话框"""
+        try:
+            from widgets.recovery_dialog import check_and_show_recovery
+            recovered = check_and_show_recovery(self)
+            if recovered:
+                QMessageBox.information(self, tr("Manual Recovery"), 
+                    f"✅ {tr('Recovery complete')}: {len(recovered)} {tr('actions recovered')}")
+            else:
+                QMessageBox.information(self, tr("Manual Recovery"), 
+                    tr("No incomplete sessions found, or recovery was skipped."))
+        except Exception as e:
+            QMessageBox.critical(self, tr("Error"), f"Recovery failed: {e}")

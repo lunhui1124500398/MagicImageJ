@@ -26,6 +26,7 @@ import re
 import platform
 import ctypes
 from widgets.settings_widget import tr
+from utils.session_logger import get_logger
 
 # 尝试导入 psutil 获取更准确的内存信息，如果没有则使用 ctypes (Windows) 或 os (Linux)
 try:
@@ -680,6 +681,22 @@ class ImportWidget(QWidget):
             
         params = {"folder_name": folder_name, "import_meta": self.meta_cache, "planned_settings": {"rolling_avg_window": self.win_spin.value(), "gaussian_sigma": self.sigma_spin.value()}}
         with open(archive_path / "processing_log.json", 'w') as f: json.dump(params, f, indent=2, cls=NumpyEncoder)
+        
+        # === [SessionLogger] 同步元数据到会话日志 ===
+        try:
+            logger = get_logger()
+            logger.set_metadata(
+                substance=self.substance_edit.currentText(),
+                dataset_id=ds_id,
+                archive_path=str(archive_path)
+            )
+            logger.log_action("import", "create_archive", {
+                "folder_name": folder_name,
+                "archive_path": str(archive_path),
+                "bit_depth": int(self.bit_depth_combo.currentText())
+            })
+        except Exception as e:
+            print(f"SessionLogger sync failed: {e}")
 
         # 4. [Req 2] 计算大小并决定 Move vs Copy
         self.status.setText("Checking size...")
@@ -774,6 +791,16 @@ class ImportWidget(QWidget):
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         self.viewer.add_image(stack, name=name, metadata=meta, colormap='gray')
         self.status.setText(f"Loaded {len(stack)} frames.")
+        
+        # === [SessionLogger] 记录 DM4 导入操作 ===
+        try:
+            get_logger().log_action("import", "load_dm4_sequence", {
+                "source_path": str(self.current_folder),
+                "frame_count": len(stack),
+                "layer_name": name,
+                "bit_depth": int(self.bit_depth_combo.currentText())
+            })
+        except: pass
 
     # === [新增] PNG 序列导入 ===
     def _load_png_sequence(self):
@@ -828,6 +855,15 @@ class ImportWidget(QWidget):
             self.viewer.add_image(stack, name=name, colormap='gray')
             self.status.setText(f"✅ {tr('Loaded')} {len(stack)} PNG frames.")
             
+            # 记录导入操作
+            try:
+                get_logger().log_action("import", "load_png_sequence", {
+                    "source_path": str(folder_path),
+                    "frame_count": len(stack),
+                    "layer_name": name
+                })
+            except: pass
+            
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, tr("Error"), str(e))
@@ -863,6 +899,15 @@ class ImportWidget(QWidget):
             
             self.viewer.add_image(stack, name=name, colormap='gray')
             self.status.setText(f"✅ {tr('Loaded')} {len(stack)} TIFF frames.")
+            
+            # 记录导入操作
+            try:
+                get_logger().log_action("import", "load_tiff_stack", {
+                    "source_path": file_path,
+                    "frame_count": len(stack),
+                    "layer_name": name
+                })
+            except: pass
             
         except Exception as e:
             QMessageBox.critical(self, tr("Error"), str(e))
