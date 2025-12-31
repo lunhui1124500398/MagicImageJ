@@ -121,7 +121,7 @@ class TEMWorkflow:
 
         self.btn_ruler = QPushButton(f"📏 {tr('Measure')}")
         self.btn_ruler.setCheckable(True) # 这是一个开关按钮
-        self.btn_ruler.setToolTip("Toggle Measurement Tool (Draw lines to measure distance)")
+        self.btn_ruler.setToolTip(tr("Toggle Measurement Tool (Draw lines to measure distance)"))
         self.btn_ruler.setStyleSheet("""
             QPushButton { border: 1px solid #444; background: #333; color: #DDD; border-radius: 3px; padding: 2px 8px; font-size: 11px; }
             QPushButton:checked { background: #2196F3; color: white; border: 1px solid #2196F3; }
@@ -310,8 +310,8 @@ class TEMWorkflow:
                 should_hide = any(dock.isVisible() for dock in left_docks)
                 for dock in left_docks:
                     dock.setVisible(not should_hide)
-                status = "Hidden" if should_hide else "Shown"
-                viewer.status = f"{status} layer controls"
+                status = tr("Hidden") if should_hide else tr("Shown")
+                viewer.status = f"{status} {tr('layer controls')}"
 
             # 2. 强制处理底部控制台 (Bug修复：防止控制台占用时间轴空间)
             # 无论左侧是显示还是隐藏，我们都希望控制台保持隐藏，除非用户手动打开
@@ -385,14 +385,14 @@ class TEMWorkflow:
                     if len(layer.data) > 0:
                         layer.data = layer.data[:-1] # 移除最后一个数据
                         # 注意：features 会由 _on_measure_data_change 自动重新计算，无需手动 pop
-                        self.viewer.status = "↩️ Last measurement removed."
+                        self.viewer.status = f"↩️ {tr('Last measurement removed.')}"
             else:
                 self.measure_layer = self.viewer.layers[layer_name]
                 self.measure_layer.visible = True
                 self.measure_layer.mode = 'add_line'
             
             self.viewer.layers.selection.active = self.measure_layer
-            self.viewer.status = "📏 Measurement Mode: Draw lines to measure.(Ctrl+Z to Undo)"
+            self.viewer.status = f"📏 {tr('Measurement Mode: Draw lines to measure.(Ctrl+Z to Undo)')}"
             
         else:
             # 关闭测量模式 (但不删除图层，只是切换回选择模式或隐藏)
@@ -400,7 +400,7 @@ class TEMWorkflow:
                 self.viewer.layers[layer_name].mode = 'pan_zoom'
                 # 可选：是否隐藏图层？通常用户可能想保留测量结果，所以这里不隐藏
             # 隐藏图层
-            self.viewer.status = "End Measurement."
+            self.viewer.status = tr("End Measurement.")
 
     def _on_measure_data_change(self, event=None):
         """计算线段长度并更新标签"""
@@ -473,7 +473,7 @@ def main():
                 print(f"[Recovery] Recovered {len(recovered_actions)} actions ")
                 # 这里可以根据 recovered_actions 执行实际恢复逻辑
                 # 目前仅显示信息，实际重放需要更复杂的逻辑
-                app.viewer.status = f"✅ Session recovery: {len(recovered_actions)} actions loaded"
+                app.viewer.status = f"✅ {tr('Session recovery: %s actions loaded') % len(recovered_actions)}"
         except Exception as e:
             print(f"Recovery check failed: {e}")
     

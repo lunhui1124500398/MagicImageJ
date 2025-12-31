@@ -155,7 +155,7 @@ class AnnotationWidget(QWidget):
         # Ratio
         g_ratio = QGroupBox(tr("Scale Ratio"))
         l_ratio = QHBoxLayout()
-        l_ratio.addWidget(QLabel("1 px ="))
+        l_ratio.addWidget(QLabel(tr("1 px =")))
         self.scale_ratio_spin = QDoubleSpinBox()
         self.scale_ratio_spin.setRange(0.000001, 100000.0)
         self.scale_ratio_spin.setValue(0.36) 
@@ -397,7 +397,7 @@ class AnnotationWidget(QWidget):
         else: return
 
         # 使用模态进度条，防止界面假死感
-        progress = QProgressDialog("Initializing Preview Layer...", None, 0, 0, self)
+        progress = QProgressDialog(tr("Initializing Preview Layer..."), None, 0, 0, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0) # 立即显示
         progress.show()
@@ -424,7 +424,7 @@ class AnnotationWidget(QWidget):
             # 3. Interaction Box
             self._create_interaction_box()
             
-            self.status_label.setText("Preview Active.")
+            self.status_label.setText(tr("Preview Active."))
         finally:
             QApplication.restoreOverrideCursor()
             progress.close()
@@ -752,7 +752,7 @@ class AnnotationWidget(QWidget):
         if hasattr(self.current_source_layer, 'contrast_limits'):
             contrast_limits = self.current_source_layer.contrast_limits
 
-        progress = QProgressDialog("Burning annotations...", "Cancel", 0, n_frames, self)
+        progress = QProgressDialog(tr("Burning annotations..."), tr("Cancel"), 0, n_frames, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
@@ -827,7 +827,7 @@ class AnnotationWidget(QWidget):
         
        # 添加新图层
         new_layer = self.viewer.add_image(new_data, name=new_layer_name)
-        self.status_label.setText("Done.")
+        self.status_label.setText(tr("Done."))
 
         # === 修复：自动切换逻辑 ===
         # 隐藏源图层 (Annotation 通常也是针对特定图层操作的)
@@ -922,4 +922,4 @@ class AnnotationWidget(QWidget):
             if l in self.viewer.layers: self.viewer.layers.remove(l)
         self.preview_overlay_layer = None
         self.interaction_layer = None
-        self.status_label.setText("Cleared.")
+        self.status_label.setText(tr("Cleared."))

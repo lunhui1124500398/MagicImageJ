@@ -337,7 +337,7 @@ class EnhanceWidget(QWidget):
         window_size = self.window_spin.value()
         # Core逻辑: output = T - window + 1
         output_frames = max(0, total_frames - window_size + 1)
-        self.frame_loss_label.setText(f"Output: {output_frames} frames (Loss: {window_size-1})")
+        self.frame_loss_label.setText(tr("Output: %s frames (Loss: %s)") % (output_frames, window_size-1))
 
     def _get_enhancement_params(self):
         return {
@@ -355,10 +355,10 @@ class EnhanceWidget(QWidget):
         image_stack = self.viewer.layers[layer_name].data
         params = self._get_enhancement_params()
         if not params['use_gaussian'] and not params['use_average']:
-            self.status_label.setText("❌ Select at least one filter.")
+            self.status_label.setText(f"❌ {tr('Select at least one filter.')}")
             return
         
-        self.status_label.setText("⏳ Running filters...")
+        self.status_label.setText(f"⏳ {tr('Running filters...')}")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.apply_btn.setEnabled(False)
@@ -387,7 +387,7 @@ class EnhanceWidget(QWidget):
                 "params": params
             })
 
-            self.status_label.setText(f"✅ Done. Layer: {new_layer_name}.")
+            self.status_label.setText(f"✅ {tr('Done. Layer: %s.') % new_layer_name}")
             if layer_name in self.viewer.layers:
                 self.viewer.layers[layer_name].visible = False
             self.viewer.layers.selection.active = new_layer
@@ -403,14 +403,14 @@ class EnhanceWidget(QWidget):
                     self.viewer.layers.selection.active = self.viewer.layers[src]
                 # 2. 删除当前层
                 self.viewer.layers.remove(layer)
-                self.status_label.setText("↩️ Enhancement Undone.")
+                self.status_label.setText(f"↩️ {tr('Enhancement Undone.')}")
         except Exception as e:
-            self.status_label.setText(f"❌ Error: {str(e)}")
+            self.status_label.setText(f"❌ {tr('Error:')} {str(e)}")
 
     def _on_enhance_error(self, error_msg):
         self.progress_bar.setVisible(False)
         self.apply_btn.setEnabled(True)
-        self.status_label.setText(f"❌ Filter Error: {error_msg}")
+        self.status_label.setText(f"❌ {tr('Filter Error:')} {error_msg}")
 
     def _update_histogram(self):
         layer = self.viewer.layers.selection.active
@@ -495,11 +495,11 @@ class EnhanceWidget(QWidget):
     def _apply_contrast_burn(self):
         layer = self.viewer.layers.selection.active
         if not isinstance(layer, napari.layers.Image): 
-            self.status_label.setText("❌ No image selected.")
+            self.status_label.setText(f"❌ {tr('No image selected.')}")
             return
         c_min = self.contrast_min_spin.value()
         c_max = self.contrast_max_spin.value()
-        self.status_label.setText("⏳ Applying contrast...")
+        self.status_label.setText(f"⏳ {tr('Applying contrast...')}")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.apply_contrast_btn.setEnabled(False)
@@ -565,7 +565,7 @@ class EnhanceWidget(QWidget):
                 "clipped": True
             })
 
-            self.status_label.setText(f"✅ Applied. New layer: {new_layer_name}")
+            self.status_label.setText(f"✅ {tr('Applied. New layer: %s') % new_layer_name}")
             
             # 隐藏原图层
             original_layer.visible = False
@@ -581,10 +581,10 @@ class EnhanceWidget(QWidget):
                     self.viewer.layers[src].visible = True
                     self.viewer.layers.selection.active = self.viewer.layers[src]
                 self.viewer.layers.remove(layer)
-                self.status_label.setText("↩️ Contrast Undo.")
+                self.status_label.setText(f"↩️ {tr('Contrast Undo.')}")
 
         except Exception as e:
-            self.status_label.setText(f"❌ Error: {str(e)}")
+            self.status_label.setText(f"❌ {tr('Error:')} {str(e)}")
 
     def _log_action(self, key, info):
         """使用 SessionLogger 记录操作"""

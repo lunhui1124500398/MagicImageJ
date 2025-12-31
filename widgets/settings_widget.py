@@ -5,9 +5,10 @@ from qtpy.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                             QLineEdit, QPushButton, QFormLayout, QTabWidget, 
                             QWidget, QKeySequenceEdit, QMessageBox, QSpinBox, 
                             QCheckBox, QGroupBox, QFileDialog, QDoubleSpinBox,
-                            QColorDialog, QScrollArea, QComboBox)
+                            QColorDialog, QScrollArea, QComboBox, QListWidget,
+                            QListWidgetItem)
 from qtpy.QtGui import QKeySequence, QColor
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, Signal, Qt
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,13 @@ TRANS_CN = {
     "Save & Close": "保存并关闭",
     "Language": "语言 (Language)",
     "Restart required to apply language changes fully.": "语言更改需要重启部分界面才能完全生效。",
+    "Preferences & Configuration": "首选项与配置",
+    "Reset to Defaults": "恢复默认设置",
+    "Cache Location": "缓存位置",
+    "Path:": "路径:",
+    "Settings Saved": "设置已保存",
+    "Configuration updated successfully.\nSome changes may require restarting actions or the app.": "配置已更新。\n部分更改可能需要重启操作或应用才能生效。",
+    "Error saving config:": "保存配置时出错:",
     
     # Import Widget
     "1. Data Source": "1. 数据源",
@@ -262,6 +270,9 @@ TRANS_CN = {
     "No sessions found": "未找到会话记录",
     "Start Recovery": "开始恢复",
     "Please load data sources first": "请先加载数据源",
+    "Or use Manual Mode to select a log file": "或者使用手动模式选择日志文件",
+    "Select Data Source Folder": "选择数据源文件夹",
+    "Select TIFF File": "选择TIFF文件",
     "completed": "已完成",
     "in_progress": "进行中",
     "crashed": "崩溃",
@@ -292,7 +303,254 @@ TRANS_CN = {
     "Video (MP4)": "视频 (MP4)",
     "Skip Export": "跳过导出",
 
+    # === Session Protection (新增) ===
+    "Session Management": "会话管理",
+    "Starred": "已收藏",
+    "Star Session": "收藏会话",
+    "Unstar Session": "取消收藏",
+    "Edit Label": "编辑标签",
+    "Delete Session": "删除会话",
+    "Refresh": "刷新",
     
+    # === Settings UI Specific ===
+    "Algorithm Defaults": "算法默认值",
+    "Auto-Calculate (Preview on ROI Draw)": "自动计算 (绘制 ROI 时预览)",
+    "Drift Kernel:": "漂移核大小:",
+    "Max Workers:": "最大线程数:",
+    "Interaction Settings": "交互设置",
+    "Show Warning when Clearing Overlays": "清除覆盖层时显示警告",
+    
+    "Image Enhancement Defaults": "图像增强默认值",
+    "Enable Gaussian Blur by Default": "默认启用高斯模糊",
+    "Enable Rolling Average by Default": "默认启用滚动平均",
+    "Gaussian Sigma:": "高斯 Sigma:",
+    "Roll Avg Window:": "滚动平均窗口:",
+    "Enhance Workers:": "增强处理线程数:",
+    
+    "Generated Folder Suffixes": "生成文件夹后缀",
+    "Enlarge Canvas on Rotate": "旋时扩大画布",
+    "Create Denoise Folders (LR/HR)": "创建去噪文件夹 (LR/HR)",
+    "Create Refine Folders (Mask)": "创建精修文件夹 (Mask)",
+    
+    # === Drift Widget ===
+    "Max Shift:": "最大漂移:",
+    "Previewing: %s. Press 'Crtl+Z' to Undo.": "正在预览: %s。按 'Ctrl+Z' 撤销。",
+    "ROI cleared.": "ROI 已清除。",
+    "Mode: Draw Rectangle (Auto-Preview ON)": "模式: 绘制矩形 (自动预览开启)",
+    "ROI updated. Auto-calculating...": "ROI 已更新。正在自动计算...",
+    "ROI updated. Click Recalculate.": "ROI 已更新。请点击“重新计算”。",
+    "Draw ROI first.": "请先绘制 ROI。",
+    "Invalid ROI (too small or out of bounds).": "无效 ROI (太小或超出边界)。",
+    "Calculating drift...": "正在计算漂移...",
+    "Auto-applying correction...": "正在自动应用矫正...",
+    "Calculated. Click Apply to see result.": "计算完成。点击“应用”查看结果。",
+    "Applying correction...": "正在应用矫正...",
+    "Apply Error:": "应用出错:",
+    "Undone. Adjust ROI and try again.": "已撤销。调整 ROI 并重试。",
+    "Rotation Undone.": "旋转已撤销。",
+    "Crop Undone.": "裁剪已撤销。",
+    "Enhancement Undone.": "增强已撤销。",
+    "Contrast Undo.": "对比度调整已撤销。",
+    
+    # === Import Widget ===
+    "No Dataset ID": "无数据集 ID",
+    "Auto-OL:": "自动识别 OL:",
+    "(Auto-Added)": "(自动添加)",
+    "OL Not Found": "未找到 OL 信息",
+    "Check ID": "检查 ID",
+    "Could not detect 'dataset' number.\nPlease check ID manually.": "无法检测到 'dataset' 编号。\n请手动检查 ID。",
+    "Select DM4 Image for Dose Calculation": "选择用于剂量计算的 DM4 图像",
+    "Locating file index...": "正在定位文件索引...",
+    "Selected: %s (Index: %s)": "已选: %s (索引: %s)",
+    "File not found in current structure match.": "在当前结构中未找到文件。",
+    "Error picking file:": "选择文件出错:",
+    "Scanning metadata...": "正在扫描元数据...",
+    "Folder exists:\n%s\nOverwrite?": "文件夹已存在:\n%s\n覆盖?",
+    "Checking size...": "正在检查大小...",
+    "Moving raw data...": "正在移动原始数据...",
+    "Copying raw data...": "正在复制原始数据...",
+    "Archived: %s": "已归档: %s",
+    "Source path updated to archive location.": "源路径已更新为归档位置。",
+    "Archive created successfully!": "归档创建成功!",
+    "Large dataset detected (>100GB). Original folder was MOVED to archive to save time/space.": "检测到大数据集 (>100GB)。原始文件夹已**移动**到归档以节省时间/空间。",
+    "Original folder was COPIED. Please delete the source manually if needed.": "原始文件夹已**复制**。如有需要请手动删除源文件。",
+    "Archive Complete": "归档完成",
+    "Archive Error:": "归档错误:",
+    "Confirm Load": "确认加载",
+    "Loading new data will CLEAR ALL current layers.\nContinue?": "加载新数据将清除所有当前图层。\n继续?",
+    "Loading...": "正在加载...",
+    "Loaded %s frames.": "加载了 %s 帧。",
+    
+    # === Geometry Widget ===
+    "Empty folder:": "空文件夹:",
+    "Failed to read first frame of": "读取第一帧失败:",
+    "Shortcut: Batch Export Triggered": "快捷键: 触发批量导出",
+    "Shortcut: Single Crop Triggered": "快捷键: 触发单次裁剪",
+    "Mode: Select/Adjust": "模式: 选择/调整",
+    "Mode: Draw": "模式: 绘制",
+    "Draw Horizon Line.": "绘制水平线。",
+    "Rotating...": "正在旋转...",
+    "Rotating %.1f°...": "正在旋转 %.1f°...",
+    "Rotated %.1f° (Expand=%s)": "已旋转 %.1f° (扩大画布=%s)",
+    "Error showing result:": "显示结果出错:",
+    "Rotation Error:": "旋转错误:",
+    "Applied %s flip.": "已应用 %s 翻转。",
+    "Mode: Adjust Crop Rect (Drag corners to resize)": "模式: 调整裁剪框 (拖动角调整大小)",
+    "Draw Single Crop Rect.": "绘制单次裁剪框。",
+    "Crop applied. Press '%s' to Undo.": "裁剪已应用。按 '%s' 撤销。",
+    "Resuming Draw on '%s'.": "恢复在 '%s' 上绘制。",
+    "Last ROI removed.": "撤销了上一个 ROI。",
+    "Drawing on '%s'. (New Layer)": "在 '%s' 上绘制。(新图层)",
+    "Draw Mode (double-click bg)": "绘制模式 (双击背景)",
+    "Select Mode (double-click bg to draw)": "选择模式 (双击背景以绘制)",
+    "No ROI selected. Select a green box first.": "未选择 ROI。请先选择一个绿框。",
+    "Set range '%s' for %s ROI(s).": "已为 %s 个 ROI 设置范围 '%s'。",
+    "Adjust Mode.": "调整模式。",
+    "Adjust Mode (Click bg to draw)": "调整模式 (点击背景以绘制)",
+    "Nothing to clear.": "没有可清除的内容。",
+    "Clear All Overlays?": "清除所有覆盖层?",
+    "Clear ALL temporary drawings (ROIs, Lines, etc.)?": "清除所有临时绘制 (ROI, 线条 等)?",
+    "This action cannot be undone.": "此操作无法撤销。",
+    "Do not ask again": "不再询问",
+    "Canvas cleared.": "画布已清除。",
+    "Ref image missing.": "参考图像缺失。",
+    "Save Reference Images?": "保存参考图像?",
+    "Saving ROI JSON.\nDo you also want to save the reference image(s)?": "正在保存 ROI JSON。\n您是否也想保存参考图像?",
+    "Note: Data Layer and View Layer are DIFFERENT.\nData: %s\nView: %s": "注意: 数据图层和视图图层不同。\n数据: %s\n视图: %s",
+    "Skip Images": "跳过图像",
+    "Select Layers": "选择图层",
+    "Which layer(s) should be saved as reference?": "应将哪些图层保存为参考?",
+    "Save Both": "保存两者",
+    "Data Only": "仅数据",
+    "View Only": "仅视图",
+    "Load View Layer?": "加载视图图层?",
+    "Load image for View Layer: '%s'?": "为视图图层加载图像: '%s'?",
+    "Load Data Layer?": "加载数据图层?",
+    "Load image for Data Layer: '%s'?": "为数据图层加载图像: '%s'?",
+    "Loading %s image(s)...": "正在加载 %s 张图像...",
+    "Load Error:": "加载错误:",
+    "No ROIs defined.": "未定义 ROI。",
+    "Exporting Crops...": "正在导出裁剪...",
+    "Export canceled.": "导出已取消。",
+    "Exported %s crops.": "已导出 %s 个裁剪。",
+    "Exported %s crops!\nSaved to: %s": "已导出 %s 个裁剪!\n保存至: %s",
+    "Export Error": "导出错误",
+    "Error": "错误",
+    "Error:": "错误:",
+    "Exists": "文件夹已存在",
+    "MOVE (Fast)": "移动 (快速)",
+    "COPY (Safe)": "复制 (安全)",
+    "Saved JSON": "已保存 JSON",
+    "Saved Seq": "已保存序列",
+    "Saved TIFF:": "已保存 TIFF:",
+    "Ref snap failed:": "参考快照失败:",
+    "Image Not Found": "未找到图像",
+    "Could not auto-locate image for layer:\n\n'%s'\n\nBrowse for it manually?": "无法自动定位图层图像:\n\n'%s'\n\n手动浏览?",
+    "Select Image for '%s'": "为 '%s' 选择图像",
+    "Image Source Detection Report": "图像源检测报告",
+    "View Layer": "视图图层",
+    "Found": "已找到",
+    
+    "DM4 Archive": "DM4 归档",
+    "PNG Sequence": "PNG 序列",
+    "TIFF Stack": "TIFF 堆栈",
+    "DM4 Archive path detected.\nPlease use Import tab to load the images.\n\n%s": "检测到 DM4 归档路径。\n请使用导入标签页加载图像。\n\n%s",
+    "✅ %s loaded successfully!": "✅ %s 加载成功!",
+    "Import failed: %s": "导入失败: %s",
+    "✅ PNG Sequence loaded!": "✅ PNG 序列已加载!",
+    "✅ TIFF Stack loaded!": "✅ TIFF 堆栈已加载!",
+    "DM4 loading requires the full Import workflow.\nPlease use Import tab.": "DM4 加载需要完整的导入流程。\n请使用导入标签页。",
+    "DM4 Sequence": "DM4 序列",
+    "Toggle Measurement Tool (Draw lines to measure distance)": "切换测量工具 (画线测量距离)",
+    "Last measurement removed.": "已移除最近的测量。",
+    "Measurement Mode: Draw lines to measure.(Ctrl+Z to Undo)": "测量模式: 画线测量。(Ctrl+Z 撤销)",
+    "End Measurement.": "结束测量。",
+    "Session recovery: %s actions loaded": "会话恢复: 已加载 %s 个操作",
+    "Hidden": "已隐藏",
+    "Shown": "已显示",
+    "layer controls": "图层控制",
+    
+    # === Enhance Widget ===
+    "Output: %s frames (Loss: %s)": "输出: %s 帧 (损失: %s)",
+    "Select at least one filter.": "请至少选择一个滤波器。",
+    "Running filters...": "正在运行滤波器...",
+    "Done. Layer: %s.": "完成。图层: %s。",
+    "Filter Error:": "滤波器错误:",
+    "No image selected.": "未选择图像。",
+    "Applied. New layer: %s": "已应用。新图层: %s",
+    
+    # === Export Widget ===
+    "Export function returned False.": "导出函数返回失败。",
+    "Higher is better, but larger filesize.": "越高越好，但文件更大。",
+    "No path selected": "未选择路径",
+    "Ready": "就绪",
+    "Check inputs": "检查输入",
+    "Missing Annotations": "缺少标注",
+    "You are exporting a video WITHOUT Scale Bar or Timestamp.\n\nAre you sure?": "您正在导出没有比例尺或时间戳的视频。\n\n确定吗?",
+    "Exporting...": "正在导出...",
+    "Invalid frame range syntax": "无效的帧范围语法",
+    "Done: %s": "完成: %s",
+    
+    # === Annotation Widget ===
+    "Ready.": "就绪。",
+    "1 px =": "1 px =",
+    "Preview Active.": "预览已激活。",
+    "Initializing Preview Layer...": "正在初始化预览图层...",
+    "Burning annotations...": "正在烧录标注...",
+    "Done.": "完成。",
+    "Cleared.": "已清除。",
+    
+    "Main Suffix:": "主后缀:",
+    "LR Suffix:": "LR 后缀:",
+    "HR Suffix:": "HR 后缀:",
+    "Mask Suffix:": "Mask 后缀:",
+    "New Mask Suffix:": "新 Mask 后缀:",
+    
+    "Measure Tool": "测量工具",
+    "Line Color:": "线条颜色:",
+    "Width:": "宽度:",
+    "Font Size:": "字体大小:",
+    "Simple Crop": "简单裁剪",
+    "Box Color:": "边框颜色:",
+    "Batch Crop": "批量裁剪",
+    
+    "Resource Thresholds": "资源阈值",
+    "RAM vs Disk Limit:": "RAM vs 磁盘限制:",
+    "If an array exceeds this size, create it on Disk (memmap).": "如果数组超过此大小，则在磁盘上创建 (memmap)。",
+    "Memmap Warning Threshold:": "Memmap 警告阈值:",
+    "Show warning if single allocation exceeds this size (Check RAM vs C: drive).": "如果单次分配超过此大小则显示警告 (检查 RAM vs C盘)。",
+    "Disk Space Warning:": "磁盘空间警告:",
+    "Warn if cache folder usage exceeds this size.": "如果缓存文件夹占用超过此大小则警告。",
+    "Move vs Copy Limit:": "移动 vs 复制限制:",
+    "If raw data folder > this size, MOVE instead of COPY during archive.": "如果原始数据文件夹 > 此大小，归档时使用剪切而非复制。",
+    
+    "starred sessions": "个收藏会话",
+    "protected sessions": "个受保护会话",
+    "normal sessions": "个普通会话",
+    "Archive Protected": "归档保护",
+    "Total": "总计",
+    "Enter label for this session:": "请输入此会话的标签:",
+    "Session Label": "会话标签",
+    "Are you sure you want to delete this session?": "确定要删除此会话吗?",
+    "Session deleted": "会话已删除",
+    "Many Starred Sessions": "收藏会话较多",
+    "You have {0} starred sessions. Consider cleaning up unused ones.": "您有 {0} 个收藏会话。建议清理不再需要的会话。",
+    "Don't remind me for {0} days": "{0} 天内不再提醒",
+    "Never remind me": "永不提醒",
+    "Remind me later": "稍后提醒",
+    "Open Management": "打开管理",
+    "Star this session?": "是否收藏此会话?",
+    "Session recovered successfully. Would you like to star it for future reference?": "会话恢复成功。是否收藏以便将来参考?",
+    "Starred Reminder Threshold:": "收藏提醒阈值:",
+    "Show reminder when starred sessions exceed this count.": "收藏会话超过此数量时显示提醒。",
+    "Reminder Cooldown (days):": "提醒冷却期 (天):",
+    "0 = never remind": "0 = 永不提醒",
+    "Please select a session first.": "请先选择一个会话。",
+    "Star / Unstar Session": "收藏/取消收藏会话",
+    "Edit Session Label": "编辑会话标签",
+    "actions": "个操作",
+    
+
     # Enhance Widget
     "1. Filters": "1. 滤波器",
     "2. Contrast & Brightness (Post-Process)": "2. 对比度与亮度 (后处理)",
@@ -524,7 +782,16 @@ class GlobalConfig:
         "session_max_keep": 20,  # 最大保留会话数
         "session_recovery_mode": "review",  # 恢复模式: "auto"(全自动) 或 "review"(每步确认)
         "session_auto_detect_source": True,  # 恢复前自动检测数据源
-        "session_confirm_export": True  # 导出操作前询问用户
+        "session_confirm_export": True,  # 导出操作前询问用户
+        
+        # Session Protection (新增)
+        "session_starred_reminder_threshold": 20,  # 收藏超过此数量时显示提醒
+        "session_starred_reminder_cooldown_days": 30,  # 提醒冷却期 (天), 0=永不提醒
+        "session_last_starred_reminder": "",  # 上次提醒时间 (ISO格式)
+        
+        # Session Shortcuts (新增)
+        "shortcut_session_star": "S",  # 收藏快捷键
+        "shortcut_session_label": "L"  # 编辑标签快捷键
     }
 
     @classmethod
@@ -864,9 +1131,18 @@ class SettingsDialog(QDialog):
         return w
     
     def _create_session_tab(self):
-        """Session & Recovery 标签页"""
+        """Session & Recovery 标签页 (含会话管理面板)"""
         w = QWidget()
+        main_layout = QVBoxLayout()
+        
+        # 使用 Splitter 分割上下两部分
+        from qtpy.QtWidgets import QSplitter
+        splitter = QSplitter(Qt.Vertical)
+        
+        # === 上半部分: 设置 ===
+        settings_widget = QWidget()
         l = QVBoxLayout()
+        l.setContentsMargins(0, 0, 0, 0)
         
         # === Group 1: Log Directory ===
         g_log = QGroupBox(tr("Session Log Settings"))
@@ -915,41 +1191,278 @@ class SettingsDialog(QDialog):
         self.session_auto_import.setToolTip(tr("If checked, will try to auto-load data files. Otherwise manual selection only."))
         f_rec.addRow(self.session_auto_import)
         
+        # 最大保留会话数
+        self.session_max_keep = QSpinBox()
+        self.session_max_keep.setRange(5, 200)
+        self.session_max_keep.setValue(int(GlobalConfig.get("session_max_keep") or 20))
+        self.session_max_keep.setToolTip(tr("Older sessions will be automatically cleaned up."))
+        f_rec.addRow(tr("Max Sessions to Keep:"), self.session_max_keep)
+        
+        # 收藏提醒阈值
+        self.session_starred_threshold = QSpinBox()
+        self.session_starred_threshold.setRange(5, 100)
+        self.session_starred_threshold.setValue(int(GlobalConfig.get("session_starred_reminder_threshold") or 20))
+        self.session_starred_threshold.setToolTip(tr("Show reminder when starred sessions exceed this count."))
+        f_rec.addRow(tr("Starred Reminder Threshold:"), self.session_starred_threshold)
+        
+        # 提醒冷却期 (注意: 0 是有效值，不能用 or)
+        self.session_reminder_cooldown = QSpinBox()
+        self.session_reminder_cooldown.setRange(0, 365)
+        cooldown_val = GlobalConfig.get("session_starred_reminder_cooldown_days")
+        self.session_reminder_cooldown.setValue(int(cooldown_val) if cooldown_val is not None else 30)
+        self.session_reminder_cooldown.setToolTip(tr("0 = never remind"))
+        self.session_reminder_cooldown.setSuffix(" days")
+        f_rec.addRow(tr("Reminder Cooldown (days):"), self.session_reminder_cooldown)
+        
         g_rec.setLayout(f_rec)
         l.addWidget(g_rec)
         
-        # === Group 3: 日志位置信息 ===
-        g_info = QGroupBox(tr("Session Log Location"))
-        f_info = QVBoxLayout()
+        settings_widget.setLayout(l)
+        splitter.addWidget(settings_widget)
         
-        # 显示系统默认路径
+        # === 下半部分: 会话管理面板 ===
+        g_mgmt = QGroupBox(f"📋 {tr('Session Management')}")
+        mgmt_layout = QVBoxLayout()
+        
+        # 会话列表
+        self.session_list = QListWidget()
+        self.session_list.setSelectionMode(QListWidget.SingleSelection)
+        self.session_list.itemDoubleClicked.connect(self._edit_session_label)  # 双击编辑标签
+        self.session_list.setStyleSheet("""
+            QListWidget::item { padding: 6px; border-bottom: 1px solid #444; }
+            QListWidget::item:selected { background-color: #2196F3; }
+        """)
+        mgmt_layout.addWidget(self.session_list)
+        
+        # 设置快捷键
+        from qtpy.QtWidgets import QShortcut
+        from qtpy.QtGui import QKeySequence
+        star_key = str(GlobalConfig.get("shortcut_session_star") or "S")
+        label_key = str(GlobalConfig.get("shortcut_session_label") or "L")
+        QShortcut(QKeySequence(star_key), self, self._toggle_session_star)
+        QShortcut(QKeySequence(label_key), self, self._edit_session_label)
+        
+        # 操作按钮行
+        h_actions = QHBoxLayout()
+        
+        btn_star = QPushButton(f"⭐ {tr('Star Session')}")
+        btn_star.clicked.connect(self._toggle_session_star)
+        h_actions.addWidget(btn_star)
+        self._btn_star = btn_star
+        
+        btn_label = QPushButton(f"🏷️ {tr('Edit Label')}")
+        btn_label.clicked.connect(self._edit_session_label)
+        h_actions.addWidget(btn_label)
+        
+        btn_delete = QPushButton(f"🗑️ {tr('Delete Session')}")
+        btn_delete.clicked.connect(self._delete_session)
+        btn_delete.setStyleSheet("background-color: #8B0000;")
+        h_actions.addWidget(btn_delete)
+        
+        btn_refresh = QPushButton(f"🔄 {tr('Refresh')}")
+        btn_refresh.clicked.connect(self._refresh_session_list)
+        h_actions.addWidget(btn_refresh)
+        
+        mgmt_layout.addLayout(h_actions)
+        
+        # 统计标签
+        self.session_stats_label = QLabel("")
+        self.session_stats_label.setStyleSheet("color: #888; font-size: 9pt; padding: 4px;")
+        mgmt_layout.addWidget(self.session_stats_label)
+        
+        g_mgmt.setLayout(mgmt_layout)
+        splitter.addWidget(g_mgmt)
+        
+        # 设置 splitter 比例
+        splitter.setSizes([250, 350])
+        
+        main_layout.addWidget(splitter)
+        
+        # 底部: 日志位置和快捷操作
+        h_bottom = QHBoxLayout()
+        
         from pathlib import Path
         default_path = Path.home() / ".napari_tem" / "sessions"
-        self.lbl_default_path = QLabel(f"<b>{tr('System Default Path')}:</b><br><code>{default_path}</code>")
-        self.lbl_default_path.setWordWrap(True)
-        self.lbl_default_path.setStyleSheet("background: #333; padding: 8px; border-radius: 4px;")
-        f_info.addWidget(self.lbl_default_path)
+        lbl_path = QLabel(f"📁 {default_path}")
+        lbl_path.setStyleSheet("color: #666; font-size: 9pt;")
+        h_bottom.addWidget(lbl_path)
         
-        h_btns = QHBoxLayout()
+        h_bottom.addStretch()
         
-        # 打开日志文件夹按钮
         btn_open_folder = QPushButton(f"📂 {tr('Open Log Folder')}")
         btn_open_folder.clicked.connect(self._open_log_folder)
-        h_btns.addWidget(btn_open_folder)
+        h_bottom.addWidget(btn_open_folder)
         
-        # 手动恢复按钮
         btn_manual_recovery = QPushButton(f"🔄 {tr('Manual Recovery')}")
         btn_manual_recovery.clicked.connect(self._trigger_manual_recovery)
         btn_manual_recovery.setStyleSheet("background-color: #2196F3;")
-        h_btns.addWidget(btn_manual_recovery)
+        h_bottom.addWidget(btn_manual_recovery)
         
-        f_info.addLayout(h_btns)
-        g_info.setLayout(f_info)
-        l.addWidget(g_info)
+        main_layout.addLayout(h_bottom)
         
-        l.addStretch()
-        w.setLayout(l)
+        w.setLayout(main_layout)
+        
+        # 初始加载会话列表
+        self._refresh_session_list()
+        
         return w
+    
+    def _refresh_session_list(self):
+        """刷新会话列表"""
+        from utils.session_logger import SessionLogger
+        from pathlib import Path
+        import datetime
+        
+        self.session_list.clear()
+        self._session_data = []  # 存储会话数据供后续操作
+        
+        # 获取所有会话
+        sessions = SessionLogger.find_all_sessions(limit=100)
+        
+        # 统计
+        starred_count = 0
+        archive_protected_count = 0
+        
+        # 获取归档路径
+        from qtpy.QtCore import QSettings
+        archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+        archive_dir = Path(archive_path) if archive_path else None
+        
+        for session_path in sessions:
+            summary = SessionLogger.get_session_summary(session_path)
+            if not summary:
+                continue
+            
+            self._session_data.append(summary)
+            
+            # 判断保护状态
+            is_archive_protected = False
+            if archive_dir and archive_dir.exists():
+                try:
+                    session_path.resolve().relative_to(archive_dir.resolve())
+                    is_archive_protected = True
+                    archive_protected_count += 1
+                except ValueError:
+                    pass
+            
+            is_starred = summary.get("starred", False)
+            if is_starred:
+                starred_count += 1
+            
+            # 构建显示文本
+            star_icon = "⭐ " if is_starred else "   "
+            archive_icon = "🔒" if is_archive_protected else ""
+            label = summary.get("label", "")
+            label_text = f"[{label}] " if label else ""
+            
+            # 时间格式化
+            created_at = summary.get("created_at", "")
+            try:
+                dt = datetime.datetime.fromisoformat(created_at)
+                time_str = dt.strftime("%m-%d %H:%M")
+            except:
+                time_str = created_at[:16] if created_at else ""
+            
+            status = summary.get("status", "unknown")
+            status_icon = {
+                "completed": "✅",
+                "in_progress": "🔄",
+                "crashed": "💥",
+                "recovered": "♻️",
+                "abandoned": "❌"
+            }.get(status, "❓")
+            
+            meta = summary.get("metadata", {})
+            substance = meta.get("substance", "")
+            actions_count = summary.get("actions_count", 0)
+            
+            # 显示格式: ⭐ 🔒 [标签] 物质名 ✅ 时间 (N个操作)
+            display_text = f"{star_icon}{archive_icon}{label_text}{substance or summary['session_id']} {status_icon} {time_str} ({actions_count}{tr('actions')})"
+            
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, len(self._session_data) - 1)  # 存储索引
+            self.session_list.addItem(item)
+        
+        # 更新统计
+        normal_count = len(self._session_data) - starred_count - archive_protected_count
+        self.session_stats_label.setText(
+            f"{tr('Total')}: {len(self._session_data)} | "
+            f"⭐ {starred_count} {tr('starred sessions')} | "
+            f"🔒 {archive_protected_count} {tr('protected sessions')} | "
+            f"📋 {normal_count} {tr('normal sessions')}"
+        )
+    
+    def _get_selected_session(self):
+        """获取当前选中的会话数据"""
+        items = self.session_list.selectedItems()
+        if not items:
+            return None
+        idx = items[0].data(Qt.UserRole)
+        if idx is not None and idx < len(self._session_data):
+            return self._session_data[idx]
+        return None
+    
+    def _toggle_session_star(self):
+        """切换收藏状态"""
+        from utils.session_logger import SessionLogger
+        
+        session = self._get_selected_session()
+        if not session:
+            QMessageBox.warning(self, tr("Warning"), tr("Please select a session first."))
+            return
+        
+        path = session.get("path")
+        current_starred = session.get("starred", False)
+        new_starred = not current_starred
+        
+        if SessionLogger.update_session_file(path, starred=new_starred):
+            self._refresh_session_list()
+    
+    def _edit_session_label(self):
+        """编辑会话标签"""
+        from utils.session_logger import SessionLogger
+        from qtpy.QtWidgets import QInputDialog
+        
+        session = self._get_selected_session()
+        if not session:
+            QMessageBox.warning(self, tr("Warning"), tr("Please select a session first."))
+            return
+        
+        path = session.get("path")
+        current_label = session.get("label", "")
+        
+        new_label, ok = QInputDialog.getText(
+            self, tr("Session Label"), 
+            tr("Enter label for this session:"),
+            text=current_label
+        )
+        
+        if ok:
+            if SessionLogger.update_session_file(path, label=new_label):
+                self._refresh_session_list()
+    
+    def _delete_session(self):
+        """删除会话"""
+        session = self._get_selected_session()
+        if not session:
+            QMessageBox.warning(self, tr("Warning"), tr("Please select a session first."))
+            return
+        
+        path = session.get("path")
+        
+        reply = QMessageBox.question(
+            self, tr("Delete Session"),
+            tr("Are you sure you want to delete this session?"),
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                path.unlink()
+                QMessageBox.information(self, tr("Delete Session"), tr("Session deleted"))
+                self._refresh_session_list()
+            except Exception as e:
+                QMessageBox.critical(self, tr("Error"), f"Failed to delete: {e}")
 
     def _create_shortcuts_tab(self):
         w = QWidget()
@@ -959,7 +1472,9 @@ class SettingsDialog(QDialog):
             "shortcut_toggle_ui": tr("Toggle Layer Controls"),
             "shortcut_undo_drift": tr("Undo / Clear ROI"),
             "shortcut_apply_crop": tr("Apply Crop / Export"),
-            "shortcut_switch_mode": tr("Switch Draw/Select Mode")
+            "shortcut_switch_mode": tr("Switch Draw/Select Mode"),
+            "shortcut_session_star": tr("Star / Unstar Session"),
+            "shortcut_session_label": tr("Edit Session Label")
         }
         for key, label in shortcuts_map.items():
             val = str(GlobalConfig.get(key))
@@ -1033,6 +1548,9 @@ class SettingsDialog(QDialog):
             GlobalConfig.set("session_dataset_default", self.session_dataset.text(), emit_signal=False)
             GlobalConfig.set("session_ask_on_recovery", self.session_ask_recovery.isChecked(), emit_signal=False)
             GlobalConfig.set("session_auto_import_data", self.session_auto_import.isChecked(), emit_signal=False)
+            GlobalConfig.set("session_max_keep", self.session_max_keep.value(), emit_signal=False)
+            GlobalConfig.set("session_starred_reminder_threshold", self.session_starred_threshold.value(), emit_signal=False)
+            GlobalConfig.set("session_starred_reminder_cooldown_days", self.session_reminder_cooldown.value(), emit_signal=False)
 
         # Save Shortcuts
         for key, edit in self.key_edits.items():

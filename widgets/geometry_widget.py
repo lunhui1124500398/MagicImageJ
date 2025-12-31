@@ -66,13 +66,13 @@ class BatchImageLoaderThread(QThread):
                     # 读取文件夹下的所有图像
                     files = sorted([f for f in path.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.tif', '.tiff']])
                     if not files:
-                        self.error.emit(f"Empty folder: {name}")
+                        self.error.emit(tr("Empty folder:") + f" {name}")
                         continue
                     
                     # 读取第一帧获取尺寸和类型
                     first = cv2.imread(str(files[0]), cv2.IMREAD_UNCHANGED)
                     if first is None: 
-                        self.error.emit(f"Failed to read first frame of {name}")
+                        self.error.emit(tr("Failed to read first frame of") + f" {name}")
                         continue
                     
                     # 预分配内存
@@ -595,20 +595,20 @@ class GeometryWidget(QWidget):
     def _on_shortcut_apply(self, viewer):
         if "Batch_ROI" in self.viewer.layers and len(self.viewer.layers["Batch_ROI"].data) > 0:
             self._export_batch_crops()
-            self.status_label.setText("⚡ Shortcut: Batch Export Triggered")
+            self.status_label.setText(f"⚡ {tr('Shortcut: Batch Export Triggered')}")
         elif "Crop_ROI" in self.viewer.layers and len(self.viewer.layers["Crop_ROI"].data) > 0:
             self._apply_crop()
-            self.status_label.setText("⚡ Shortcut: Single Crop Triggered")
+            self.status_label.setText(f"⚡ {tr('Shortcut: Single Crop Triggered')}")
 
     def _on_shortcut_switch(self, viewer):
         if "Batch_ROI" in self.viewer.layers:
             layer = self.viewer.layers["Batch_ROI"]
             if layer.mode == 'add_rectangle':
                 layer.mode = 'select'
-                self.status_label.setText("⚡ Mode: Select/Adjust")
+                self.status_label.setText(f"⚡ {tr('Mode: Select/Adjust')}")
             else:
                 layer.mode = 'add_rectangle'
-                self.status_label.setText("⚡ Mode: Draw")
+                self.status_label.setText(f"⚡ {tr('Mode: Draw')}")
 
     def _refresh_layers(self, event=None):
         layers = [
@@ -728,7 +728,7 @@ class GeometryWidget(QWidget):
         layer = self.viewer.add_shapes(name="Rotation_Line", shape_type='line', edge_color='cyan', edge_width=4)
         layer.events.data.connect(self._auto_calculate_angle)
         layer.mode = 'add_line'
-        self.status_label.setText("✏️ Draw Horizon Line.")
+        self.status_label.setText(f"✏️ {tr('Draw Horizon Line.')}")
 
     def _auto_calculate_angle(self, event=None):
         layer = self.viewer.layers["Rotation_Line"]
@@ -746,8 +746,8 @@ class GeometryWidget(QWidget):
         angle = self.angle_spin.value()
         expand = self.enlarge_check.isChecked()
         image_stack = self.viewer.layers[layer_name].data
-        self.status_label.setText("⏳ Rotating...")
-        self.rot_progress = QProgressDialog(f"Rotating {angle:.1f}°...", "Cancel", 0, len(image_stack), self)
+        self.status_label.setText(f"⏳ {tr('Rotating...')}")
+        self.rot_progress = QProgressDialog(tr("Rotating %.1f°...") % angle, "Cancel", 0, len(image_stack), self)
         self.rot_progress.setWindowModality(Qt.WindowModal)
         self.rot_progress.show()
         
@@ -772,8 +772,8 @@ class GeometryWidget(QWidget):
                         self.viewer.layers[src].visible = True
                         self.viewer.layers.selection.active = self.viewer.layers[src]
                     self.viewer.layers.remove(layer)
-                    self.status_label.setText("↩️ Rotation Undone.")
-                self.status_label.setText(f"✅ Rotated {angle:.1f}° (Expand={expand})")
+                    self.status_label.setText(f"↩️ {tr('Rotation Undone.')}")
+                self.status_label.setText(f"✅ {tr('Rotated %.1f° (Expand=%s)') % (angle, expand)}")
                 
                 # === [日志记录] 旋转操作 ===
                 try:
@@ -784,11 +784,11 @@ class GeometryWidget(QWidget):
                     })
                 except: pass
             except Exception as e:
-                self.status_label.setText(f"Error showing result: {e}")
+                self.status_label.setText(f"{tr('Error showing result:')} {e}")
         
         def on_error(err):
             self.rot_progress.close()
-            self.status_label.setText(f"❌ Rotation Error: {err}")
+            self.status_label.setText(f"❌ {tr('Rotation Error:')} {err}")
 
         self.rot_thread.finished.connect(on_finished)
         self.rot_thread.error.connect(on_error)
@@ -806,7 +806,7 @@ class GeometryWidget(QWidget):
             self.rotate_layer_combo.setCurrentText(new_name)
             self.simple_crop_combo.setCurrentText(new_name)
             self.viewer.layers.selection.active = self.viewer.layers[new_name]
-            self.status_label.setText(f"✅ Applied {direction} flip.")
+            self.status_label.setText(f"✅ {tr('Applied %s flip.') % direction}")
             
             # === [日志记录] 翻转操作 ===
             try:
@@ -832,10 +832,10 @@ class GeometryWidget(QWidget):
             if layer.mode == 'add_rectangle' and len(layer.data) > 0:
                 layer.mode = 'select'
                 self.viewer.layers.selection.active = layer
-                self.status_label.setText("🖐️ Mode: Adjust Crop Rect (Drag corners to resize)")
+                self.status_label.setText(f"🖐️ {tr('Mode: Adjust Crop Rect (Drag corners to resize)')}")
 
         layer.events.data.connect(on_data_change)
-        self.status_label.setText("✏️ Draw Single Crop Rect.")
+        self.status_label.setText(f"✏️ {tr('Draw Single Crop Rect.')}")
 
     def _apply_crop(self):
         target = self.simple_crop_combo.currentText()
@@ -869,9 +869,9 @@ class GeometryWidget(QWidget):
                 self.viewer.layers[target].visible = True
                 self.viewer.layers.selection.active = self.viewer.layers[target]
             self._draw_crop_rect()
-            self.status_label.setText("↩️ Crop Undone.")
+            self.status_label.setText(f"↩️ {tr('Crop Undone.')}")
 
-        self.status_label.setText(f"✅ Crop applied. Press '{undo_key}' to Undo.")
+        self.status_label.setText(f"""✅ {tr("Crop applied. Press '%s' to Undo.") % undo_key}""")
         
         # === [日志记录] 裁剪操作 ===
         try:
@@ -899,7 +899,7 @@ class GeometryWidget(QWidget):
 
             self._bind_smart_mode_switch(layer)
             
-            self.status_label.setText(f"✏️ Resuming Draw on '{view_layer}'.")
+            self.status_label.setText(f"""✏️ {tr("Resuming Draw on '%s'.") % view_layer}""")
             self._clear_residue(["Crop_ROI", "Rotation_Line", "Interaction_Box","Drift_ROI","Measurements"]) 
             if self.lock_view_check.isChecked():
                 self._force_view_active = True
@@ -956,13 +956,13 @@ class GeometryWidget(QWidget):
                     layer.data = layer.data[:-1]
                     layer.features = {k: v[:-1] for k, v in layer.features.items()}
                     layer.selected_data = set()
-                    self.status_label.setText("↩️ Last ROI removed.")
+                    self.status_label.setText(f"↩️ {tr('Last ROI removed.')}")
                 except: pass
                 finally:
                     self._is_updating = False
                     layer.refresh()
         switch_key = GlobalConfig.get_napari_shortcut("shortcut_switch_mode")
-        self.status_label.setText(f"✏️ Drawing on '{view_layer}'. (New Layer)")
+        self.status_label.setText(f"""✏️ {tr("Drawing on '%s'. (New Layer)") % view_layer}""")
         self._last_shape_count = 0
     
     def _bind_smart_mode_switch(self, layer):
@@ -1002,7 +1002,7 @@ class GeometryWidget(QWidget):
             if not clicked_on_shape:
                 layer.mode = 'add_rectangle'
                 layer.selected_data = set()
-                self.status_label.setText("✏️ Draw Mode (double-click bg)")
+                self.status_label.setText(f"✏️ {tr('Draw Mode (double-click bg)')}")
         
         # === 【可选】单击背景取消选择（不切换模式）===
         self._is_dragging = False
@@ -1043,7 +1043,7 @@ class GeometryWidget(QWidget):
                     
                     if not clicked_on_shape:
                         layer.selected_data = set()
-                        self.status_label.setText("🖐️ Select Mode (double-click bg to draw)")
+                        self.status_label.setText(f"🖐️ {tr('Select Mode (double-click bg to draw)')}")
                 
                 self._press_pos = None
                 self._is_dragging = False
@@ -1129,7 +1129,7 @@ class GeometryWidget(QWidget):
         
         selected_idxs = list(layer.selected_data)
         if not selected_idxs:
-            self.status_label.setText("⚠️ No ROI selected. Select a green box first.")
+            self.status_label.setText(f"⚠️ {tr('No ROI selected. Select a green box first.')}")
             return
         
         range_str = self.batch_frame_edit.text().strip()
@@ -1161,12 +1161,12 @@ class GeometryWidget(QWidget):
         }
         
         layer.refresh()
-        self.status_label.setText(f"✅ Set range '{range_str}' for {len(selected_idxs)} ROI(s).")
+        self.status_label.setText(f"""✅ {tr("Set range '%s' for %s ROI(s).") % (range_str, len(selected_idxs))}""")
 
     def _switch_to_select_mode(self):
         if "Batch_ROI" in self.viewer.layers:
             self.viewer.layers["Batch_ROI"].mode = 'select'
-            self.status_label.setText("🖐️ Adjust Mode.")
+            self.status_label.setText(f"🖐️ {tr('Adjust Mode.')}")
 
     def _on_batch_data_change(self, event=None):
         if self._is_updating: return
@@ -1259,7 +1259,7 @@ class GeometryWidget(QWidget):
         if should_switch_to_select:
             layer.selected_data = {current_count - 1}
             layer.mode = 'select'
-            self.status_label.setText("🖐️ Adjust Mode (Click bg to draw)")
+            self.status_label.setText(f"🖐️ {tr('Adjust Mode (Click bg to draw)')}")
         
         # === [SessionLogger] 记录 ROI 快照用于恢复 ===
         try:
@@ -1290,19 +1290,19 @@ class GeometryWidget(QWidget):
         
         has_residue = any(name in self.viewer.layers for name in targets)
         if not has_residue:
-            self.status_label.setText("⚠️ Nothing to clear.")
+            self.status_label.setText(f"⚠️ {tr('Nothing to clear.')}")
             return
 
         if GlobalConfig.get("show_clear_warning"):
             msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Clear All Overlays?")
-            msg_box.setText("Clear ALL temporary drawings (ROIs, Lines, etc.)?")
-            msg_box.setInformativeText("This action cannot be undone.")
+            msg_box.setWindowTitle(tr("Clear All Overlays?"))
+            msg_box.setText(tr("Clear ALL temporary drawings (ROIs, Lines, etc.)?"))
+            msg_box.setInformativeText(tr("This action cannot be undone."))
             msg_box.setIcon(QMessageBox.Warning)
             msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
             msg_box.setDefaultButton(QMessageBox.No)
             
-            cb_dont_ask = QCheckBox("Do not ask again")
+            cb_dont_ask = QCheckBox(tr("Do not ask again"))
             msg_box.setCheckBox(cb_dont_ask)
             
             if msg_box.exec_() == QMessageBox.No: return
@@ -1311,7 +1311,7 @@ class GeometryWidget(QWidget):
                 GlobalConfig.set("show_clear_warning", False)
 
         self._clear_residue(targets)
-        self.status_label.setText("🗑️ Canvas cleared.")
+        self.status_label.setText(f"🗑️ {tr('Canvas cleared.')}")
         if hasattr(self, '_last_shape_count'): self._last_shape_count = 0
 
     def _detect_image_source(self, base_path, layer_name):
@@ -1360,7 +1360,7 @@ class GeometryWidget(QWidget):
         data_layer_name = self.batch_data_combo.currentText()
         
         if not view_layer_name or view_layer_name not in self.viewer.layers:
-            self.status_label.setText("❌ Ref image missing.")
+            self.status_label.setText(f"❌ {tr('Ref image missing.')}")
             return
         
         # 确定保存策略
@@ -1376,7 +1376,7 @@ class GeometryWidget(QWidget):
         
         text = tr("Saving ROI JSON.\nDo you also want to save the reference image(s)?")
         if not layers_are_same:
-            text += f"\n\nNote: Data Layer and View Layer are DIFFERENT.\nData: {data_layer_name}\nView: {view_layer_name}"
+            text += "\n\n" + tr("Note: Data Layer and View Layer are DIFFERENT.\nData: %s\nView: %s") % (data_layer_name, view_layer_name)
         msg_box.setText(text)
         
         # 按钮设计
@@ -1480,7 +1480,7 @@ class GeometryWidget(QWidget):
                 elif format_ext == 'tiff':
                     tiff_path = json_path.parent / f"{safe_name}.tiff"
                     if export_to_tiff_stack(layer_obj.data, str(tiff_path)):
-                        msg += f"\nSaved TIFF: {tiff_path.name}"
+                        msg += f"\n{tr('Saved TIFF:')} {tiff_path.name}"
 
             # 3. 总是保存一张 Ref Snapshot (PNG) 方便快速预览
             ref_png = json_path.with_name(json_path.stem + "_ref.png")
@@ -1527,7 +1527,7 @@ class GeometryWidget(QWidget):
             
             draw.text((10, 10), f"Ref Frame: {idx}\nLayer: {img_layer.name}", fill="yellow", font=font)
             pil_img.save(save_path)
-        except Exception as e: print(f"Ref snap failed: {e}")
+        except Exception as e: print(f"{tr('Ref snap failed:')} {e}")
 
     # =========================================================
     #  新增辅助函数：负责弹窗询问 + 文件选择 + 模式判断
@@ -1539,8 +1539,8 @@ class GeometryWidget(QWidget):
         """
         reply = QMessageBox.question(
             self, 
-            f"{title_prefix}Image Not Found", 
-            f"Could not auto-locate image for layer:\n\n'{layer_name}'\n\nBrowse for it manually?",
+            f"{title_prefix}{tr('Image Not Found')}", 
+            tr("Could not auto-locate image for layer:\n\n'%s'\n\nBrowse for it manually?") % layer_name,
             QMessageBox.Yes | QMessageBox.No
         )
         
@@ -1551,7 +1551,7 @@ class GeometryWidget(QWidget):
         start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
         path_str, _ = QFileDialog.getOpenFileName(
             self, 
-            f"Select Image for '{layer_name}'", 
+            tr("Select Image for '%s'") % layer_name, 
             start_dir, 
             "Images (*.tiff *.tif *.png *.jpg *.bmp)"
         )
@@ -1660,19 +1660,19 @@ class GeometryWidget(QWidget):
                 else:
                     # View Layer -> 选一次
                     # 询问是否需要加载 View
-                    if QMessageBox.question(self, "Load View Layer?", f"Load image for View Layer: '{view_name}'?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                    if QMessageBox.question(self, tr("Load View Layer?"), tr("Load image for View Layer: '%s'?") % view_name, QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
                         p_v, m_v = self._prompt_user_for_file(view_name, title_prefix="[View Layer] ")
                         if p_v: tasks_to_run.append({'path': p_v, 'mode': m_v, 'name': view_name, 'role': 'view'})
                     
                     # Data Layer -> 选一次
-                    if QMessageBox.question(self, "Load Data Layer?", f"Load image for Data Layer: '{data_name}'?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                    if QMessageBox.question(self, tr("Load Data Layer?"), tr("Load image for Data Layer: '%s'?") % data_name, QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
                         p_d, m_d = self._prompt_user_for_file(data_name, title_prefix="[Data Layer] ")
                         if p_d: tasks_to_run.append({'path': p_d, 'mode': m_d, 'name': data_name, 'role': 'data'})
 
             # 5. 提交任务给后台线程
             if tasks_to_run:
                 count = len(tasks_to_run)
-                self.load_progress = QProgressDialog(f"Loading {count} image(s)...", "Cancel", 0, 0, self)
+                self.load_progress = QProgressDialog(tr("Loading %s image(s)...") % count, tr("Cancel"), 0, 0, self)
                 self.load_progress.setWindowModality(Qt.WindowModal)
                 self.load_progress.show()
                 
@@ -1683,7 +1683,7 @@ class GeometryWidget(QWidget):
                 self.loader_thread.item_ready.connect(self._on_single_image_loaded)
                 # 全部完成后，关闭进度条并加载 ROI
                 self.loader_thread.finished_all.connect(lambda: (self.load_progress.close(), self._restore_rois_to_layer(data_dump)))
-                self.loader_thread.error.connect(lambda e: self.status_label.setText(f"Load Error: {e}"))
+                self.loader_thread.error.connect(lambda e: self.status_label.setText(f"{tr('Load Error:')} {e}"))
                 
                 self.loader_thread.start()
             else:
@@ -1772,7 +1772,7 @@ class GeometryWidget(QWidget):
         data_layer_name = self.batch_data_combo.currentText()
         view_layer_name = self.batch_view_combo.currentText()
         if "Batch_ROI" not in self.viewer.layers or not len(self.viewer.layers["Batch_ROI"].data):
-            self.status_label.setText("❌ No ROIs defined.")
+            self.status_label.setText(f"❌ {tr('No ROIs defined.')}")
             return
         if not data_layer_name or data_layer_name not in self.viewer.layers: return
 
@@ -1843,7 +1843,7 @@ class GeometryWidget(QWidget):
         }
 
         # 5. UI 进度
-        self.batch_progress = QProgressDialog("Exporting Crops...", "Cancel", 0, len(rois), self)
+        self.batch_progress = QProgressDialog(tr("Exporting Crops..."), tr("Cancel"), 0, len(rois), self)
         self.batch_progress.setWindowModality(Qt.WindowModal)
         self.batch_progress.setMinimumDuration(0)
         self.batch_progress.canceled.connect(self._on_export_cancel)
@@ -1863,7 +1863,7 @@ class GeometryWidget(QWidget):
     def _on_export_cancel(self):
         if self.export_thread.isRunning():
             self.export_thread.requestInterruption()
-            self.status_label.setText("⚠️ Export canceled.")
+            self.status_label.setText(f"⚠️ {tr('Export canceled.')}")
 
     def _on_export_finished(self, count, path_name, view_stack, rois, sub_name, output_dir, frame_idx):
         self.batch_progress.close()
@@ -1871,14 +1871,14 @@ class GeometryWidget(QWidget):
         # [Req 6] 使用指定的 frame_idx
         self._create_overview_map(view_stack, rois, sub_name, output_dir, frame_idx)
         
-        self.status_label.setText(f"✅ Exported {count} crops.")
+        self.status_label.setText(f"✅ {tr('Exported %s crops.') % count}")
         self._force_view_active = False
-        QMessageBox.information(self, "Success", f"Exported {count} crops!\nSaved to: {path_name}")
+        QMessageBox.information(self, tr("Success"), tr("Exported %s crops!\nSaved to: %s") % (count, path_name))
 
     def _on_export_error(self, err):
         self.batch_progress.close()
-        self.status_label.setText(f"❌ Error: {err}")
-        QMessageBox.critical(self, "Export Error", str(err))
+        self.status_label.setText(f"❌ {tr('Error:')} {err}")
+        QMessageBox.critical(self, tr("Export Error"), str(err))
 
     def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx):
         """保存 Overview Map"""

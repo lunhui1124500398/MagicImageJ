@@ -67,7 +67,7 @@ class ExportThread(QThread):
             if success:
                 self.finished.emit(str(self.output_path))
             else:
-                self.error.emit("Export function returned False.")
+                self.error.emit(tr("Export function returned False."))
                 
         except Exception as e:
             import traceback
@@ -468,7 +468,7 @@ class ExportWidget(QWidget):
 
     def _start_export(self):
         if not self.layer_combo.currentText() or not self.output_path: 
-            self.lbl_status.setText("❌ Check inputs")
+            self.lbl_status.setText(f"❌ {tr('Check inputs')}")
             return
         layer_name = self.layer_combo.currentText()
         # === [Fix] Warning Check (Smart) ===
@@ -486,8 +486,8 @@ class ExportWidget(QWidget):
             
             if not anno_enabled or (not has_sb and not has_ts):
                 reply = QMessageBox.question(
-                    self, "Missing Annotations",
-                    "You are exporting a video WITHOUT Scale Bar or Timestamp.\n\nAre you sure?",
+                    self, tr("Missing Annotations"),
+                    tr("You are exporting a video WITHOUT Scale Bar or Timestamp.\n\nAre you sure?"),
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No
                 )
                 if reply == QMessageBox.No: return
@@ -495,7 +495,7 @@ class ExportWidget(QWidget):
         self.btn_run.setEnabled(False)
         self.pbar.setValue(0)
         self.pbar.setVisible(True)
-        self.lbl_status.setText("⏳ Exporting...")
+        self.lbl_status.setText(f"⏳ {tr('Exporting...')}")
         
         # 1. 自动处理文件名 (如果使用了归档路径)
         final_path = Path(self.output_path)
@@ -530,7 +530,7 @@ class ExportWidget(QWidget):
             indices = self._parse_frame_indices(text, total_frames)
             
             if not indices:
-                self.lbl_status.setText("❌ Invalid frame range syntax")
+                self.lbl_status.setText(f"❌ {tr('Invalid frame range syntax')}")
                 self.btn_run.setEnabled(True)
                 return
             
@@ -554,7 +554,7 @@ class ExportWidget(QWidget):
         self.export_thread.start()
 
     def _on_done(self, path, params):
-        self.lbl_status.setText(f"✅ Done: {Path(path).name}")
+        self.lbl_status.setText(f"✅ {tr('Done: %s') % Path(path).name}")
         self.pbar.setVisible(False)
         self.btn_run.setEnabled(True)
         
@@ -562,7 +562,7 @@ class ExportWidget(QWidget):
         self._log_export(path, params)
 
     def _on_error(self, err):
-        self.lbl_status.setText(f"❌ Error: {err}")
+        self.lbl_status.setText(f"❌ {tr('Error:')} {err}")
         self.pbar.setVisible(False)
         self.btn_run.setEnabled(True)
 

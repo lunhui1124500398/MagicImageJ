@@ -499,9 +499,9 @@ class ImportWidget(QWidget):
             if match_ds:
                 ds_num = match_ds.group(1)
                 self.dataset_edit.setText(f"ds{ds_num}")
-                status_msgs.append(f"Auto-ID: ds{ds_num}")
+                status_msgs.append(f"{tr('Auto-ID:')} ds{ds_num}")
             else:
-                status_msgs.append("No Dataset ID")
+                status_msgs.append(tr("No Dataset ID"))
 
             # 2. Aperture (OL) Detection
             match_ol = re.search(r"(?<!non)OL\s*[#\-_]?\s*(\d+)", current_name, re.IGNORECASE)
@@ -521,32 +521,32 @@ class ImportWidget(QWidget):
                     if idx >= 0:
                         # 情况A: 列表中已有 (0-4)，直接选中
                         self.aperture_combo.setCurrentIndex(idx)
-                        status_msgs.append(f"Auto-OL: {ol_num}")
+                        status_msgs.append(f"{tr('Auto-OL:')} {ol_num}")
                     else:
                         # 情况B: 列表中没有 (比如 OL5, OL7)，这是导致你Bug的核心原因！
                         # [Fix] 动态添加到下拉框并选中
                         self.aperture_combo.addItem(ol_num)
                         self.aperture_combo.setCurrentText(ol_num)
-                        status_msgs.append(f"Auto-OL: {ol_num} (Auto-Added)")
+                        status_msgs.append(f"{tr('Auto-OL:')} {ol_num} {tr('(Auto-Added)')}")
                         
                 except Exception as e:
                     print(f"OL Parse Error: {e}")
                     pass
             else:
-                status_msgs.append("OL Not Found")
+                status_msgs.append(tr("OL Not Found"))
             
             self.status.setText(" | ".join(status_msgs))
             
             if not match_ds:
-                 QMessageBox.information(self, "Check ID", "Could not detect 'dataset' number.\nPlease check ID manually.")
+                 QMessageBox.information(self, tr("Check ID"), tr("Could not detect 'dataset' number.\nPlease check ID manually."))
 
             self._update_preview()
 
     def _pick_single_file_for_dose(self):
         if not self.current_folder: return
-        f, _ = QFileDialog.getOpenFileName(self, "Select DM4 Image for Dose Calculation", self.current_folder, "DM4 Files (*.dm4)")
+        f, _ = QFileDialog.getOpenFileName(self, tr("Select DM4 Image for Dose Calculation"), self.current_folder, "DM4 Files (*.dm4)")
         if f:
-            self.status.setText("Locating file index...")
+            self.status.setText(tr("Locating file index..."))
             try:
                 target_path = Path(f).resolve()
                 all_files = sorted(list(Path(self.current_folder).rglob("*.dm4")))
@@ -557,18 +557,18 @@ class ImportWidget(QWidget):
                         break
                 if found_idx >= 0:
                     self.dose_idx_spin.setValue(found_idx)
-                    self.status.setText(f"Selected: {target_path.name} (Index: {found_idx})")
+                    self.status.setText(f"{tr('Selected: %s (Index: %s)') % (target_path.name, found_idx)}")
                     self._calc_dose()
                 else:
-                    self.status.setText("❌ File not found in current structure match.")
+                    self.status.setText(f"❌ {tr('File not found in current structure match.')}")
             except Exception as e:
-                self.status.setText(f"❌ Error picking file: {e}")
+                self.status.setText(f"❌ {tr('Error picking file:')} {e}")
 
     def _calc_dose(self):
         if not self.current_folder: return
         self.calc_dose_btn.setEnabled(False)
         self.pick_file_btn.setEnabled(False)
-        self.status.setText("Scanning metadata...")
+        self.status.setText(tr("Scanning metadata..."))
         frame_idx = self.dose_idx_spin.value()
         self.thread_dose = DoseCalculationThread(self.current_folder, frame_idx=frame_idx)
         self.thread_dose.finished.connect(self._on_dose_done)
@@ -653,7 +653,7 @@ class ImportWidget(QWidget):
         archive_path = parent_dir / folder_name
         
         if archive_path.exists():
-            if QMessageBox.warning(self, "Exists", f"Folder exists:\n{folder_name}\nOverwrite?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.No: return
+            if QMessageBox.warning(self, tr("Exists"), tr("Folder exists:\n%s\nOverwrite?") % folder_name, QMessageBox.Yes|QMessageBox.No) == QMessageBox.No: return
         
         self.create_archive_btn.setEnabled(False)
         self.archive_progress.setVisible(True)
@@ -721,7 +721,7 @@ class ImportWidget(QWidget):
         raw_folder_name = f"{date_str}_{self.sub_txt}_OriginalDataset{ds_num}"
         raw_dest = archive_path / raw_folder_name
         
-        self.status.setText(f"{'Moving' if move_mode else 'Copying'} raw data...")
+        self.status.setText(tr("Moving raw data...") if move_mode else tr("Copying raw data..."))
         self.archive_thread = ArchiveThread(str(self.current_folder), str(raw_dest), move_mode=move_mode)
         # Pass move_mode and size_gb to callback
         self.archive_thread.finished.connect(lambda: self._on_archive_done(move_mode, size_gb, raw_dest))
@@ -742,30 +742,30 @@ class ImportWidget(QWidget):
         
         # [Req New] Popup with details
         if self.check_show_popup.isChecked():
-            mode_str = "MOVE (Fast)" if was_moved else "COPY (Safe)"
-            msg = f"Archive created successfully!\n\n" \
+            mode_str = tr("MOVE (Fast)") if was_moved else tr("COPY (Safe)")
+            msg = tr("Archive created successfully!") + "\n\n" \
                   f"📂 Path: {self.archive_root}\n" \
                   f"📦 Source Size: {size_gb:.2f} GB\n" \
                   f"⚙️ Mode: {mode_str}\n"
             
             if was_moved:
-                msg += "\n[Info] Large dataset detected (>100GB). Original folder was MOVED to archive to save time/space."
+                msg += "\n" + tr("Large dataset detected (>100GB). Original folder was MOVED to archive to save time/space.")
             else:
-                msg += "\n[Info] Original folder was COPIED. Please delete the source manually if needed."
+                msg += "\n" + tr("Original folder was COPIED. Please delete the source manually if needed.")
                 
-            QMessageBox.information(self, "Archive Complete", msg)
+            QMessageBox.information(self, tr("Archive Complete"), msg)
 
     def _on_archive_error(self, err):
         self.archive_progress.setVisible(False)
         self.create_archive_btn.setEnabled(True)
-        self.status.setText(f"❌ Archive Error: {err}")
-        QMessageBox.critical(self, "Error", str(err))
+        self.status.setText(f"❌ {tr('Archive Error:')} {err}")
+        QMessageBox.critical(self, tr("Error"), str(err))
 
     def _load_data(self):
         if not self.current_folder: return
         if len(self.viewer.layers) > 0:
             reply = QMessageBox.question(
-                self, "Confirm Load", "Loading new data will CLEAR ALL current layers.\nContinue?",
+                self, tr("Confirm Load"), tr("Loading new data will CLEAR ALL current layers.\nContinue?"),
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
             )
             if reply == QMessageBox.No: return
@@ -775,13 +775,13 @@ class ImportWidget(QWidget):
         
         self.load_btn.setEnabled(False)
         self.progress.setVisible(True)
-        self.status.setText("Loading...")
+        self.status.setText(tr("Loading..."))
         bit = int(self.bit_depth_combo.currentText())
         workers = self.max_workers_spin.value()
         self.thread_load = LoaderThread(self.current_folder, bit, workers)
         self.thread_load.progress.connect(lambda c, t: (self.progress.setMaximum(t), self.progress.setValue(c)))
         self.thread_load.finished.connect(self._on_loaded)
-        self.thread_load.error.connect(lambda e: (self.status.setText(f"Error: {e}"), self.load_btn.setEnabled(True)))
+        self.thread_load.error.connect(lambda e: (self.status.setText(f"{tr('Error:')} {e}"), self.load_btn.setEnabled(True)))
         self.thread_load.start()
 
     def _on_loaded(self, stack, meta):
@@ -790,7 +790,7 @@ class ImportWidget(QWidget):
         name = f"Original_{Path(self.current_folder).name}"
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         self.viewer.add_image(stack, name=name, metadata=meta, colormap='gray')
-        self.status.setText(f"Loaded {len(stack)} frames.")
+        self.status.setText(tr("Loaded %s frames.") % len(stack))
         
         # === [SessionLogger] 记录 DM4 导入操作 ===
         try:
@@ -867,7 +867,7 @@ class ImportWidget(QWidget):
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, tr("Error"), str(e))
-            self.status.setText(f"❌ Error: {e}")
+            self.status.setText(f"❌ {tr('Error:')} {e}")
 
     # === [新增] TIFF Stack 导入 ===
     def _load_tiff_stack(self):
@@ -911,4 +911,4 @@ class ImportWidget(QWidget):
             
         except Exception as e:
             QMessageBox.critical(self, tr("Error"), str(e))
-            self.status.setText(f"❌ Error: {e}")
+            self.status.setText(f"❌ {tr('Error:')} {e}")

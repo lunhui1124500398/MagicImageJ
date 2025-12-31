@@ -378,6 +378,10 @@ def check_and_show_recovery(parent=None) -> list:
             selected = dialog.get_selected_actions()
             # 标记旧会话为已恢复
             _mark_session_recovered(latest_log)
+            
+            # 询问用户是否收藏此会话
+            _offer_star_session(latest_log, parent)
+            
             return selected
         else:
             # 用户选择跳过，标记为放弃
@@ -428,3 +432,21 @@ def _mark_session_abandoned(log_path: Path):
             json.dump(data, f, indent=2)
     except:
         pass
+
+
+def _offer_star_session(log_path: Path, parent=None):
+    """询问用户是否收藏已恢复的会话"""
+    try:
+        reply = QMessageBox.question(
+            parent, 
+            tr("Star this session?"),
+            tr("Session recovered successfully. Would you like to star it for future reference?"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            from utils.session_logger import SessionLogger
+            SessionLogger.update_session_file(log_path, starred=True)
+    except Exception as e:
+        print(f"[RecoveryDialog] Failed to offer star: {e}")

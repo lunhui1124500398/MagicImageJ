@@ -38,6 +38,24 @@ class RecoveryWidget(QWidget):
         self.manual_log_path = None  # 手动选择的日志路径
         self._setup_ui()
         self._refresh_sessions()
+        self._setup_shortcuts()
+    
+    def _setup_shortcuts(self):
+        """设置键盘快捷键 (使用配置的快捷键)"""
+        from qtpy.QtWidgets import QShortcut
+        from qtpy.QtGui import QKeySequence
+        
+        # 使用配置的快捷键
+        star_key = str(GlobalConfig.get("shortcut_session_star") or "S")
+        label_key = str(GlobalConfig.get("shortcut_session_label") or "L")
+        
+        # 收藏快捷键
+        shortcut_star = QShortcut(QKeySequence(star_key), self)
+        shortcut_star.activated.connect(self._toggle_session_star)
+        
+        # 编辑标签快捷键
+        shortcut_label = QShortcut(QKeySequence(label_key), self)
+        shortcut_label.activated.connect(self._edit_session_label)
     
     def _setup_ui(self):
         layout = QVBoxLayout()
@@ -83,6 +101,7 @@ class RecoveryWidget(QWidget):
         
         self.session_list = QListWidget()
         self.session_list.currentItemChanged.connect(self._on_session_selected)
+        self.session_list.itemDoubleClicked.connect(self._on_session_double_clicked)  # 双击编辑标签
         self.session_list.setMinimumWidth(220)
         left_layout.addWidget(self.session_list)
         
@@ -204,13 +223,19 @@ class RecoveryWidget(QWidget):
                 substance = meta.get("substance", "N/A")
                 dataset = meta.get("dataset_id", "")
                 
+                # 收藏和标签状态 (新增)
+                starred = session_data.get("starred", False)
+                label = session_data.get("label", "")
+                star_icon = "⭐ " if starred else ""
+                label_text = f"[{label}] " if label else ""
+                
                 # 创建列表项
-                display = f"{icon} {created} | {substance}"
+                display = f"{star_icon}{icon} {label_text}{created} | {substance}"
                 if dataset:
                     display += f"/{dataset}"
                 
                 item = QListWidgetItem(display)
-                item.setToolTip(f"Status: {status}\nPath: {log_path}")
+                item.setToolTip(f"Status: {status}\nLabel: {label or '(none)'}\nPath: {log_path}")
                 item.setData(Qt.UserRole, len(self.sessions) - 1)
                 self.session_list.addItem(item)
         
@@ -299,7 +324,7 @@ class RecoveryWidget(QWidget):
                 else:
                     status_str = f"<span style='color: #F44336;'>❌ {tr('Data source NOT found (may have been moved)')}</span>"
                 
-                src_label = QLabel(f"<b>{src_type}:</b><br><small>{src_path}</small><br>{status_str}")
+                src_label = QLabel(f"<b>{tr(src_type)}:</b><br><small>{src_path}</small><br>{status_str}")
                 src_label.setWordWrap(True)
                 h_src.addWidget(src_label, stretch=1)
                 
@@ -358,7 +383,27 @@ class RecoveryWidget(QWidget):
         g_actions.setLayout(a_layout)
         self.details_layout.addWidget(g_actions)
         
-        # === 4. 操作按钮 ===
+        # === 4. 会话管理按钮 (新增: 收藏/标签) ===
+        h_mgmt = QHBoxLayout()
+        
+        # 收藏按钮
+        is_starred = session.get("starred", False)
+        star_btn_text = f"⭐ {tr('Unstar Session')}" if is_starred else f"☆ {tr('Star Session')}"
+        btn_star = QPushButton(star_btn_text)
+        btn_star.clicked.connect(self._toggle_session_star)
+        if is_starred:
+            btn_star.setStyleSheet("background-color: #FFA500;")
+        h_mgmt.addWidget(btn_star)
+        
+        # 标签编辑按钮
+        btn_label = QPushButton(f"🏷️ {tr('Edit Label')}")
+        btn_label.clicked.connect(self._edit_session_label)
+        h_mgmt.addWidget(btn_label)
+        
+        h_mgmt.addStretch()
+        self.details_layout.addLayout(h_mgmt)
+        
+        # === 5. 恢复/放弃按钮 ===
         h_btns = QHBoxLayout()
         
         btn_abandon = QPushButton(f"🗑️ {tr('Abandon Session')}")
@@ -381,6 +426,66 @@ class RecoveryWidget(QWidget):
         self.details_layout.addWidget(hint)
         
         self.details_layout.addStretch()
+    
+    def _toggle_session_star(self):
+        """切换当前会话的收藏状态"""
+        from utils.session_logger import SessionLogger
+        
+        if not self.current_session:
+            return
+        
+        log_path = self.current_session.get("_log_path")
+        if not log_path:
+            return
+        
+        current_starred = self.current_session.get("starred", False)
+        new_starred = not current_starred
+        
+        if SessionLogger.update_session_file(Path(log_path), starred=new_starred):
+            # 更新本地状态
+            self.current_session["starred"] = new_starred
+            # 刷新列表和详情
+            self._refresh_sessions()
+            # 重新选中当前会话并显示详情
+            self._show_session_details()
+    
+    def _edit_session_label(self):
+        """编辑当前会话的标签"""
+        from utils.session_logger import SessionLogger
+        from qtpy.QtWidgets import QInputDialog
+        
+        if not self.current_session:
+            return
+        
+        log_path = self.current_session.get("_log_path")
+        if not log_path:
+            return
+        
+        current_label = self.current_session.get("label", "")
+        
+        new_label, ok = QInputDialog.getText(
+            self, tr("Session Label"), 
+            tr("Enter label for this session:"),
+            text=current_label
+        )
+        
+        if ok:
+            if SessionLogger.update_session_file(Path(log_path), label=new_label):
+                # 更新本地状态
+                self.current_session["label"] = new_label
+                # 刷新列表和详情
+                self._refresh_sessions()
+                self._show_session_details()
+    
+    def _on_session_double_clicked(self, item):
+        """双击会话列表项时编辑标签"""
+        if item is None:
+            return
+        
+        idx = item.data(Qt.UserRole)
+        if idx is not None and idx < len(self.sessions):
+            self.current_session = self.sessions[idx]
+            self._edit_session_label()
     
     def _get_data_sources(self, session_data):
         """从会话数据中提取数据源信息"""
@@ -464,13 +569,13 @@ class RecoveryWidget(QWidget):
                 self._load_tiff_stack(src_path)
             elif src_type == "DM4 Archive":
                 QMessageBox.information(self, tr("Data Source Import"), 
-                    f"DM4 Archive path detected.\nPlease use Import tab to load the images.\n\n{src_path}")
+                    tr("DM4 Archive path detected.\nPlease use Import tab to load the images.\n\n%s") % src_path)
                 return
             
             QMessageBox.information(self, tr("Data Source Import"), 
-                f"✅ {src_type} loaded successfully!")
+                tr("✅ %s loaded successfully!") % tr(src_type))
         except Exception as e:
-            QMessageBox.critical(self, tr("Error"), f"Import failed: {e}")
+            QMessageBox.critical(self, tr("Error"), tr("Import failed: %s") % e)
     
     def _manual_select_source(self, idx: int):
         """手动选择数据源"""
@@ -485,20 +590,20 @@ class RecoveryWidget(QWidget):
             if folder:
                 try:
                     self._load_png_sequence(folder)
-                    QMessageBox.information(self, tr("Data Source Import"), "✅ PNG Sequence loaded!")
+                    QMessageBox.information(self, tr("Data Source Import"), tr("✅ PNG Sequence loaded!"))
                 except Exception as e:
-                    QMessageBox.critical(self, tr("Error"), f"Import failed: {e}")
+                    QMessageBox.critical(self, tr("Error"), tr("Import failed: %s") % e)
         elif src_type == "TIFF Stack":
             file_path, _ = QFileDialog.getOpenFileName(self, tr("Select TIFF File"), "", "TIFF (*.tiff *.tif)")
             if file_path:
                 try:
                     self._load_tiff_stack(file_path)
-                    QMessageBox.information(self, tr("Data Source Import"), "✅ TIFF Stack loaded!")
+                    QMessageBox.information(self, tr("Data Source Import"), tr("✅ TIFF Stack loaded!"))
                 except Exception as e:
-                    QMessageBox.critical(self, tr("Error"), f"Import failed: {e}")
+                    QMessageBox.critical(self, tr("Error"), tr("Import failed: %s") % e)
         elif src_type == "DM4 Archive":
             QMessageBox.information(self, tr("Data Source Import"), 
-                "DM4 loading requires the full Import workflow.\nPlease use Import tab.")
+                tr("DM4 loading requires the full Import workflow.\nPlease use Import tab."))
     
     def _load_png_sequence(self, folder_path: str):
         """加载 PNG 序列"""

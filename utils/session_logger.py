@@ -49,6 +49,8 @@ class SessionLogger:
         self.session_id = str(uuid.uuid4())[:8]
         self.created_at = datetime.datetime.now().isoformat()
         self.status = "in_progress"
+        self.starred = False  # 收藏状态
+        self.label = ""  # 用户自定义标签
         self.metadata: Dict[str, Any] = {
             "substance": "",
             "dataset_id": "",
@@ -237,6 +239,8 @@ class SessionLogger:
             "session_id": self.session_id,
             "created_at": self.created_at,
             "status": self.status,
+            "starred": self.starred,
+            "label": self.label,
             "metadata": self.metadata,
             "actions": self.actions,
             "checksum": self._compute_checksum()
@@ -268,7 +272,7 @@ class SessionLogger:
         thread.start()
     
     def _cleanup_old_sessions(self):
-        """清理旧会话日志，保留最近 N 个"""
+        """清理旧会话日志，保留最近 N 个 (跳过收藏的和归档路径下的)"""
         from widgets.settings_widget import GlobalConfig
         
         max_keep = int(GlobalConfig.get("session_max_keep") or 20)
@@ -277,21 +281,59 @@ class SessionLogger:
             log_dir = self.get_log_directory()
             session_files = list(log_dir.glob("*_session.json"))
             
-            if len(session_files) <= max_keep:
-                return
+            # 获取归档路径 (归档路径下的session不清理)
+            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+            archive_dir = Path(archive_path) if archive_path else None
             
-            # 按修改时间排序，最新的在前
-            session_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            # 分类: 受保护的 vs 普通的
+            protected_files = []
+            normal_files = []
             
-            # 删除多余的旧文件
-            for old_file in session_files[max_keep:]:
+            for f in session_files:
+                # 检查是否在归档路径下
+                if archive_dir and archive_dir.exists():
+                    try:
+                        f.resolve().relative_to(archive_dir.resolve())
+                        protected_files.append(f)
+                        continue
+                    except ValueError:
+                        pass  # 不在归档路径下
+                
+                # 检查是否被收藏
                 try:
-                    old_file.unlink()
-                    print(f"[SessionLogger] Cleaned up old log: {old_file.name}")
+                    with open(f, 'r', encoding='utf-8') as file:
+                        data = json.load(file)
+                    if data.get("starred", False):
+                        protected_files.append(f)
+                        continue
                 except:
                     pass
+                
+                normal_files.append(f)
+            
+            # 只清理普通文件，且只有当普通文件超出限制时才清理
+            if len(normal_files) <= max_keep:
+                return
+            
+            # 按修改时间排序，最新的在前 (带错误处理)
+            def safe_mtime(p):
+                try:
+                    return p.stat().st_mtime
+                except:
+                    return 0  # 文件可能已被删除，排到最前面不被清理
+            
+            normal_files.sort(key=safe_mtime, reverse=True)
+            
+            # 删除多余的旧文件
+            for old_file in normal_files[max_keep:]:
+                try:
+                    if old_file.exists():  # 确保文件存在再删除
+                        old_file.unlink()
+                        print(f"[SessionLogger] Cleaned up old log: {old_file.name}")
+                except Exception as del_e:
+                    print(f"[SessionLogger] Failed to delete {old_file.name}: {del_e}")
         except Exception as e:
-            print(f"[SessionLogger] Cleanup failed: {e}")
+            print(f"[SessionLogger] Cleanup error: {e}")
     
     def _on_exit(self):
         """程序退出时保存"""
@@ -402,9 +444,77 @@ class SessionLogger:
             else:
                 data["_checksum_valid"] = True
             
+            # 确保兼容旧版本 (没有 starred/label 字段)
+            data.setdefault("starred", False)
+            data.setdefault("label", "")
+            
             return data
         except Exception as e:
             print(f"[SessionLogger] Failed to load {path}: {e}")
+            return None
+    
+    @staticmethod
+    def update_session_file(path: Path, starred: bool = None, label: str = None) -> bool:
+        """
+        更新已存在session文件的收藏/标签状态
+        
+        Args:
+            path: session文件路径
+            starred: 新的收藏状态 (None表示不修改)
+            label: 新的标签 (None表示不修改)
+        
+        Returns:
+            是否更新成功
+        """
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            modified = False
+            if starred is not None and data.get("starred") != starred:
+                data["starred"] = starred
+                modified = True
+            if label is not None and data.get("label") != label:
+                data["label"] = label
+                modified = True
+            
+            if modified:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                print(f"[SessionLogger] Updated session: {path.name}")
+            
+            return True
+        except Exception as e:
+            print(f"[SessionLogger] Failed to update {path}: {e}")
+            return False
+    
+    @staticmethod
+    def get_session_summary(path: Path) -> Optional[Dict[str, Any]]:
+        """
+        获取session摘要信息 (用于列表展示)
+        
+        Returns:
+            包含 session_id, created_at, status, starred, label, 
+            actions_count, metadata 的字典
+        """
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            return {
+                "path": path,
+                "session_id": data.get("session_id", "unknown"),
+                "created_at": data.get("created_at", ""),
+                "status": data.get("status", "unknown"),
+                "starred": data.get("starred", False),
+                "label": data.get("label", ""),
+                "actions_count": len(data.get("actions", [])),
+                "metadata": data.get("metadata", {}),
+                "file_size": path.stat().st_size,
+                "modified_time": path.stat().st_mtime
+            }
+        except Exception as e:
+            print(f"[SessionLogger] Failed to get summary for {path}: {e}")
             return None
 
 

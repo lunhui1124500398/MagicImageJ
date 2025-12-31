@@ -361,7 +361,7 @@ class DriftCorrectionWidget(QWidget):
         self.drift_canvas.draw()
         self.drift_canvas.setVisible(True)
         self.apply_btn.setEnabled(True)
-        self.status_label.setText(f"✅ Max X: {np.max(np.abs(drifts[:,0])):.1f}, Y: {np.max(np.abs(drifts[:,1])):.1f}")
+        self.status_label.setText(f"✅ {tr('Max Shift:')} X: {np.max(np.abs(drifts[:,0])):.1f}, Y: {np.max(np.abs(drifts[:,1])):.1f}")
         # === [核心修改] 自动应用校正 ===
         if self.auto_calc_cb.isChecked():
             self.status_label.setText(f"⚡ {tr('Auto-applying correction...')}")
@@ -373,7 +373,7 @@ class DriftCorrectionWidget(QWidget):
     def _on_drift_error(self, error_msg):
         self.progress_bar.setVisible(False)
         self.auto_calc_cb.setEnabled(True)
-        self.status_label.setText(f"❌ Error: {error_msg}")
+        self.status_label.setText(f"❌ {tr('Error:')} {error_msg}")
 
     def _apply_correction(self, auto_mode=False):
         if self.current_drifts is None: return
@@ -419,14 +419,14 @@ class DriftCorrectionWidget(QWidget):
             if source_layer_name in self.viewer.layers:
                 self.viewer.layers[source_layer_name].visible = False
             self.viewer.layers.selection.active = new_layer
-            self.status_label.setText(f"✅ Previewing: {new_layer_name}. Press 'Crtl+Z' to Undo.")
+            self.status_label.setText(f"""✅ {tr("Previewing: %s. Press 'Crtl+Z' to Undo.") % new_layer_name}""")
 
             # 使用 SessionLogger 记录操作
             action_id = self._log_drift_action(source_layer_name)
             new_layer.metadata['action_id'] = action_id
         
         except Exception as e:
-            self.status_label.setText(f"❌ Apply Error: {str(e)}")
+            self.status_label.setText(f"❌ {tr('Apply Error:')} {str(e)}")
     
     def _undo_last_correction(self, layer_to_remove):
         """撤销操作：删除图层，显示原图，激活ROI层"""
