@@ -10,8 +10,9 @@ Recovery Widget - 独立的会话恢复组件
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                             QPushButton, QListWidget, QListWidgetItem,
                             QGroupBox, QMessageBox, QSplitter, QFrame,
-                            QFileDialog, QScrollArea)
-from qtpy.QtCore import Qt
+                            QFileDialog, QScrollArea, QCheckBox, QDialog,
+                            QMenu, QAction)
+from qtpy.QtCore import Qt, QTimer
 from pathlib import Path
 import json
 from widgets.settings_widget import GlobalConfig, tr
@@ -36,9 +37,18 @@ class RecoveryWidget(QWidget):
         self.current_session = None  # 当前选中的会话数据
         self.data_sources = []  # 当前会话的数据源
         self.manual_log_path = None  # 手动选择的日志路径
+        self._manual_mode_active = False  # 手动模式激活标志
         self._setup_ui()
         self._refresh_sessions()
         self._setup_shortcuts()
+        
+        # 实时刷新定时器 (5秒)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self._refresh_sessions)
+        self._refresh_timer.start(5000)
+        
+        # 首次使用时检测 Everything
+        QTimer.singleShot(1000, self._check_everything_hint)
     
     def _setup_shortcuts(self):
         """设置键盘快捷键 (使用配置的快捷键)"""
@@ -48,6 +58,7 @@ class RecoveryWidget(QWidget):
         # 使用配置的快捷键
         star_key = str(GlobalConfig.get("shortcut_session_star") or "S")
         label_key = str(GlobalConfig.get("shortcut_session_label") or "L")
+        delete_key = str(GlobalConfig.get("shortcut_delete_session") or "Delete")
         
         # 收藏快捷键
         shortcut_star = QShortcut(QKeySequence(star_key), self)
@@ -56,6 +67,10 @@ class RecoveryWidget(QWidget):
         # 编辑标签快捷键
         shortcut_label = QShortcut(QKeySequence(label_key), self)
         shortcut_label.activated.connect(self._edit_session_label)
+        
+        # 删除会话快捷键
+        shortcut_delete = QShortcut(QKeySequence(delete_key), self)
+        shortcut_delete.activated.connect(self._delete_current_session)
     
     def _setup_ui(self):
         layout = QVBoxLayout()
@@ -81,6 +96,10 @@ class RecoveryWidget(QWidget):
         btn_select_log.clicked.connect(self._select_log_file)
         m_layout.addWidget(btn_select_log)
         
+        btn_manage_paths = QPushButton(f"🗂️ {tr('Manage Paths')}")
+        btn_manage_paths.clicked.connect(self._show_path_manager)
+        m_layout.addWidget(btn_manage_paths)
+        
         self.lbl_manual_path = QLabel(f"{tr('Current')}: <i>{tr('Not selected')}</i>")
         self.lbl_manual_path.setStyleSheet("color: #888;")
         m_layout.addWidget(self.lbl_manual_path, stretch=1)
@@ -99,11 +118,31 @@ class RecoveryWidget(QWidget):
         lbl_sessions = QLabel(f"<b>📋 {tr('Recent Sessions')}</b>")
         left_layout.addWidget(lbl_sessions)
         
+        # === 筛选复选框 ===
+        filter_layout = QHBoxLayout()
+        self.chk_archive_only = QCheckBox(f"📦 {tr('Archive Only')}")
+        self.chk_archive_only.stateChanged.connect(self._refresh_sessions)
+        filter_layout.addWidget(self.chk_archive_only)
+        
+        self.chk_starred_only = QCheckBox(f"⭐ {tr('Starred Only')}")
+        self.chk_starred_only.stateChanged.connect(self._refresh_sessions)
+        filter_layout.addWidget(self.chk_starred_only)
+        filter_layout.addStretch()
+        left_layout.addLayout(filter_layout)
+        
         self.session_list = QListWidget()
         self.session_list.currentItemChanged.connect(self._on_session_selected)
         self.session_list.itemDoubleClicked.connect(self._on_session_double_clicked)  # 双击编辑标签
+        self.session_list.setContextMenuPolicy(Qt.CustomContextMenu)  # 启用右键菜单
+        self.session_list.customContextMenuRequested.connect(self._show_session_context_menu)
         self.session_list.setMinimumWidth(220)
         left_layout.addWidget(self.session_list)
+        
+        # 删除会话按钮
+        btn_delete_session = QPushButton(f"🗑️ {tr('Delete Session')}")
+        btn_delete_session.clicked.connect(self._delete_current_session)
+        btn_delete_session.setToolTip(tr("Delete the selected session from disk"))
+        left_layout.addWidget(btn_delete_session)
         
         left_panel.setLayout(left_layout)
         splitter.addWidget(left_panel)
@@ -184,23 +223,29 @@ class RecoveryWidget(QWidget):
         session_data = SessionLogger.load_from_file(self.manual_log_path)
         if session_data:
             session_data["_log_path"] = str(self.manual_log_path)
+            session_data["_is_manual"] = True  # 标记为手动选择
             self.current_session = session_data
+            self._manual_mode_active = True  # 激活手动模式
             
-            # 取消列表选中
+            # 阻止列表选择事件覆盖
+            self.session_list.blockSignals(True)
             self.session_list.clearSelection()
+            self.session_list.blockSignals(False)
             
             # 显示详情
             self._show_session_details()
     
     def _refresh_sessions(self):
-        """刷新会话列表 - 显示所有会话"""
+        """刷新会话列表 - 支持筛选、归档优先排序、实时刷新"""
         from utils.session_logger import SessionLogger
+        
+        # 保存当前选中项以便恢复
+        current_idx = None
+        if self.session_list.currentItem():
+            current_idx = self.session_list.currentItem().data(Qt.UserRole)
         
         self.session_list.clear()
         self.sessions = []
-        self.manual_log_path = None
-        self.lbl_manual_path.setText(f"{tr('Current')}: <i>{tr('Not selected')}</i>")
-        self.lbl_manual_path.setStyleSheet("color: #888;")
         
         # 获取所有会话
         all_sessions = SessionLogger.find_all_sessions(limit=50)
@@ -209,35 +254,68 @@ class RecoveryWidget(QWidget):
             self._show_empty_state()
             return
         
+        # 获取筛选条件
+        archive_only = self.chk_archive_only.isChecked()
+        starred_only = self.chk_starred_only.isChecked()
+        
+        # 加载并处理会话数据
+        session_summaries = []
         for log_path in all_sessions:
+            summary = SessionLogger.get_session_summary(log_path)
+            if not summary:
+                continue
+            
+            # 应用筛选条件
+            is_archive = summary.get("is_archive_session", False)
+            is_starred = summary.get("starred", False)
+            
+            if archive_only and not is_archive:
+                continue
+            if starred_only and not is_starred:
+                continue
+            
+            # 加载完整数据
             session_data = SessionLogger.load_from_file(log_path)
             if session_data:
                 session_data["_log_path"] = str(log_path)
-                self.sessions.append(session_data)
-                
-                # 获取会话信息
-                status = session_data.get("status", "unknown")
-                icon = self.STATUS_ICONS.get(status, "❓")
-                created = session_data.get("created_at", "")[:16].replace("T", " ")
-                meta = session_data.get("metadata", {})
-                substance = meta.get("substance", "N/A")
-                dataset = meta.get("dataset_id", "")
-                
-                # 收藏和标签状态 (新增)
-                starred = session_data.get("starred", False)
-                label = session_data.get("label", "")
-                star_icon = "⭐ " if starred else ""
-                label_text = f"[{label}] " if label else ""
-                
-                # 创建列表项
-                display = f"{star_icon}{icon} {label_text}{created} | {substance}"
-                if dataset:
-                    display += f"/{dataset}"
-                
-                item = QListWidgetItem(display)
-                item.setToolTip(f"Status: {status}\nLabel: {label or '(none)'}\nPath: {log_path}")
-                item.setData(Qt.UserRole, len(self.sessions) - 1)
-                self.session_list.addItem(item)
+                session_data["_is_archive"] = is_archive
+                session_data["_auto_label"] = summary.get("auto_label", "")
+                session_summaries.append((summary, session_data))
+        
+        # 排序：归档优先，然后按修改时间倒序
+        session_summaries.sort(key=lambda x: (not x[0].get("is_archive_session", False), -x[0].get("modified_time", 0)))
+        
+        for summary, session_data in session_summaries:
+            self.sessions.append(session_data)
+            
+            # 获取显示信息
+            status = session_data.get("status", "unknown")
+            status_icon = self.STATUS_ICONS.get(status, "❓")
+            created = session_data.get("created_at", "")[:16].replace("T", " ")
+            
+            # 图标：收藏 ⭐ 和归档 📦
+            starred = session_data.get("starred", False)
+            is_archive = session_data.get("_is_archive", False)
+            star_icon = "⭐ " if starred else ""
+            archive_icon = "📦 " if is_archive else ""
+            
+            # 标签：优先用户标签，否则用自动标签
+            user_label = session_data.get("label", "")
+            auto_label = session_data.get("_auto_label", "")
+            display_label = user_label or auto_label
+            label_text = f"[{display_label}] " if display_label else ""
+            
+            # 创建列表项: ⭐ 📦 ✅ [NaCl-ds1] 2024-01-01 12:00
+            display = f"{star_icon}{archive_icon}{status_icon} {label_text}{created}"
+            
+            item = QListWidgetItem(display)
+            item.setToolTip(f"Status: {status}\nLabel: {display_label or '(none)'}\nPath: {session_data.get('_log_path', '')}")
+            item.setData(Qt.UserRole, len(self.sessions) - 1)
+            self.session_list.addItem(item)
+        
+        # 恢复选中项 (手动模式时跳过，避免覆盖手动选择的会话)
+        if not self._manual_mode_active and current_idx is not None and current_idx < self.session_list.count():
+            self.session_list.setCurrentRow(current_idx)
         
         # 显示空状态如果没有会话
         if self.session_list.count() == 0:
@@ -247,6 +325,10 @@ class RecoveryWidget(QWidget):
         """会话选中时显示详情"""
         if current is None:
             return
+        
+        # 用户主动选择列表项时，解除手动模式
+        if self._manual_mode_active:
+            self._manual_mode_active = False
         
         # 清除手动选择状态
         self.manual_log_path = None
@@ -568,8 +650,20 @@ class RecoveryWidget(QWidget):
             elif src_type == "TIFF Stack":
                 self._load_tiff_stack(src_path)
             elif src_type == "DM4 Archive":
-                QMessageBox.information(self, tr("Data Source Import"), 
-                    tr("DM4 Archive path detected.\nPlease use Import tab to load the images.\n\n%s") % src_path)
+                # DM4 需要完整导入流程，但可以提前设置好路径
+                from qtpy.QtCore import QSettings
+                QSettings("NapariUser", "Importer").setValue("last_folder", src_path)
+                
+                reply = QMessageBox.question(self, tr("DM4 Auto-Import"),
+                    f"{tr('DM4 Archive detected. Auto-set path and switch to Import tab?')}\n\n{src_path}",
+                    QMessageBox.Yes | QMessageBox.No)
+                
+                if reply == QMessageBox.Yes:
+                    # 使用辅助方法切换到 Import 标签页
+                    self._switch_to_import_tab()
+                    
+                    QMessageBox.information(self, tr("Path Set"), 
+                        f"{tr('DM4 folder path set. Click Load Images to proceed.')}\n{src_path}")
                 return
             
             QMessageBox.information(self, tr("Data Source Import"), 
@@ -602,8 +696,16 @@ class RecoveryWidget(QWidget):
                 except Exception as e:
                     QMessageBox.critical(self, tr("Error"), tr("Import failed: %s") % e)
         elif src_type == "DM4 Archive":
-            QMessageBox.information(self, tr("Data Source Import"), 
-                tr("DM4 loading requires the full Import workflow.\nPlease use Import tab."))
+            folder = QFileDialog.getExistingDirectory(self, tr("Select DM4 Folder"))
+            if folder:
+                from qtpy.QtCore import QSettings
+                QSettings("NapariUser", "Importer").setValue("last_folder", folder)
+                
+                # 使用辅助方法切换到 Import 标签页
+                self._switch_to_import_tab()
+                
+                QMessageBox.information(self, tr("Path Set"), 
+                    f"{tr('DM4 folder path set. Click Load Images to proceed.')}\n{folder}")
     
     def _load_png_sequence(self, folder_path: str):
         """加载 PNG 序列"""
@@ -1600,26 +1702,65 @@ class RecoveryWidget(QWidget):
                 c_min = params.get("min", 0)
                 c_max = params.get("max", 255)
                 
-                # 执行对比度调整 - 和 ContrastBurnThread 相同的逻辑
-                data_f = data.astype(np.float32)
-                range_width = c_max - c_min
-                if range_width < 1e-9:
-                    range_width = 1e-9
+                # 添加进度对话框，防止用户认为程序卡死
+                from qtpy.QtWidgets import QProgressDialog, QApplication
+                from qtpy.QtCore import Qt
                 
-                # 归一化到 [0, 1]
-                normalized = (data_f - c_min) / range_width
-                normalized = np.clip(normalized, 0, 1)
+                progress = QProgressDialog(tr("Applying contrast adjustment..."), None, 0, 100, self)
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                progress.show()
+                QApplication.processEvents()
                 
-                # 映射到 uint8
-                result = (normalized * 255).astype(np.uint8)
-                
-                new_name = f"Contrast_{source_layer.name}"
-                self.viewer.add_image(result, name=new_name, colormap='gray')
-                
-                # 隐藏源图层
-                source_layer.visible = False
-                
-                return ("success", new_name)
+                try:
+                    # 执行对比度调整 - 和 ContrastBurnThread 相同的逻辑
+                    progress.setLabelText(tr("Converting data type..."))
+                    progress.setValue(10)
+                    QApplication.processEvents()
+                    
+                    data_f = data.astype(np.float32)
+                    
+                    progress.setLabelText(tr("Normalizing..."))
+                    progress.setValue(30)
+                    QApplication.processEvents()
+                    
+                    range_width = c_max - c_min
+                    if range_width < 1e-9:
+                        range_width = 1e-9
+                    
+                    # 归一化到 [0, 1]
+                    normalized = (data_f - c_min) / range_width
+                    
+                    progress.setLabelText(tr("Clipping values..."))
+                    progress.setValue(60)
+                    QApplication.processEvents()
+                    
+                    normalized = np.clip(normalized, 0, 1)
+                    
+                    progress.setLabelText(tr("Mapping to uint8..."))
+                    progress.setValue(80)
+                    QApplication.processEvents()
+                    
+                    # 映射到 uint8
+                    result = (normalized * 255).astype(np.uint8)
+                    
+                    progress.setLabelText(tr("Rendering result..."))
+                    progress.setValue(95)
+                    QApplication.processEvents()
+                    
+                    new_name = f"Contrast_{source_layer.name}"
+                    self.viewer.add_image(result, name=new_name, colormap='gray')
+                    
+                    # 隐藏源图层
+                    source_layer.visible = False
+                    
+                    progress.setValue(100)
+                    
+                    return ("success", new_name)
+                    
+                finally:
+                    progress.close()
             
         except Exception as e:
             print(f"Enhance replay failed: {e}")
@@ -1758,3 +1899,350 @@ class RecoveryWidget(QWidget):
             name = name[:15] + "..." + name[-10:]
         
         self.viewer.add_image(stack, name=name, colormap='gray')
+    
+    def _show_path_manager(self):
+        """显示搜索路径管理器对话框"""
+        from utils.session_logger import SessionLogger
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("Manage Search Paths"))
+        dialog.setMinimumWidth(500)
+        layout = QVBoxLayout()
+        
+        # 说明
+        layout.addWidget(QLabel(f"<b>{tr('Saved Search Paths')}</b><br><i>{tr('Sessions from these folders will be shown in the list.')}</i>"))
+        
+        # 路径列表
+        path_list = QListWidget()
+        paths_data = SessionLogger.get_all_saved_search_paths()
+        
+        for item_data in paths_data:
+            path = item_data["path"]
+            exists = item_data["exists"]
+            icon = "✅" if exists else "❌"
+            item = QListWidgetItem(f"{icon} {path}")
+            item.setData(Qt.UserRole, path)
+            if not exists:
+                item.setForeground(Qt.gray)
+            path_list.addItem(item)
+        
+        layout.addWidget(path_list)
+        
+        # 按钮区域 - 第一行：路径管理
+        btn_layout = QHBoxLayout()
+        
+        btn_add = QPushButton(f"➕ {tr('Add Path')}")
+        def add_path():
+            folder = QFileDialog.getExistingDirectory(dialog, tr("Select Archive Folder"))
+            if folder:
+                if SessionLogger.add_search_path(folder):
+                    new_item = QListWidgetItem(f"✅ {folder}")
+                    new_item.setData(Qt.UserRole, folder)  # 修复：设置 UserRole 数据
+                    path_list.addItem(new_item)
+                    self._refresh_sessions()
+        btn_add.clicked.connect(add_path)
+        btn_layout.addWidget(btn_add)
+        
+        # 导入 Session 文件按钮
+        btn_import_session = QPushButton(f"📄 {tr('Import Session File')}")
+        def import_session_file():
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog, tr("Select Session Log File"), "", 
+                "Session JSON (*.json)"
+            )
+            if file_path:
+                # 将 session 文件复制到默认目录并添加父文件夹到搜索路径
+                import shutil
+                src = Path(file_path)
+                parent_folder = src.parent
+                
+                # 将父文件夹添加到搜索路径
+                if SessionLogger.add_search_path(str(parent_folder)):
+                    new_item = QListWidgetItem(f"✅ {parent_folder}")
+                    new_item.setData(Qt.UserRole, str(parent_folder))
+                    path_list.addItem(new_item)
+                
+                self._refresh_sessions()
+                QMessageBox.information(dialog, tr("Import Success"), 
+                    f"{tr('Session imported successfully!')}\n\n{tr('Path added')}: {parent_folder}")
+        btn_import_session.clicked.connect(import_session_file)
+        btn_layout.addWidget(btn_import_session)
+        btn_layout.addWidget(btn_add)
+        
+        btn_locate = QPushButton(f"🔍 {tr('Locate')}")
+        def locate_path():
+            item = path_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, tr("Error"), tr("Please select a path first."))
+                return
+            old_path = item.data(Qt.UserRole)
+            if not old_path:
+                QMessageBox.warning(dialog, tr("Error"), tr("Invalid path data."))
+                return
+            if Path(old_path).exists():
+                QMessageBox.information(dialog, tr("Path Valid"), tr("This path is valid."))
+                return
+            
+            # 尝试 Everything 自动查找
+            new_path = SessionLogger.try_relocate_path(old_path)
+            if new_path:
+                SessionLogger.update_search_path(old_path, new_path)
+                item.setText(f"✅ {new_path}")
+                item.setData(Qt.UserRole, new_path)
+                item.setForeground(Qt.white)
+                QMessageBox.information(dialog, tr("Path Located"), f"{tr('Found at')}:\n{new_path}")
+                self._refresh_sessions()
+            else:
+                # Everything 未找到，手动选择
+                reply = QMessageBox.question(dialog, tr("Not Found"), 
+                    tr("Could not auto-locate. Browse manually?"),
+                    QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    folder = QFileDialog.getExistingDirectory(dialog, tr("Manual Select Folder"))
+                    if folder:
+                        SessionLogger.update_search_path(old_path, folder)
+                        item.setText(f"✅ {folder}")
+                        item.setData(Qt.UserRole, folder)
+                        item.setForeground(Qt.white)
+                        self._refresh_sessions()
+        btn_locate.clicked.connect(locate_path)
+        btn_layout.addWidget(btn_locate)
+        
+        btn_remove = QPushButton(f"🗑️ {tr('Remove')}")
+        def remove_path():
+            item = path_list.currentItem()
+            if item:
+                path = item.data(Qt.UserRole)
+                if path:
+                    SessionLogger.remove_search_path(path)
+                path_list.takeItem(path_list.row(item))
+                self._refresh_sessions()
+        btn_remove.clicked.connect(remove_path)
+        btn_layout.addWidget(btn_remove)
+        
+        btn_cleanup = QPushButton(f"🧹 {tr('Cleanup Invalid')}")
+        def cleanup_invalid():
+            count = SessionLogger.cleanup_invalid_paths()
+            if count > 0:
+                QMessageBox.information(dialog, tr("Cleanup Complete"), f"{tr('Removed')} {count} {tr('invalid paths')}")
+                dialog.accept()
+                self._show_path_manager()  # 重新打开刷新
+            else:
+                QMessageBox.information(dialog, tr("Cleanup Complete"), tr("No invalid paths found."))
+        btn_cleanup.clicked.connect(cleanup_invalid)
+        btn_layout.addWidget(btn_cleanup)
+        
+        layout.addLayout(btn_layout)
+        
+        # Everything 状态 - 显示详细诊断信息
+        available, status_msg = SessionLogger.get_everything_status()
+        if available:
+            layout.addWidget(QLabel(f"<span style='color:#4CAF50'>✅ {status_msg}</span>"))
+        else:
+            lbl_hint = QLabel(f"<span style='color:#FF9800'>⚠️ {status_msg}</span><br>"
+                              f"<a href='https://voidtools.com/'>{tr('Download')} Everything</a>")
+            lbl_hint.setOpenExternalLinks(True)
+            layout.addWidget(lbl_hint)
+        
+        # 关闭按钮
+        btn_close = QPushButton(tr("Close"))
+        btn_close.clicked.connect(dialog.accept)
+        layout.addWidget(btn_close)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+    
+    def _check_everything_hint(self):
+        """首次使用时检测 Everything 并显示提示"""
+        from utils.session_logger import SessionLogger
+        from qtpy.QtCore import QSettings
+        
+        settings = QSettings("NapariUser", "Recovery")
+        if settings.value("everything_hint_shown", False):
+            return
+        
+        if not SessionLogger.check_everything_available():
+            QMessageBox.information(self, tr("Tip"),
+                f"{tr('Everything search engine not detected.')}\n\n"
+                f"{tr('Installing it enables')}:\n"
+                f"• {tr('Auto-locate moved archive folders')}\n"
+                f"• {tr('Millisecond full-disk search')}\n\n"
+                f"{tr('Download')}: https://voidtools.com/")
+        
+        settings.setValue("everything_hint_shown", True)
+    
+    def _show_session_context_menu(self, pos):
+        """显示会话右键菜单"""
+        item = self.session_list.itemAt(pos)
+        if not item:
+            return
+        
+        idx = item.data(Qt.UserRole)
+        if idx is None or idx >= len(self.sessions):
+            return
+        
+        session = self.sessions[idx]
+        log_path = session.get("_log_path", "")
+        
+        menu = QMenu(self)
+        
+        # 在文件浏览器中打开
+        action_open_folder = QAction(f"📂 {tr('Open in Explorer')}", self)
+        action_open_folder.triggered.connect(lambda: self._open_in_explorer(log_path))
+        menu.addAction(action_open_folder)
+        
+        menu.addSeparator()
+        
+        # 收藏/取消收藏
+        starred = session.get("starred", False)
+        star_text = tr("Unstar Session") if starred else tr("Star Session")
+        action_star = QAction(f"{'⭐' if not starred else '☆'} {star_text}", self)
+        action_star.triggered.connect(lambda: self._toggle_star_session(session))
+        menu.addAction(action_star)
+        
+        # 编辑标签
+        action_label = QAction(f"🏷️ {tr('Edit Label')}", self)
+        action_label.triggered.connect(lambda: self._edit_session_label(session))
+        menu.addAction(action_label)
+        
+        menu.addSeparator()
+        
+        # 删除会话
+        action_delete = QAction(f"🗑️ {tr('Delete Session')}", self)
+        action_delete.triggered.connect(lambda: self._delete_session(session))
+        menu.addAction(action_delete)
+        
+        menu.exec_(self.session_list.mapToGlobal(pos))
+    
+    def _open_in_explorer(self, log_path):
+        """在文件浏览器中打开会话所在文件夹"""
+        import subprocess
+        import os
+        
+        if not log_path:
+            return
+        
+        path = Path(log_path)
+        folder = path.parent if path.is_file() else path
+        
+        # 检查是否需要确认
+        from qtpy.QtCore import QSettings
+        settings = QSettings("NapariUser", "Recovery")
+        ask_confirm = settings.value("ask_open_explorer", True, type=bool)
+        
+        if ask_confirm:
+            msg = QMessageBox(self)
+            msg.setWindowTitle(tr("Open in Explorer"))
+            msg.setText(f"{tr('Open folder in file explorer?')}\n\n{folder}")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            
+            chk_dont_ask = QCheckBox(tr("Don't ask again"))
+            msg.setCheckBox(chk_dont_ask)
+            
+            if msg.exec_() != QMessageBox.Yes:
+                return
+            
+            if chk_dont_ask.isChecked():
+                settings.setValue("ask_open_explorer", False)
+        
+        # 打开文件浏览器
+        if os.name == 'nt':  # Windows
+            subprocess.run(['explorer', str(folder)])
+        else:  # macOS / Linux
+            subprocess.run(['open' if os.uname().sysname == 'Darwin' else 'xdg-open', str(folder)])
+    
+    def _delete_current_session(self):
+        """删除当前选中的会话"""
+        if not self.current_session:
+            QMessageBox.warning(self, tr("Error"), tr("Please select a session first."))
+            return
+        self._delete_session(self.current_session)
+    
+    def _delete_session(self, session):
+        """删除指定会话"""
+        log_path = session.get("_log_path", "")
+        if not log_path:
+            return
+        
+        reply = QMessageBox.question(self, tr("Delete Session"),
+            f"{tr('Are you sure you want to delete this session?')}\n\n{Path(log_path).name}",
+            QMessageBox.Yes | QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        try:
+            path = Path(log_path)
+            if path.exists():
+                path.unlink()
+            
+            QMessageBox.information(self, tr("Session deleted"), tr("Session has been deleted."))
+            self._refresh_sessions()
+        except Exception as e:
+            QMessageBox.critical(self, tr("Error"), f"{tr('Failed to delete session')}: {e}")
+    
+    def _toggle_star_session(self, session):
+        """切换会话收藏状态"""
+        from utils.session_logger import SessionLogger
+        log_path = session.get("_log_path", "")
+        if not log_path:
+            return
+        
+        current_starred = session.get("starred", False)
+        SessionLogger.update_session_file(Path(log_path), starred=not current_starred)
+        self._refresh_sessions()
+    
+    def _edit_session_label(self, session):
+        """编辑会话标签"""
+        from qtpy.QtWidgets import QInputDialog
+        from utils.session_logger import SessionLogger
+        
+        log_path = session.get("_log_path", "")
+        if not log_path:
+            return
+        
+        current_label = session.get("label", "")
+        new_label, ok = QInputDialog.getText(self, tr("Edit Label"), 
+            tr("Enter label for this session:"), text=current_label)
+        
+        if ok:
+            SessionLogger.update_session_file(Path(log_path), label=new_label)
+            self._refresh_sessions()
+    
+    def _switch_to_import_tab(self):
+        """切换到 Import 标签页"""
+        from qtpy.QtWidgets import QTabWidget
+        
+        try:
+            # 方法1: 向上查找 QTabWidget 父组件
+            parent = self.parent()
+            tab_widget = None
+            
+            while parent is not None:
+                if isinstance(parent, QTabWidget):
+                    tab_widget = parent
+                    break
+                # 检查父组件的子组件中是否有 QTabWidget
+                for child in parent.children():
+                    if isinstance(child, QTabWidget):
+                        tab_widget = child
+                        break
+                if tab_widget:
+                    break
+                parent = parent.parent()
+            
+            if tab_widget:
+                # 查找 Import 标签页
+                for i in range(tab_widget.count()):
+                    tab_text = tab_widget.tabText(i)
+                    if 'Import' in tab_text or '导入' in tab_text:
+                        tab_widget.setCurrentIndex(i)
+                        print(f"[Recovery] Switched to Import tab (index {i})")
+                        return True
+            
+            print("[Recovery] Could not find tab widget")
+            return False
+            
+        except Exception as e:
+            print(f"[Recovery] Tab switch error: {e}")
+            return False

@@ -19,7 +19,7 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
                             QProgressDialog, QApplication,QScrollArea)
 from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QColor
-from utils.utils import resource_path
+from utils.utils import resource_path, elide_text
 import numpy as np
 import napari
 import cv2
@@ -854,7 +854,7 @@ class AnnotationWidget(QWidget):
     # ========== Utils ==========
     def _refresh_layers(self):
         """刷新图层并自动选中"""
-        current_text = self.layer_combo.currentText()
+        current_data = self.layer_combo.currentData()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
         
@@ -862,21 +862,27 @@ class AnnotationWidget(QWidget):
             if (hasattr(layer, 'data') and 
                 isinstance(layer.data, np.ndarray) and 
                 len(layer.data.shape) >= 3):
-                self.layer_combo.addItem(layer.name)
+                short = elide_text(layer.name, 25)
+                self.layer_combo.addItem(short, layer.name)
+                self.layer_combo.setItemData(self.layer_combo.count()-1, layer.name, Qt.ToolTipRole)
         
         # 智能选择逻辑
         active_layer = self.viewer.layers.selection.active
-        if active_layer and self.layer_combo.findText(active_layer.name) >= 0:
-            self.layer_combo.setCurrentText(active_layer.name)
-        elif self.layer_combo.findText(current_text) >= 0:
-            self.layer_combo.setCurrentText(current_text)
+        if active_layer:
+            idx = self.layer_combo.findData(active_layer.name)
+            if idx >= 0: self.layer_combo.setCurrentIndex(idx)
+        elif current_data:
+            idx = self.layer_combo.findData(current_data)
+            if idx >= 0: self.layer_combo.setCurrentIndex(idx)
             
         self.layer_combo.blockSignals(False)
         # 强制更新状态
-        self._on_layer_selected(self.layer_combo.currentText())
+        self._on_layer_selected()
                 
-    def _on_layer_selected(self, name):
-        if name: self.current_source_layer = self.viewer.layers[name]
+    def _on_layer_selected(self, name_ignored=None):
+        name = self.layer_combo.currentData()
+        if name and name in self.viewer.layers:
+             self.current_source_layer = self.viewer.layers[name]
         
     def _format_val(self, val):
         fmt = self.label_format_combo.currentText()

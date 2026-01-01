@@ -242,29 +242,42 @@ class DriftCorrectionWidget(QWidget):
         self.auto_calc_cb.blockSignals(False)
 
     def _refresh_layers(self, event=None):
-        current_text = self.layer_combo.currentText()
+        from utils.utils import elide_text
+        current_data = self.layer_combo.currentData()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
         for layer in self.viewer.layers:
             if (hasattr(layer, 'data') and isinstance(layer.data, np.ndarray) and len(layer.data.shape) == 3):
-                self.layer_combo.addItem(layer.name)
+                # Lazy Display: 显示截断后的名称，完整名称存入 UserData
+                short = elide_text(layer.name, 25)
+                self.layer_combo.addItem(short, layer.name)
+                # 设置 Tooltip 显示完整名称
+                self.layer_combo.setItemData(self.layer_combo.count()-1, layer.name, Qt.ToolTipRole)
         
+        # 优先选择激活图层
+        index_set = False
         active_layer = self.viewer.layers.selection.active
-        if active_layer and self.layer_combo.findText(active_layer.name) >= 0:
-            self.layer_combo.setCurrentText(active_layer.name)
-        elif self.layer_combo.findText(current_text) >= 0:
-            self.layer_combo.setCurrentText(current_text)
+        if active_layer:
+            index = self.layer_combo.findData(active_layer.name)
+            if index >= 0:
+                self.layer_combo.setCurrentIndex(index)
+                index_set = True
+        
+        if not index_set and current_data:
+            index = self.layer_combo.findData(current_data)
+            if index >= 0:
+                self.layer_combo.setCurrentIndex(index)
         self.layer_combo.blockSignals(False)
         self._update_template_range()
 
     def _on_active_layer_changed(self, event=None):
         active_layer = self.viewer.layers.selection.active
         if active_layer:
-            index = self.layer_combo.findText(active_layer.name)
+            index = self.layer_combo.findData(active_layer.name)
             if index >= 0: self.layer_combo.setCurrentIndex(index)
 
     def _update_template_range(self):
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         if layer_name:
             layer = self.viewer.layers[layer_name]
             self.template_spin.setMaximum(len(layer.data) - 1)
@@ -316,7 +329,7 @@ class DriftCorrectionWidget(QWidget):
         return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
 
     def _preview_drift(self):
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         if not layer_name: return
         image_stack = self.viewer.layers[layer_name].data
         roi_bbox = self._get_roi_bbox()
@@ -377,7 +390,7 @@ class DriftCorrectionWidget(QWidget):
 
     def _apply_correction(self, auto_mode=False):
         if self.current_drifts is None: return
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         layer = self.viewer.layers[layer_name]
 
         if not auto_mode:

@@ -11,7 +11,7 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
                             QLabel, QSpinBox, QHBoxLayout, QComboBox,
                             QCheckBox, QGroupBox, QFileDialog, QLineEdit,
                             QProgressBar, QRadioButton, QButtonGroup, QScrollArea, QMessageBox)
-from qtpy.QtCore import Signal, QThread, QSettings
+from qtpy.QtCore import Signal, QThread, QSettings, Qt
 import numpy as np
 from pathlib import Path
 import json
@@ -21,6 +21,7 @@ from widgets.settings_widget import tr
 
 # 引入工具函数
 from utils.video_export import export_to_video, export_to_tiff_stack, get_available_codecs
+from utils.utils import elide_text
 
 class ExportThread(QThread):
     """导出后台线程"""
@@ -314,19 +315,30 @@ class ExportWidget(QWidget):
         
     def _refresh_layers(self, event=None):
         self._restore_last_path()
-        curr = self.layer_combo.currentText()
+        curr_data = self.layer_combo.currentData()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
         for l in self.viewer.layers:
             if hasattr(l, 'data') and isinstance(l.data, np.ndarray):
                 if l.data.ndim in [3, 4]: # 3D stack or 4D RGB
-                    self.layer_combo.addItem(l.name)
+                    short = elide_text(l.name, 25)
+                    self.layer_combo.addItem(short, l.name)
+                    self.layer_combo.setItemData(self.layer_combo.count()-1, l.name, Qt.ToolTipRole)
         
-        if curr: 
-            idx = self.layer_combo.findText(curr)
+        # 优先选择激活图层
+        index_set = False
+        active_layer = self.viewer.layers.selection.active
+        if active_layer:
+            idx = self.layer_combo.findData(active_layer.name)
+            if idx >= 0:
+                self.layer_combo.setCurrentIndex(idx)
+                index_set = True
+        
+        if not index_set and curr_data: 
+            idx = self.layer_combo.findData(curr_data)
             if idx >= 0: self.layer_combo.setCurrentIndex(idx)
         self.layer_combo.blockSignals(False)
-        self._on_layer_changed(self.layer_combo.currentText())
+        self._on_layer_changed(self.layer_combo.currentData())
 
         s = self.annotation_settings
         
@@ -346,14 +358,15 @@ class ExportWidget(QWidget):
     def _on_active_layer_changed(self, event=None):
         active = self.viewer.layers.selection.active
         if active:
-            idx = self.layer_combo.findText(active.name)
+            idx = self.layer_combo.findData(active.name)
             if idx >= 0: 
                 self.layer_combo.setCurrentIndex(idx)
 
-    def _on_layer_changed(self, txt):
-        if not txt: return
-        if txt not in self.viewer.layers: return
-        layer = self.viewer.layers[txt]
+    def _on_layer_changed(self, txt=None):
+        real_name = self.layer_combo.currentData()
+        if not real_name: return
+        if real_name not in self.viewer.layers: return
+        layer = self.viewer.layers[real_name]
         
         if hasattr(layer, 'data'):
             num_frames = layer.data.shape[0]
@@ -467,10 +480,10 @@ class ExportWidget(QWidget):
         return params
 
     def _start_export(self):
-        if not self.layer_combo.currentText() or not self.output_path: 
+        if not self.layer_combo.currentData() or not self.output_path: 
             self.lbl_status.setText(f"❌ {tr('Check inputs')}")
             return
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         # === [Fix] Warning Check (Smart) ===
         # 如果图层名包含 "Burned" 或 "Annotated"，我们假设用户已经烧录好了，跳过检查
         # 否则，如果未启用Annotation或未勾选子项，提示警告
@@ -500,7 +513,7 @@ class ExportWidget(QWidget):
         # 1. 自动处理文件名 (如果使用了归档路径)
         final_path = Path(self.output_path)
         archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         
         if archive_path and final_path == Path(archive_path):
             # 自动归档模式：生成文件名

@@ -27,6 +27,7 @@ import platform
 import ctypes
 from widgets.settings_widget import tr
 from utils.session_logger import get_logger
+from utils.utils import elide_text
 
 # 尝试导入 psutil 获取更准确的内存信息，如果没有则使用 ctypes (Windows) 或 os (Linux)
 try:
@@ -450,7 +451,7 @@ class ImportWidget(QWidget):
         self.progress = QProgressBar(); self.progress.setVisible(False); l_load.addWidget(self.progress)
         g_load.setLayout(l_load); layout.addWidget(g_load)
 
-        self.status = QLabel(""); layout.addWidget(self.status)
+        self.status = QLabel(""); self.status.setWordWrap(True); layout.addWidget(self.status)
         content.setLayout(layout); scroll.setWidget(content); main.addWidget(scroll); self.setLayout(main)
     
     def _check_worker_count(self, val):
@@ -663,6 +664,10 @@ class ImportWidget(QWidget):
         self.archive_root = str(archive_path)
         QSettings("NapariUser", "Global").setValue("archive_path", self.archive_root)
         
+        # 自动保存归档路径到持久化搜索列表（用于 Recovery 跨会话访问）
+        from utils.session_logger import SessionLogger
+        SessionLogger.add_search_path(self.archive_root)
+        
         # === [信息共享] 保存关键信息供 GeometryWidget 使用 ===
         date_str = self.meta_cache.get('date_fmt', datetime.datetime.now().strftime("%Y%m%d"))
         ds_id = self.dataset_edit.text().strip() or "ds1"
@@ -699,7 +704,7 @@ class ImportWidget(QWidget):
             print(f"SessionLogger sync failed: {e}")
 
         # 4. [Req 2] 计算大小并决定 Move vs Copy
-        self.status.setText("Checking size...")
+        self.status.setText(tr("Checking size..."))
         size_bytes = self._get_dir_size(str(self.current_folder))
         size_gb = size_bytes / (1024**3)
         move_mode = False
@@ -731,20 +736,20 @@ class ImportWidget(QWidget):
     def _on_archive_done(self, was_moved, size_gb, new_path):
         self.archive_progress.setVisible(False)
         self.create_archive_btn.setEnabled(True)
-        self.status.setText(f"✅ Archived: {Path(self.archive_root).name}")
+        self.status.setText(f"✅ {tr('Archived:')} {Path(self.archive_root).name}")
 
         if was_moved:
             self.current_folder = str(new_path)
             self._update_folder_label(str(new_path))
             self.settings.setValue("last_folder", str(new_path))
             # 刷新一下 ID 提取 (可选，确保一致性)
-            self.status.setText("ℹ️ Source path updated to archive location.")
+            self.status.setText(f"ℹ️ {tr('Source path updated to archive location.')}")
         
         # [Req New] Popup with details
         if self.check_show_popup.isChecked():
             mode_str = tr("MOVE (Fast)") if was_moved else tr("COPY (Safe)")
             msg = tr("Archive created successfully!") + "\n\n" \
-                  f"📂 Path: {self.archive_root}\n" \
+                  f"📂 Path: {elide_text(str(self.archive_root), 40)}\n" \
                   f"📦 Source Size: {size_gb:.2f} GB\n" \
                   f"⚙️ Mode: {mode_str}\n"
             

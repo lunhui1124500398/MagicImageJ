@@ -253,6 +253,15 @@ TRANS_CN = {
     "Recovery complete": "恢复完成",
     "actions recovered": "个操作已恢复",
     "No incomplete sessions found, or recovery was skipped.": "未找到未完成的会话，或已跳过恢复。",
+    "Continue": "继续",
+    "Skip This": "跳过此项",
+    "Cancel All": "取消全部",
+    "Continue Without Import": "不导入继续",
+    "Archived:": "已归档：",
+    "Source path updated to archive location.": "源路径已更新至归档位置。",
+    "Checking size...": "正在检查大小...",
+    "Archive Only": "仅归档",
+    "Starred Only": "仅收藏",
     
     # === Recovery Widget (独立组件) ===
     "Recovery": "会话恢复",
@@ -698,6 +707,71 @@ TRANS_CN = {
 
     "Memmap Warning Threshold:": "内存分配预警阈值:",
     "Show warning if single allocation exceeds this size (Check RAM vs C: drive).": "若单次分配超过此大小则预警 (可能物理内存撑不住，殃及C盘)。",
+    
+    # === 路径管理与 Everything 集成 ===
+    "Manage Paths": "管理搜索路径",
+    "Manage Search Paths": "管理搜索路径",
+    "Saved Search Paths": "已保存的搜索路径",
+    "Sessions from these folders will be shown in the list.": "这些文件夹中的会话将显示在列表中。",
+    "Add Path": "添加路径",
+    "Select Archive Folder": "选择归档文件夹",
+    "Locate": "定位",
+    "Path Valid": "路径有效",
+    "This path is valid.": "此路径有效。",
+    "Path Located": "路径已定位",
+    "Found at": "已找到于",
+    "Manual Select Folder": "手动选择文件夹",
+    "Remove": "移除",
+    "Cleanup Invalid": "清理无效路径",
+    "Cleanup Complete": "清理完成",
+    "Removed": "已移除",
+    "invalid paths": "个无效路径",
+    "No invalid paths found.": "未发现无效路径。",
+    "search available": "搜索可用",
+    "not available": "不可用",
+    "Download": "下载",
+    "Close": "关闭",
+    "Tip": "提示",
+    "Everything search engine not detected.": "未检测到 Everything 搜索引擎。",
+    "Installing it enables": "安装后可获得以下功能",
+    "Auto-locate moved archive folders": "自动定位移动后的归档文件夹",
+    "Millisecond full-disk search": "毫秒级全盘搜索",
+    
+    # === 对比度应用进度条 ===
+    "Applying contrast adjustment...": "正在应用对比度调整...",
+    "Converting data type...": "正在转换数据类型...",
+    "Normalizing...": "正在归一化...",
+    "Clipping values...": "正在裁剪数值...",
+    "Mapping to uint8...": "正在映射到 uint8...",
+    "Rendering result...": "正在渲染结果...",
+    
+    # === 路径管理器错误提示 ===
+    "Please select a path first.": "请先选择一个路径。",
+    "Invalid path data.": "无效的路径数据。",
+    "Not Found": "未找到",
+    "Could not auto-locate. Browse manually?": "自动定位失败。是否手动浏览？",
+    
+    # === 右键菜单与会话管理 ===
+    "Open in Explorer": "在文件浏览器中打开",
+    "Open folder in file explorer?": "是否在文件浏览器中打开此文件夹？",
+    "Don't ask again": "不再询问",
+    "Delete the selected session from disk": "从磁盘删除选中的会话",
+    "Session has been deleted.": "会话已删除。",
+    "Failed to delete session": "删除会话失败",
+    
+    # === 导入 Session 文件 ===
+    "Import Session File": "导入 Session 文件",
+    "Select Session Log File": "选择 Session 日志文件",
+    "Import Success": "导入成功",
+    "Session imported successfully!": "Session 导入成功！",
+    "Path added": "已添加路径",
+    
+    # === DM4 自动导入改进 ===
+    "DM4 Auto-Import": "DM4 自动导入",
+    "DM4 Archive detected. Auto-set path and switch to Import tab?": "检测到 DM4 归档。是否自动设置路径并切换到导入标签页？",
+    "Path Set": "路径已设置",
+    "DM4 folder path set. Click Load Images to proceed.": "DM4 文件夹路径已设置。点击'加载图像'继续。",
+    "Select DM4 Folder": "选择 DM4 文件夹",
 }
 
 def tr(text):
@@ -724,6 +798,7 @@ class GlobalConfig:
         "shortcut_undo_drift": "Ctrl+Z",
         "shortcut_apply_crop": "Enter",
         "shortcut_switch_mode": "M",
+        "shortcut_delete_session": "Delete",  # 删除会话快捷键
         
         # Drift Defaults
         "drift_kernel": 11,
@@ -1474,7 +1549,8 @@ class SettingsDialog(QDialog):
             "shortcut_apply_crop": tr("Apply Crop / Export"),
             "shortcut_switch_mode": tr("Switch Draw/Select Mode"),
             "shortcut_session_star": tr("Star / Unstar Session"),
-            "shortcut_session_label": tr("Edit Session Label")
+            "shortcut_session_label": tr("Edit Session Label"),
+            "shortcut_delete_session": tr("Delete Session")
         }
         for key, label in shortcuts_map.items():
             val = str(GlobalConfig.get(key))

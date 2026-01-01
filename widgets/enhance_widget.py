@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
+from utils.utils import elide_text
 
 # JSON Encoder
 class NumpyEncoder(json.JSONEncoder):
@@ -281,22 +282,35 @@ class EnhanceWidget(QWidget):
         self.max_workers_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_workers", v))
 
     def _refresh_layers_silently(self, event=None):
-        current_text = self.layer_combo.currentText()
+        current_data = self.layer_combo.currentData()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
         for layer in self.viewer.layers:
             if hasattr(layer, 'data') and isinstance(layer.data, np.ndarray):
                 if layer.data.ndim == 3: 
-                    self.layer_combo.addItem(layer.name)
-        index = self.layer_combo.findText(current_text)
-        if index >= 0: self.layer_combo.setCurrentIndex(index)
+                    short = elide_text(layer.name, 25)
+                    self.layer_combo.addItem(short, layer.name)
+                    self.layer_combo.setItemData(self.layer_combo.count()-1, layer.name, Qt.ToolTipRole)
+        
+        # 优先选择激活图层
+        index_set = False
+        active_layer = self.viewer.layers.selection.active
+        if active_layer:
+            index = self.layer_combo.findData(active_layer.name)
+            if index >= 0:
+                self.layer_combo.setCurrentIndex(index)
+                index_set = True
+        
+        if not index_set and current_data:
+            index = self.layer_combo.findData(current_data)
+            if index >= 0: self.layer_combo.setCurrentIndex(index)
         self.layer_combo.blockSignals(False)
 
     def _on_active_layer_changed(self, event=None):
         active_layer = self.viewer.layers.selection.active
         if active_layer:
             self.layer_combo.blockSignals(True)
-            index = self.layer_combo.findText(active_layer.name)
+            index = self.layer_combo.findData(active_layer.name)
             if index >= 0: self.layer_combo.setCurrentIndex(index)
             self.layer_combo.blockSignals(False)
             self._update_histogram()
@@ -331,7 +345,7 @@ class EnhanceWidget(QWidget):
         if not self.use_average_check.isChecked():
             self.frame_loss_label.setText("")
             return
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         if not layer_name or layer_name not in self.viewer.layers: return
         total_frames = len(self.viewer.layers[layer_name].data)
         window_size = self.window_spin.value()
@@ -350,7 +364,7 @@ class EnhanceWidget(QWidget):
         }
 
     def _apply_enhancement(self):
-        layer_name = self.layer_combo.currentText()
+        layer_name = self.layer_combo.currentData()
         if not layer_name: return
         image_stack = self.viewer.layers[layer_name].data
         params = self._get_enhancement_params()
@@ -373,7 +387,7 @@ class EnhanceWidget(QWidget):
         self.progress_bar.setVisible(False)
         self.apply_btn.setEnabled(True)
         try:
-            layer_name = self.layer_combo.currentText()
+            layer_name = self.layer_combo.currentData()
             input_layer = self.viewer.layers[layer_name]
             
             if not enhanced_stack.flags['C_CONTIGUOUS']:
@@ -381,11 +395,12 @@ class EnhanceWidget(QWidget):
             new_layer_name = f"Enh_{layer_name}"
             new_layer = self.viewer.add_image(enhanced_stack, name=new_layer_name, colormap='gray', metadata={'source_layer': layer_name})
             
-            # === Log params ===
-            self._log_action("filter_enhancement", {
+            # === Log params and save action_id ===
+            action_id = self._log_action("filter_enhancement", {
                 "source": layer_name,
                 "params": params
             })
+            new_layer.metadata['action_id'] = action_id
 
             self.status_label.setText(f"✅ {tr('Done. Layer: %s.') % new_layer_name}")
             if layer_name in self.viewer.layers:
@@ -404,6 +419,13 @@ class EnhanceWidget(QWidget):
                 # 2. 删除当前层
                 self.viewer.layers.remove(layer)
                 self.status_label.setText(f"↩️ {tr('Enhancement Undone.')}")
+                # 3. 记录撤回
+                aid = layer.metadata.get('action_id')
+                if aid:
+                    try:
+                        from utils.session_logger import get_logger
+                        get_logger().log_undo(aid)
+                    except: pass
         except Exception as e:
             self.status_label.setText(f"❌ {tr('Error:')} {str(e)}")
 
@@ -557,13 +579,14 @@ class EnhanceWidget(QWidget):
                 metadata={'source_layer': original_layer.name}
             )
             
-            # 记录日志
-            self._log_action("contrast_adjustment", {
+            # 记录日志并保存 action_id
+            action_id = self._log_action("contrast_adjustment", {
                 "source": original_layer.name,
                 "min": c_min,
                 "max": c_max,
                 "clipped": True
             })
+            new_layer.metadata['action_id'] = action_id
 
             self.status_label.setText(f"✅ {tr('Applied. New layer: %s') % new_layer_name}")
             
@@ -582,17 +605,25 @@ class EnhanceWidget(QWidget):
                     self.viewer.layers.selection.active = self.viewer.layers[src]
                 self.viewer.layers.remove(layer)
                 self.status_label.setText(f"↩️ {tr('Contrast Undo.')}")
+                # 记录撤回
+                aid = layer.metadata.get('action_id')
+                if aid:
+                    try:
+                        from utils.session_logger import get_logger
+                        get_logger().log_undo(aid)
+                    except: pass
 
         except Exception as e:
             self.status_label.setText(f"❌ {tr('Error:')} {str(e)}")
 
     def _log_action(self, key, info):
-        """使用 SessionLogger 记录操作"""
+        """使用 SessionLogger 记录操作，并返回 action_id"""
         try:
             from utils.session_logger import get_logger
-            get_logger().log_action("enhance", key, info)
+            return get_logger().log_action("enhance", key, info)
         except Exception as e:
             print(f"Log error: {e}")
+            return None
     
     def _load_params_from_config(self):
         self.use_gaussian_check.blockSignals(True)

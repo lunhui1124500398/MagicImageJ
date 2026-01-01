@@ -26,6 +26,7 @@ import os
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
+from utils.utils import elide_text
 
 # ==========================================
 #  新增：后台图像读取线程 (防止界面卡死)
@@ -618,17 +619,33 @@ class GeometryWidget(QWidget):
         
         for combo in [self.rotate_layer_combo, self.simple_crop_combo, 
                       self.batch_data_combo, self.batch_view_combo]:
-            current = combo.currentText()
+            current_data = combo.currentData()
+            current_text = combo.currentText()
+            # 兼容：如果之前有 Data 则用 Data，否则用 Text (首次运行)
+            stored_selection = current_data if current_data else current_text
+            
             combo.blockSignals(True)
             combo.clear()
-            combo.addItems(layers)
+            for l_name in layers:
+                short = elide_text(l_name, 25)
+                combo.addItem(short, l_name)
+                combo.setItemData(combo.count()-1, l_name, Qt.ToolTipRole)
             
-            if current in layers:
-                combo.setCurrentText(current)
-            elif layers and combo in [self.rotate_layer_combo, self.simple_crop_combo]:
+            # 激活图层优先 (用于 rotate/crop 组合框)
+            active_layer_applied = False
+            if layers and combo in [self.rotate_layer_combo, self.simple_crop_combo]:
                 active = self.viewer.layers.selection.active
                 if active and active.name in layers:
-                    combo.setCurrentText(active.name)
+                    idx = combo.findData(active.name)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+                        active_layer_applied = True
+            
+            # 仅在未应用激活图层时使用保存的选择
+            if not active_layer_applied and stored_selection:
+                idx = combo.findData(stored_selection)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
             
             combo.blockSignals(False)
         
@@ -639,15 +656,18 @@ class GeometryWidget(QWidget):
         if not data_candidates:
              data_candidates = [l for l in layers if "Rotated" in l and "Enh" not in l and "Contrast" not in l and "Burned" not in l]
         if data_candidates:
-            self.batch_data_combo.setCurrentText(data_candidates[-1])
+            idx = self.batch_data_combo.findData(data_candidates[-1])
+            if idx >= 0: self.batch_data_combo.setCurrentIndex(idx)
 
         view_candidates = [l for l in layers if l.startswith("Contrast_Enh")]
         if not view_candidates:
             view_candidates = [l for l in layers if l.startswith("Enh")]
         if view_candidates:
-            self.batch_view_combo.setCurrentText(view_candidates[-1])
-        elif self.batch_data_combo.currentText():
-            self.batch_view_combo.setCurrentText(self.batch_data_combo.currentText())
+            idx = self.batch_view_combo.findData(view_candidates[-1])
+            if idx >= 0: self.batch_view_combo.setCurrentIndex(idx)
+        elif self.batch_data_combo.currentData():
+            idx = self.batch_view_combo.findData(self.batch_data_combo.currentData())
+            if idx >= 0: self.batch_view_combo.setCurrentIndex(idx)
 
         self.batch_data_combo.blockSignals(False)
         self.batch_view_combo.blockSignals(False)
@@ -680,16 +700,21 @@ class GeometryWidget(QWidget):
         active = self.viewer.layers.selection.active
         if active and hasattr(active, 'data') and isinstance(active.data, np.ndarray) and active.data.ndim == 3:
             name = active.name
-            self.rotate_layer_combo.setCurrentText(name)
-            self.simple_crop_combo.setCurrentText(name)
+            idx1 = self.rotate_layer_combo.findData(name)
+            if idx1 >= 0: self.rotate_layer_combo.setCurrentIndex(idx1)
+            idx2 = self.simple_crop_combo.findData(name)
+            if idx2 >= 0: self.simple_crop_combo.setCurrentIndex(idx2)
 
     def _sync_batch_layers(self):
-        txt = self.batch_data_combo.currentText()
-        if txt: self.batch_view_combo.setCurrentText(txt)
+        # 将裁剪源(Data)同步为参考源(View)的选择
+        txt = self.batch_view_combo.currentData()
+        if txt:
+            idx = self.batch_data_combo.findData(txt)
+            if idx >= 0: self.batch_data_combo.setCurrentIndex(idx)
 
     def _enforce_view_visibility(self, event=None):
         if not self._force_view_active: return
-        view_name = self.batch_view_combo.currentText()
+        view_name = self.batch_view_combo.currentData()
         if not view_name or view_name not in self.viewer.layers: return
         try: self.viewer.layers.events.reordered.disconnect(self._enforce_view_visibility)
         except: pass
@@ -704,7 +729,7 @@ class GeometryWidget(QWidget):
                 self.viewer.layers.remove(name)
 
     def _peek_data_layer_show(self):
-        data_name = self.batch_data_combo.currentText()
+        data_name = self.batch_data_combo.currentData()
         if not data_name or data_name not in self.viewer.layers: return
         self._force_view_active = False 
         for l in self.viewer.layers:
@@ -716,7 +741,7 @@ class GeometryWidget(QWidget):
             self._force_view_active = True
             self._enforce_view_visibility() 
         else:
-            view_name = self.batch_view_combo.currentText()
+            view_name = self.batch_view_combo.currentData()
             if view_name in self.viewer.layers:
                 for l in self.viewer.layers:
                     if isinstance(l, napari.layers.Image):
@@ -741,7 +766,7 @@ class GeometryWidget(QWidget):
             self.angle_spin.setValue(angle)
 
     def _apply_rotation(self):
-        layer_name = self.rotate_layer_combo.currentText()
+        layer_name = self.rotate_layer_combo.currentData()
         if not layer_name: return
         angle = self.angle_spin.value()
         expand = self.enlarge_check.isChecked()
@@ -762,9 +787,23 @@ class GeometryWidget(QWidget):
                 if layer_name in self.viewer.layers:
                     self.viewer.layers[layer_name].visible = False
                 self._clear_residue(["Rotation_Line"])
-                self.simple_crop_combo.setCurrentText(new_name)
+                self._refresh_layers()  # 刷新后使用 findData
+                idx = self.simple_crop_combo.findData(new_name)
+                if idx >= 0: self.simple_crop_combo.setCurrentIndex(idx)
                 self.viewer.layers.selection.active = new_layer
                 undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+                
+                # === [日志记录] 旋转操作 ===
+                action_id = None
+                try:
+                    action_id = get_logger().log_action("geometry", "rotate", {
+                        "source_layer": layer_name,
+                        "angle": angle,
+                        "expand": expand
+                    })
+                    new_layer.metadata['action_id'] = action_id
+                except: pass
+                
                 @new_layer.bind_key(undo_key, overwrite=True)
                 def undo_rotation(layer):
                     src = layer.metadata.get('source_layer')
@@ -773,16 +812,13 @@ class GeometryWidget(QWidget):
                         self.viewer.layers.selection.active = self.viewer.layers[src]
                     self.viewer.layers.remove(layer)
                     self.status_label.setText(f"↩️ {tr('Rotation Undone.')}")
+                    # 记录撤回
+                    aid = layer.metadata.get('action_id')
+                    if aid:
+                        try:
+                            get_logger().log_undo(aid)
+                        except: pass
                 self.status_label.setText(f"✅ {tr('Rotated %.1f° (Expand=%s)') % (angle, expand)}")
-                
-                # === [日志记录] 旋转操作 ===
-                try:
-                    get_logger().log_action("geometry", "rotate", {
-                        "source_layer": layer_name,
-                        "angle": angle,
-                        "expand": expand
-                    })
-                except: pass
             except Exception as e:
                 self.status_label.setText(f"{tr('Error showing result:')} {e}")
         
@@ -795,7 +831,7 @@ class GeometryWidget(QWidget):
         self.rot_thread.start()
 
     def _apply_flip(self, direction):
-        layer_name = self.rotate_layer_combo.currentText()
+        layer_name = self.rotate_layer_combo.currentData()
         if not layer_name: return
         image_stack = self.viewer.layers[layer_name].data
         try:
@@ -803,8 +839,11 @@ class GeometryWidget(QWidget):
             suffix = "FlipH" if direction == 'horizontal' else "FlipV"
             new_name = f"{suffix}_{layer_name}"
             self.viewer.add_image(flipped, name=new_name, colormap='gray')
-            self.rotate_layer_combo.setCurrentText(new_name)
-            self.simple_crop_combo.setCurrentText(new_name)
+            self._refresh_layers()
+            idx1 = self.rotate_layer_combo.findData(new_name)
+            if idx1 >= 0: self.rotate_layer_combo.setCurrentIndex(idx1)
+            idx2 = self.simple_crop_combo.findData(new_name)
+            if idx2 >= 0: self.simple_crop_combo.setCurrentIndex(idx2)
             self.viewer.layers.selection.active = self.viewer.layers[new_name]
             self.status_label.setText(f"✅ {tr('Applied %s flip.') % direction}")
             
@@ -838,7 +877,7 @@ class GeometryWidget(QWidget):
         self.status_label.setText(f"✏️ {tr('Draw Single Crop Rect.')}")
 
     def _apply_crop(self):
-        target = self.simple_crop_combo.currentText()
+        target = self.simple_crop_combo.currentData()
         if not target or "Crop_ROI" not in self.viewer.layers: return
         shapes = self.viewer.layers["Crop_ROI"].data
         if not shapes: return
@@ -861,6 +900,16 @@ class GeometryWidget(QWidget):
                     layer.visible = False
         undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift") 
         
+        # === [日志记录] 裁剪操作 ===
+        action_id = None
+        try:
+            action_id = get_logger().log_action("geometry", "crop", {
+                "source_layer": target,
+                "bbox": list(bbox)  # [x1, y1, x2, y2]
+            })
+            new_layer.metadata['action_id'] = action_id
+        except: pass
+        
         @new_layer.bind_key(undo_key, overwrite=True)
         def undo_crop(layer):
             if layer in self.viewer.layers:
@@ -870,20 +919,18 @@ class GeometryWidget(QWidget):
                 self.viewer.layers.selection.active = self.viewer.layers[target]
             self._draw_crop_rect()
             self.status_label.setText(f"↩️ {tr('Crop Undone.')}")
+            # 记录撤回
+            aid = layer.metadata.get('action_id')
+            if aid:
+                try:
+                    get_logger().log_undo(aid)
+                except: pass
 
         self.status_label.setText(f"""✅ {tr("Crop applied. Press '%s' to Undo.") % undo_key}""")
-        
-        # === [日志记录] 裁剪操作 ===
-        try:
-            get_logger().log_action("geometry", "crop", {
-                "source_layer": target,
-                "bbox": list(bbox)  # [x1, y1, x2, y2]
-            })
-        except: pass
 
     # --- Batch Crop Logic ---
     def _start_batch_mode(self):
-        view_layer = self.batch_view_combo.currentText()
+        view_layer = self.batch_view_combo.currentData()
         if not view_layer: return
         
         # 1. 如果图层已存在，进入恢复模式 (Resume)
@@ -1191,7 +1238,7 @@ class GeometryWidget(QWidget):
         
         self._last_shape_count = current_count
         
-        view_layer_name = self.batch_view_combo.currentText()
+        view_layer_name = self.batch_view_combo.currentData()
         if view_layer_name not in self.viewer.layers: return
         
         img_layer = self.viewer.layers[view_layer_name]
@@ -1263,8 +1310,8 @@ class GeometryWidget(QWidget):
         
         # === [SessionLogger] 记录 ROI 快照用于恢复 ===
         try:
-            view_layer_name = self.batch_view_combo.currentText()
-            data_layer_name = self.batch_data_combo.currentText()
+            view_layer_name = self.batch_view_combo.currentData()
+            data_layer_name = self.batch_data_combo.currentData()
             
             rois_snapshot = []
             for i, poly in enumerate(layer.data):
@@ -1356,8 +1403,8 @@ class GeometryWidget(QWidget):
         roi_layer = self.viewer.layers["Batch_ROI"]
         if len(roi_layer.data) == 0: return
         
-        view_layer_name = self.batch_view_combo.currentText()
-        data_layer_name = self.batch_data_combo.currentText()
+        view_layer_name = self.batch_view_combo.currentData()
+        data_layer_name = self.batch_data_combo.currentData()
         
         if not view_layer_name or view_layer_name not in self.viewer.layers:
             self.status_label.setText(f"❌ {tr('Ref image missing.')}")
@@ -1710,13 +1757,18 @@ class GeometryWidget(QWidget):
             
             # 2. 根据 role 自动选中下拉框
             # 这样用户就不用手动去 ComboBox 里再选一次了
+            self._refresh_layers()  # 先刷新图层列表
             if role == 'data':
-                self.batch_data_combo.setCurrentText(new_layer.name)
+                idx = self.batch_data_combo.findData(new_layer.name)
+                if idx >= 0: self.batch_data_combo.setCurrentIndex(idx)
             elif role == 'view':
-                self.batch_view_combo.setCurrentText(new_layer.name)
+                idx = self.batch_view_combo.findData(new_layer.name)
+                if idx >= 0: self.batch_view_combo.setCurrentIndex(idx)
             elif role == 'both':
-                self.batch_data_combo.setCurrentText(new_layer.name)
-                self.batch_view_combo.setCurrentText(new_layer.name)
+                idx1 = self.batch_data_combo.findData(new_layer.name)
+                if idx1 >= 0: self.batch_data_combo.setCurrentIndex(idx1)
+                idx2 = self.batch_view_combo.findData(new_layer.name)
+                if idx2 >= 0: self.batch_view_combo.setCurrentIndex(idx2)
                 
             # 3. 强制刷新一下下拉框状态（有时候添加新图层后 Combo 不会自动刷新）
             # 注意：_refresh_layers 已经在 layer inserted 事件中绑定了，
@@ -1769,8 +1821,8 @@ class GeometryWidget(QWidget):
 
     def _export_batch_crops(self):
         # 1. 基础校验
-        data_layer_name = self.batch_data_combo.currentText()
-        view_layer_name = self.batch_view_combo.currentText()
+        data_layer_name = self.batch_data_combo.currentData()
+        view_layer_name = self.batch_view_combo.currentData()
         if "Batch_ROI" not in self.viewer.layers or not len(self.viewer.layers["Batch_ROI"].data):
             self.status_label.setText(f"❌ {tr('No ROIs defined.')}")
             return
@@ -1989,8 +2041,11 @@ class GeometryWidget(QWidget):
             new_layer = self.viewer.add_image(stack, name=name, colormap='gray')
             
             # 自动选中新加载的图层
-            self.batch_view_combo.setCurrentText(new_layer.name)
-            self.batch_data_combo.setCurrentText(new_layer.name)
+            self._refresh_layers()
+            idx1 = self.batch_view_combo.findData(new_layer.name)
+            if idx1 >= 0: self.batch_view_combo.setCurrentIndex(idx1)
+            idx2 = self.batch_data_combo.findData(new_layer.name)
+            if idx2 >= 0: self.batch_data_combo.setCurrentIndex(idx2)
             self.status_label.setText(f"✅ {tr('Loaded')} {len(stack)} PNG frames.")
             
         except Exception as e:
@@ -2031,8 +2086,11 @@ class GeometryWidget(QWidget):
             new_layer = self.viewer.add_image(stack, name=name, colormap='gray')
             
             # 自动选中新加载的图层
-            self.batch_view_combo.setCurrentText(new_layer.name)
-            self.batch_data_combo.setCurrentText(new_layer.name)
+            self._refresh_layers()
+            idx1 = self.batch_view_combo.findData(new_layer.name)
+            if idx1 >= 0: self.batch_view_combo.setCurrentIndex(idx1)
+            idx2 = self.batch_data_combo.findData(new_layer.name)
+            if idx2 >= 0: self.batch_data_combo.setCurrentIndex(idx2)
             self.status_label.setText(f"✅ {tr('Loaded')} {len(stack)} TIFF frames.")
             
         except Exception as e:

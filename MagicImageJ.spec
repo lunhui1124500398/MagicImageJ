@@ -28,14 +28,12 @@ add_files = [
 # 解决 PackageNotFoundError: imageio / napari 等错误
 # ========================================================
 # 必须把这些库的“身份证”带上，否则它们运行时会报错说找不到自己
-my_datas += copy_metadata('napari')
-my_datas += copy_metadata('imageio')
-my_datas += copy_metadata('vispy')
-my_datas += copy_metadata('magicgui')
-my_datas += copy_metadata('npe2')       # Napari 的插件引擎
-my_datas += copy_metadata('scipy')
-my_datas += copy_metadata('tifffile')
-my_datas += copy_metadata('pillow')
+# 安全地复制元数据，防止因环境问题导致打包失败
+for pkg in ['napari', 'imageio', 'vispy', 'magicgui', 'npe2', 'scipy', 'tifffile', 'pillow']:
+    try:
+        my_datas += copy_metadata(pkg)
+    except Exception as e:
+        print(f"WARNING: Could not copy metadata for {pkg}: {e}")
 
 extra_datas = []
 # 1. 尝试收集 napari_builtins 的 builtins.yaml

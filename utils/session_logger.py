@@ -419,12 +419,188 @@ class SessionLogger:
             if fallback.exists():
                 search_dirs.append(fallback)
             
-            # 也搜索归档路径
+            # 也搜索当前归档路径
             archive = QSettings("NapariUser", "Global").value("archive_path", "")
             if archive and Path(archive).exists():
                 search_dirs.append(Path(archive))
+            
+            # 搜索保存的搜索路径列表
+            saved_paths = SessionLogger.get_saved_search_paths()
+            for p in saved_paths:
+                if p not in search_dirs:
+                    search_dirs.append(p)
         
         return search_dirs
+    
+    @staticmethod
+    def get_saved_search_paths() -> List[Path]:
+        """获取保存的搜索路径列表 (自动过滤无效路径)"""
+        settings = QSettings("NapariUser", "Recovery")
+        saved = settings.value("saved_search_paths", [])
+        if not saved:
+            return []
+        
+        # 返回有效路径
+        valid_paths = []
+        for p in saved:
+            path = Path(p) if isinstance(p, str) else p
+            if path.exists():
+                valid_paths.append(path)
+        
+        return valid_paths
+    
+    @staticmethod
+    def get_all_saved_search_paths() -> List[dict]:
+        """获取所有保存的搜索路径（包括无效的），返回路径和状态"""
+        settings = QSettings("NapariUser", "Recovery")
+        saved = settings.value("saved_search_paths", [])
+        if not saved:
+            return []
+        
+        result = []
+        for p in saved:
+            path = Path(p) if isinstance(p, str) else p
+            result.append({
+                "path": str(path),
+                "exists": path.exists()
+            })
+        
+        return result
+    
+    @staticmethod
+    def add_search_path(path: str) -> bool:
+        """添加搜索路径到保存列表"""
+        settings = QSettings("NapariUser", "Recovery")
+        saved = settings.value("saved_search_paths", []) or []
+        
+        if path not in saved:
+            saved.append(path)
+            settings.setValue("saved_search_paths", saved)
+            return True
+        return False
+    
+    @staticmethod
+    def remove_search_path(path: str) -> bool:
+        """从保存列表移除搜索路径"""
+        settings = QSettings("NapariUser", "Recovery")
+        saved = settings.value("saved_search_paths", []) or []
+        
+        if path in saved:
+            saved.remove(path)
+            settings.setValue("saved_search_paths", saved)
+            return True
+        return False
+    
+    @staticmethod
+    def update_search_path(old_path: str, new_path: str) -> bool:
+        """更新搜索路径"""
+        settings = QSettings("NapariUser", "Recovery")
+        saved = settings.value("saved_search_paths", []) or []
+        
+        if old_path in saved:
+            idx = saved.index(old_path)
+            saved[idx] = new_path
+            settings.setValue("saved_search_paths", saved)
+            return True
+        return False
+    
+    @staticmethod
+    def cleanup_invalid_paths() -> int:
+        """清理所有无效路径，返回清理数量"""
+        settings = QSettings("NapariUser", "Recovery")
+        saved = settings.value("saved_search_paths", []) or []
+        
+        valid = [p for p in saved if Path(p).exists()]
+        removed_count = len(saved) - len(valid)
+        
+        if removed_count > 0:
+            settings.setValue("saved_search_paths", valid)
+        
+        return removed_count
+    
+    @staticmethod
+    def try_relocate_path(old_path: str) -> Optional[str]:
+        """
+        尝试使用 Everything 搜索引擎查找移动后的路径
+        
+        Args:
+            old_path: 失效的旧路径
+            
+        Returns:
+            新路径字符串，未找到返回 None
+        """
+        try:
+            from everytools import EveryTools
+            
+            # 按文件夹名搜索
+            folder_name = Path(old_path).name
+            et = EveryTools()
+            results = et.search(folder_name)
+            
+            if not results:
+                return None
+            
+            for result in results[:10]:  # 只检查前10个结果
+                result_path = Path(result)
+                # 检查是否包含 session 日志文件
+                if result_path.is_dir():
+                    session_files = list(result_path.glob("*_session.json"))
+                    if session_files:
+                        return str(result_path)
+            
+            return None
+            
+        except ImportError:
+            # everytools 未安装
+            return None
+        except Exception as e:
+            print(f"[SessionLogger] Everything search failed: {e}")
+            return None
+    
+    @staticmethod
+    def check_everything_available() -> bool:
+        """检测 Everything 搜索引擎是否可用"""
+        try:
+            from everytools import EveryTools
+            # 执行一次简单搜索测试
+            et = EveryTools()
+            results = et.search("test")
+            # 如果返回 None 或空列表，说明 Everything 未运行
+            return results is not None
+        except ImportError:
+            print("[SessionLogger] everytools not installed. Run: pip install everytools")
+            return False
+        except Exception as e:
+            print(f"[SessionLogger] Everything check failed: {e}")
+            print("[SessionLogger] Make sure Everything is running (portable version needs manual start)")
+            return False
+    
+    @staticmethod
+    def get_everything_status() -> tuple:
+        """
+        获取 Everything 状态详情
+        
+        Returns:
+            (available: bool, message: str)
+        """
+        try:
+            from everytools import EveryTools
+            try:
+                et = EveryTools()
+                results = et.search("napari")  # 使用更可能有结果的关键词
+                # everytools 返回 None 表示 Everything 未运行
+                # 返回空列表 [] 表示 Everything 运行但无结果（这是正常的）
+                if results is None:
+                    return (False, "Everything 未运行 (请启动 Everything.exe)")
+                else:
+                    return (True, "Everything 搜索可用")
+            except Exception as e:
+                error_str = str(e).lower()
+                if "ipc" in error_str or "not running" in error_str:
+                    return (False, "Everything 未运行 (请启动 Everything.exe)")
+                return (False, f"Everything 错误: {e}")
+        except ImportError:
+            return (False, "everytools 未安装 (pip install everytools)")
     
     @staticmethod
     def load_from_file(path: Path) -> Optional[Dict[str, Any]]:
@@ -495,11 +671,34 @@ class SessionLogger:
         
         Returns:
             包含 session_id, created_at, status, starred, label, 
-            actions_count, metadata 的字典
+            actions_count, metadata, is_archive_session, auto_label 的字典
         """
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            
+            meta = data.get("metadata", {})
+            
+            # 判断是否为归档路径下的会话
+            # 检查当前归档路径
+            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+            is_archive = bool(archive_path and str(path).startswith(str(archive_path)))
+            
+            # 同时检查保存的搜索路径列表
+            if not is_archive:
+                saved_paths = QSettings("NapariUser", "Recovery").value("saved_search_paths", []) or []
+                path_str = str(path)
+                for saved in saved_paths:
+                    if path_str.startswith(str(saved)):
+                        is_archive = True
+                        break
+            
+            # 自动生成标签 (substance-ds[x])
+            auto_label = ""
+            substance = meta.get("substance", "")
+            ds = meta.get("dataset_id", "")
+            if substance or ds:
+                auto_label = f"{substance}-{ds}" if substance and ds else (substance or ds)
             
             return {
                 "path": path,
@@ -509,9 +708,11 @@ class SessionLogger:
                 "starred": data.get("starred", False),
                 "label": data.get("label", ""),
                 "actions_count": len(data.get("actions", [])),
-                "metadata": data.get("metadata", {}),
+                "metadata": meta,
                 "file_size": path.stat().st_size,
-                "modified_time": path.stat().st_mtime
+                "modified_time": path.stat().st_mtime,
+                "is_archive_session": is_archive,
+                "auto_label": auto_label
             }
         except Exception as e:
             print(f"[SessionLogger] Failed to get summary for {path}: {e}")
