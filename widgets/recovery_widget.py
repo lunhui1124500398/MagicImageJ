@@ -16,6 +16,7 @@ from qtpy.QtCore import Qt, QTimer
 from pathlib import Path
 import json
 from widgets.settings_widget import GlobalConfig, tr
+import numpy as np
 
 
 class RecoveryWidget(QWidget):
@@ -1093,6 +1094,35 @@ class RecoveryWidget(QWidget):
                     filtered_actions.append(action)
             selected_actions = filtered_actions
         
+        # === 智能处理：annotation 的 update_params/pre_burn_params ===
+        # 只保留最后一次 update_params (或 burn_in 之前的那一次 pre_burn_params)
+        # 因为用户调整过程中的中间状态通常不需要恢复
+        annotation_updates = []
+        for i, action in enumerate(selected_actions):
+            if action.get("widget") == "annotation" and action.get("action") in ("update_params", "pre_burn_params"):
+                annotation_updates.append(i)
+        
+        if len(annotation_updates) > 1:
+            # 保留最后一次，或者如果有 burn_in，保留 burn_in 之前的那一个
+            has_burn_in = any(a.get("widget") == "annotation" and a.get("action") == "burn_in" for a in selected_actions)
+            
+            if has_burn_in:
+                # 只需要保留 burn_in 本身 (它包含 params)，删除所有 update_params/pre_burn_params
+                filtered_actions = [a for a in selected_actions 
+                                  if not (a.get("widget") == "annotation" and a.get("action") in ("update_params", "pre_burn_params"))]
+            else:
+                # 没有 burn_in，只保留最后一个 update_params
+                last_update_idx = annotation_updates[-1]
+                filtered_actions = []
+                for i, action in enumerate(selected_actions):
+                    if action.get("widget") == "annotation" and action.get("action") in ("update_params", "pre_burn_params"):
+                        if i == last_update_idx:
+                            filtered_actions.append(action)
+                        # 跳过其他的
+                    else:
+                        filtered_actions.append(action)
+            selected_actions = filtered_actions
+        
         # 执行恢复操作 - 链式恢复
         success_count = 0
         failed_actions = []
@@ -1154,6 +1184,22 @@ class RecoveryWidget(QWidget):
         log_path = Path(self.current_session.get("_log_path", ""))
         if log_path.exists():
             self._mark_session_status(log_path, "recovered")
+        
+        # === 将恢复事件记录到当前会话日志 ===
+        # 这样用户后续的操作会和恢复的上下文一起保存
+        try:
+            from utils.session_logger import get_logger
+            recovered_session_id = self.current_session.get("session_id", "unknown")
+            get_logger().log_action("recovery", "session_restored", {
+                "source_session_id": recovered_session_id,
+                "source_log_path": str(log_path),
+                "success_count": success_count,
+                "skipped_count": len(skipped_actions),
+                "failed_count": len(failed_actions),
+                "recovered_widgets": list(set(a.get("widget", "") for a in selected_actions))
+            })
+        except Exception as e:
+            print(f"[RecoveryWidget] Failed to log recovery event: {e}")
         
         # 显示恢复结果
         QMessageBox.information(self, tr("Session Recovery"), 
@@ -1225,9 +1271,17 @@ class RecoveryWidget(QWidget):
         if widget == "geometry":
             return self._replay_geometry(action_type, params, recovery_mode, last_result_layer)
         
+        # === 标注恢复 - 恢复参数或执行烧录 ===
+        if widget == "annotation":
+            return self._replay_annotation(action_type, params, recovery_mode, last_result_layer)
+        
         # === 导出 ===
         if widget == "export":
             return ("skipped", None)  # 导出需要手动确认路径
+        
+        # === 会话恢复链接 - 可以链式恢复到源会话 ===
+        if widget == "recovery" and action_type == "session_restored":
+            return self._replay_session_link(params, recovery_mode)
         
         return ("skipped", None)
     
@@ -1767,6 +1821,216 @@ class RecoveryWidget(QWidget):
             return ("failed", None)
         
         return ("skipped", None)
+    
+    def _replay_annotation(self, action_type: str, params: dict, recovery_mode: str, last_result_layer: str = None) -> tuple:
+        """
+        重放标注操作
+        
+        action_type:
+            - "update_params" / "pre_burn_params": 恢复 UI 参数 (可编辑模式)
+            - "burn_in": 执行烧录 (生成新图层)
+        """
+        try:
+            # 找到 AnnotationWidget 实例
+            annotation_widget = self._find_annotation_widget()
+            if annotation_widget is None:
+                print("[RecoveryWidget] AnnotationWidget not found")
+                return ("skipped", None)
+            
+            # === Case 1: 参数恢复 (可编辑模式) ===
+            if action_type in ("update_params", "pre_burn_params"):
+                if recovery_mode == "review":
+                    confirm = self._ask_recovery_confirm(
+                        tr("Session Recovery"),
+                        f"{tr('Restore annotation parameters')}?\n\n"
+                        f"{tr('This will update scale bar and timestamp settings.')}\n\n"
+                        f"{tr('Continue with this result?')}"
+                    )
+                    if confirm == "abort":
+                        return ("abort", None)
+                    elif confirm == "skip":
+                        return ("skipped", None)
+                
+                # 应用参数
+                annotation_widget.apply_params(params)
+                
+                if recovery_mode == "review":
+                    from qtpy.QtWidgets import QMessageBox
+                    QMessageBox.information(
+                        self,
+                        tr("Session Recovery"),
+                        f"✅ {tr('Annotation parameters restored')}\n\n"
+                        f"{tr('You can now preview and adjust the settings.')}"
+                    )
+                
+                return ("success", None)
+            
+            # === Case 2: 烧录操作 ===
+            elif action_type == "burn_in":
+                # 从 params 中提取嵌套的参数
+                inner_params = params.get("params", params)
+                source_layer_name = params.get("source_layer", "")
+                
+                if recovery_mode == "review":
+                    from qtpy.QtWidgets import QMessageBox
+                    msg_box = QMessageBox(self)
+                    msg_box.setWindowTitle(tr("Session Recovery"))
+                    msg_box.setText(
+                        f"{tr('This is a burn-in operation')}.\n\n"
+                        f"{tr('How would you like to recover?')}"
+                    )
+                    
+                    btn_params_only = msg_box.addButton(
+                        f"📝 {tr('Restore Parameters Only')} ({tr('Editable')})", 
+                        QMessageBox.ActionRole
+                    )
+                    btn_execute = msg_box.addButton(
+                        f"🔥 {tr('Execute Burn-in')} ({tr('New Layer')})", 
+                        QMessageBox.AcceptRole
+                    )
+                    btn_skip = msg_box.addButton(tr("Skip"), QMessageBox.RejectRole)
+                    
+                    msg_box.exec_()
+                    choice = msg_box.clickedButton()
+                    
+                    if choice == btn_skip or choice is None:
+                        return ("skipped", None)
+                    
+                    if choice == btn_params_only:
+                        # 仅恢复参数
+                        annotation_widget.apply_params(inner_params)
+                        QMessageBox.information(
+                            self,
+                            tr("Session Recovery"),
+                            f"✅ {tr('Annotation parameters restored (editable mode)')}"
+                        )
+                        return ("success", None)
+                    
+                    # 继续执行烧录
+                    pass
+                
+                # 执行烧录：先应用参数，再触发烧录
+                annotation_widget.apply_params(inner_params)
+                
+                # 确保源图层存在
+                if source_layer_name and source_layer_name in self.viewer.layers:
+                    # 设置源图层
+                    idx = annotation_widget.layer_combo.findData(source_layer_name)
+                    if idx >= 0:
+                        annotation_widget.layer_combo.setCurrentIndex(idx)
+                elif last_result_layer and last_result_layer in self.viewer.layers:
+                    idx = annotation_widget.layer_combo.findData(last_result_layer)
+                    if idx >= 0:
+                        annotation_widget.layer_combo.setCurrentIndex(idx)
+                
+                # 触发烧录
+                annotation_widget._apply_to_new_layer()
+                
+                # 获取结果图层名
+                result_layer_name = params.get("result_layer", "")
+                
+                return ("success", result_layer_name if result_layer_name else None)
+            
+            return ("skipped", None)
+            
+        except Exception as e:
+            print(f"[RecoveryWidget] Annotation replay failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return ("failed", None)
+    
+    def _replay_session_link(self, params: dict, recovery_mode: str) -> tuple:
+        """
+        处理 session_restored 操作 - 链式恢复到源会话
+        """
+        from qtpy.QtWidgets import QMessageBox
+        import json
+        
+        source_session_id = params.get("source_session_id", "unknown")
+        source_log_path = params.get("source_log_path", "")
+        
+        if recovery_mode == "review":
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle(tr("Session Recovery"))
+            msg_box.setText(
+                f"{tr('This action was recovered from another session')}.\n\n"
+                f"Source Session: {source_session_id}\n"
+                f"Path: {source_log_path}\n\n"
+                f"{tr('What would you like to do?')}"
+            )
+            
+            btn_load = msg_box.addButton(f"🔗 {tr('Load Source Session')}", QMessageBox.AcceptRole)
+            btn_skip = msg_box.addButton(tr("Skip"), QMessageBox.RejectRole)
+            
+            msg_box.exec_()
+            choice = msg_box.clickedButton()
+            
+            if choice != btn_load:
+                return ("skipped", None)
+        
+        # 检查源会话文件是否存在
+        source_path = Path(source_log_path)
+        if not source_path.exists():
+            QMessageBox.warning(
+                self,
+                tr("Session Recovery"),
+                f"⚠️ {tr('Source session file not found')}:\n\n{source_log_path}\n\n"
+                f"{tr('The original session may have been moved or deleted.')}"
+            )
+            return ("skipped", None)
+        
+        # 加载源会话
+        try:
+            with open(source_path, 'r', encoding='utf-8') as f:
+                source_session = json.load(f)
+            source_session["_log_path"] = str(source_path)
+            
+            # 显示源会话供用户选择恢复
+            self.current_session = source_session
+            self._show_session_details()
+            
+            QMessageBox.information(
+                self,
+                tr("Session Recovery"),
+                f"✅ {tr('Source session loaded')}\n\n"
+                f"Session: {source_session_id}\n"
+                f"{tr('Please select the actions you want to recover from this session.')}"
+            )
+            
+            return ("success", None)
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                tr("Error"),
+                f"Failed to load source session: {e}"
+            )
+            return ("failed", None)
+    
+    def _find_annotation_widget(self):
+        """
+        在 Napari 窗口中查找 AnnotationWidget 实例
+        """
+        try:
+            from widgets.annotation_widget import AnnotationWidget
+            
+            # 方法 1: 通过 viewer.window 的 dock widgets 查找 (使用公共 API)
+            # Napari 的 dock_widgets 返回的 values 直接就是 widget 本身，而不是 QDockWidget
+            if hasattr(self.viewer, 'window') and hasattr(self.viewer.window, 'dock_widgets'):
+                for widget in self.viewer.window.dock_widgets.values():
+                    if isinstance(widget, AnnotationWidget):
+                        return widget
+            
+            # 方法 2: 通过 Qt 遍历所有子控件查找
+            from qtpy.QtWidgets import QApplication
+            for widget in QApplication.allWidgets():
+                if isinstance(widget, AnnotationWidget):
+                    return widget
+            
+            return None
+        except ImportError:
+            print("[RecoveryWidget] Could not import AnnotationWidget")
+            return None
     
     def _format_params(self, params: dict) -> str:
         """格式化参数为可读字符串"""

@@ -27,7 +27,8 @@ import platform
 import ctypes
 from widgets.settings_widget import tr
 from utils.session_logger import get_logger
-from utils.utils import elide_text
+from utils.utils import elide_text, natural_sort_key
+from utils.ui_utils import setup_safe_scroll_all
 
 # 尝试导入 psutil 获取更准确的内存信息，如果没有则使用 ctypes (Windows) 或 os (Linux)
 try:
@@ -147,7 +148,7 @@ class DoseCalculationThread(QThread):
             self.error.emit("Library 'dm4' not found.")
             return
         try:
-            files = sorted(list(self.folder_path.rglob("*.dm4")))
+            files = sorted(list(self.folder_path.rglob("*.dm4")), key=natural_sort_key)
             if not files:
                 self.error.emit("No .dm4 files found.")
                 return
@@ -453,6 +454,13 @@ class ImportWidget(QWidget):
 
         self.status = QLabel(""); self.status.setWordWrap(True); layout.addWidget(self.status)
         content.setLayout(layout); scroll.setWidget(content); main.addWidget(scroll); self.setLayout(main)
+        
+        # [新增] 防止滚轮误触更改数值
+        setup_safe_scroll_all(
+            self.dose_idx_spin, self.aperture_combo, self.win_spin, 
+            self.sigma_spin, self.max_workers_spin, self.bit_depth_combo,
+            self.substance_edit
+        )
     
     def _check_worker_count(self, val):
         """动态显示内存警告"""
@@ -820,7 +828,7 @@ class ImportWidget(QWidget):
             return
         
         folder_path = Path(folder)
-        png_files = sorted(list(folder_path.glob("*.png")))
+        png_files = sorted(list(folder_path.glob("*.png")), key=natural_sort_key)
         
         if not png_files:
             QMessageBox.warning(self, tr("No Images"), tr("No PNG files found in the selected folder."))

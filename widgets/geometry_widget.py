@@ -16,6 +16,7 @@ from qtpy.QtCore import Qt, QTimer, QSettings, QThread, Signal
 import numpy as np
 from pathlib import Path
 import cv2
+from utils.ui_utils import setup_safe_scroll_all
 from PIL import Image, ImageDraw, ImageFont
 from core.geometry import (calculate_rotation_angle, rotate_image_stack, flip_image_stack,
                            crop_image_stack, validate_bbox)
@@ -592,6 +593,13 @@ class GeometryWidget(QWidget):
         self._refresh_layers()
         self._sync_batch_layers()
         self._try_load_archived_substance()
+
+        # [Safety] Prevent accidental mouse wheel scroll
+        setup_safe_scroll_all(
+            self.rotate_layer_combo, self.simple_crop_combo,
+            self.batch_data_combo, self.batch_view_combo, self.batch_format_combo,
+            self.angle_spin, self.padding_spin
+        )
 
     def _on_shortcut_apply(self, viewer):
         if "Batch_ROI" in self.viewer.layers and len(self.viewer.layers["Batch_ROI"].data) > 0:

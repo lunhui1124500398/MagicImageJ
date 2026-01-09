@@ -12,6 +12,7 @@ from qtpy.QtCore import QObject, Signal, Qt
 import json
 import os
 from pathlib import Path
+from utils.ui_utils import setup_safe_scroll_all
 
 # 国际化 (i18n) 翻译字典
 # =============================================================================
@@ -772,6 +773,34 @@ TRANS_CN = {
     "Path Set": "路径已设置",
     "DM4 folder path set. Click Load Images to proceed.": "DM4 文件夹路径已设置。点击'加载图像'继续。",
     "Select DM4 Folder": "选择 DM4 文件夹",
+    
+    # === Annotation Recovery (New) ===
+    "Restore annotation parameters": "恢复标注参数",
+    "This will update scale bar and timestamp settings.": "这将更新比例尺和时间戳设置。",
+    "Annotation parameters restored": "标注参数已恢复",
+    "You can now preview and adjust the settings.": "您现在可以预览并调整设置。",
+    "This is a burn-in operation": "这是一个烧录操作",
+    "How would you like to recover?": "您希望如何恢复？",
+    "Restore Parameters Only": "仅恢复参数",
+    "Editable": "可编辑",
+    "Execute Burn-in": "执行烧录",
+    "New Layer": "新图层",
+    "Annotation parameters restored (editable mode)": "标注参数已恢复 (可编辑模式)",
+    "This action was recovered from another session": "此操作是从另一个会话恢复的",
+    "What would you like to do?": "您希望做什么？",
+    "Load Source Session": "加载源会话",
+    "Source session file not found": "找不到源会话文件",
+    "The original session may have been moved or deleted.": "原始会话可能已被移动或删除。",
+    "Source session loaded": "源会话已加载",
+    "Please select the actions you want to recover from this session.": "请选择您想从此会话恢复的操作。",
+    
+    # === Manual Import (Recovery) ===
+    "Manual Data Import": "手动数据导入",
+    "No image layers detected": "未检测到图像层",
+    "Detected paths from session log": "从会话日志检测到的路径",
+    "No source path found in session log.": "会话日志中未找到源路径。",
+    "Please select how to import data": "请选择导入数据的方式",
+    "Manual Import": "手动导入",
 }
 
 def tr(text):
@@ -975,6 +1004,18 @@ class SettingsDialog(QDialog):
         h_btn.addWidget(btn_cancel)
         h_btn.addWidget(btn_save)
         layout.addLayout(h_btn)
+        
+        # [Safety] Prevent accidental mouse wheel scroll
+        setup_safe_scroll_all(
+            self.lang_combo,
+            self.drift_k_spin, self.drift_w_spin,
+            self.enh_sigma_spin, self.enh_win_spin, self.enh_work_spin,
+            self.style_meas_w, self.style_meas_font,
+            self.style_batch_w, self.style_batch_font,
+            self.sys_ram, self.sys_disk, self.sys_move, self.sys_mem_warn,
+            self.session_max_keep, self.session_starred_threshold, self.session_reminder_cooldown
+        )
+        
         self.setLayout(layout)
 
     def _create_general_tab(self):

@@ -13,3 +13,7 @@ __pycache__/
 # 临时文件
 *.log
 *.tmp
+
+
+# 测试文件
+/tests

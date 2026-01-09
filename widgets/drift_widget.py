@@ -18,6 +18,7 @@ from pathlib import Path
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
+from utils.ui_utils import setup_safe_scroll_all
 
 # 导入核心算法
 from core.drift_correction import (calculate_drift_curve, 
@@ -225,6 +226,12 @@ class DriftCorrectionWidget(QWidget):
 
         self.kernel_spin.valueChanged.connect(lambda v: GlobalConfig.set("drift_kernel", v))
         self.max_workers_spin.valueChanged.connect(lambda v: GlobalConfig.set("drift_workers", v))
+        
+        # [新增] 防止滚轮误触更改数值
+        setup_safe_scroll_all(
+            self.template_spin, self.kernel_spin, self.max_workers_spin,
+            self.layer_combo
+        )
 
     def _load_params_from_config(self):
         """从 GlobalConfig 读取参数并更新 UI"""

@@ -18,6 +18,7 @@ from pathlib import Path
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
 from utils.utils import elide_text
+from utils.ui_utils import setup_safe_scroll_all
 
 # JSON Encoder
 class NumpyEncoder(json.JSONEncoder):
@@ -280,6 +281,12 @@ class EnhanceWidget(QWidget):
         self.sigma_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_sigma", v))
         self.window_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_window", v))
         self.max_workers_spin.valueChanged.connect(lambda v: GlobalConfig.set("enh_workers", v))
+        
+        # [新增] 防止滚轮误触更改数值
+        setup_safe_scroll_all(
+            self.sigma_spin, self.window_spin, self.max_workers_spin,
+            self.contrast_min_spin, self.contrast_max_spin, self.layer_combo
+        )
 
     def _refresh_layers_silently(self, event=None):
         current_data = self.layer_combo.currentData()

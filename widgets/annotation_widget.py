@@ -20,12 +20,14 @@ from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
 from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QColor
 from utils.utils import resource_path, elide_text
+from utils.ui_utils import setup_safe_scroll_all
 import numpy as np
 import napari
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 import os
 from widgets.settings_widget import tr
+from utils.session_logger import get_logger
 
 
 class AnnotationWidget(QWidget):
@@ -43,6 +45,19 @@ class AnnotationWidget(QWidget):
         
         self.current_source_layer = None
         self.interaction_map = {} 
+        
+        # === [Performance] 防抖动定时器 (Debounce Timers) ===
+        # 渲染更新定时器 (30ms) - 合并快速变化的渲染请求
+        self._render_timer = QTimer()
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(30)  # ~30 FPS
+        self._render_timer.timeout.connect(self._do_render_update)
+        
+        # 配置保存定时器 (500ms) - 避免频繁磁盘IO
+        self._save_timer = QTimer()
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)  # 用户停止操作后才保存
+        self._save_timer.timeout.connect(self._do_save_settings) 
         
         # 监听维度变化 (滚动滑条时触发懒加载)
         self.viewer.dims.events.current_step.connect(self._on_frame_change)
@@ -125,6 +140,19 @@ class AnnotationWidget(QWidget):
         main_layout.addWidget(scroll)
         self.setLayout(main_layout)
         self._refresh_layers()
+
+        # [Safety] Prevent accidental mouse wheel scroll
+        setup_safe_scroll_all(
+            self.layer_combo,
+            # Scale Bar
+            self.scale_ratio_spin, self.scale_length_spin, self.scale_thickness_spin,
+            self.scale_font_spin, self.scale_padding_spin, self.scale_height_spin,
+            self.scale_x_spin, self.scale_y_spin, self.scale_width_spin,
+            self.scale_bg_alpha_slider, # Although slider usually handles wheel fine, consistency
+            # Label
+            self.label_format_combo, self.label_start_spin, self.label_interval_spin,
+            self.label_font_spin, self.label_x_spin, self.label_y_spin
+        )
 
     def _create_scale_bar_tab(self):
         w = QWidget()
@@ -554,8 +582,31 @@ class AnnotationWidget(QWidget):
     # ========== Interaction ==========
 
     def _on_ui_param_change(self):
+        """轻量级调度器：收集请求，延迟执行真正的渲染和保存"""
         if self._updating: return
-        # === 新增：保存参数到 QSettings ===
+        
+        # 如果正在拖动，只触发即时渲染（跳过防抖）
+        if self._dragging:
+            self._refresh_overlay_only()
+            return
+        
+        # 执行自动尺寸计算（同步，因为其他逻辑可能依赖）
+        if self.auto_size_check.isChecked(): 
+            self._perform_auto_calc()
+        
+        # 调度渲染更新 (30ms 防抖)
+        self._render_timer.start()
+        
+        # 调度配置保存 (500ms 防抖)
+        self._save_timer.start()
+
+    def _do_render_update(self):
+        """实际执行渲染更新 (被防抖定时器调用)"""
+        self._refresh_overlay_only()
+        self._create_interaction_box()
+
+    def _do_save_settings(self):
+        """实际执行配置保存 (被防抖定时器调用)"""
         # Scale Bar Settings
         self.settings.setValue("scale/enable", self.use_scale_bar_check.isChecked())
         self.settings.setValue("scale/ratio", self.scale_ratio_spin.value())
@@ -565,7 +616,7 @@ class AnnotationWidget(QWidget):
         self.settings.setValue("scale/thickness", self.scale_thickness_spin.value())
         self.settings.setValue("scale/font_size", self.scale_font_spin.value())
         self.settings.setValue("scale/padding", self.scale_padding_spin.value())
-        self.settings.setValue("scale/color", self.scale_color)  # Tuple (r,g,b,a)
+        self.settings.setValue("scale/color", self.scale_color)
         self.settings.setValue("scale/bg_color", self.scale_bg_color)
         self.settings.setValue("scale/bg_alpha", self.scale_bg_alpha_slider.value())
         self.settings.setValue("scale/use_bg", self.scale_use_bg_check.isChecked())
@@ -580,13 +631,13 @@ class AnnotationWidget(QWidget):
         self.settings.setValue("label/position", (self.label_x_spin.value(), self.label_y_spin.value()))
         self.settings.setValue("label/start", self.label_start_spin.value())
         self.settings.setValue("label/interval", self.label_interval_spin.value())
-        # =================================
 
-        if self.auto_size_check.isChecked(): self._perform_auto_calc()
-        if self._dragging: self._refresh_overlay_only()
-        else:
-            self._refresh_overlay_only()
-            self._create_interaction_box()
+        # === 会话日志记录 (Session Logging) ===
+        try:
+            params = self._get_params_dict()
+            get_logger().log_action("annotation", "update_params", params)
+        except Exception as e:
+            print(f"[AnnotationWidget] Session log failed: {e}")
 
     def _on_interaction_change(self, event):
         if self._updating: return
@@ -648,6 +699,9 @@ class AnnotationWidget(QWidget):
                 
                 self._updating = False
             self._refresh_overlay_only()
+            
+            # 触发保存定时器 (会记录日志)
+            self._save_timer.start()
         finally:
             self._dragging = False
 
@@ -746,6 +800,13 @@ class AnnotationWidget(QWidget):
         elif data.ndim == 4: n_frames, H, W, C = data.shape
         else: return
 
+        # === 烧录前记录参数 (Pre-Burn Logging) ===
+        try:
+            params = self._get_params_dict()
+            get_logger().log_action("annotation", "pre_burn_params", params)
+        except Exception as e:
+            print(f"[AnnotationWidget] Pre-burn log failed: {e}")
+
         # === 新增：获取当前图层的显示对比度 (所见即所得) ===
         # Napari 的 contrast_limits 决定了屏幕上怎么显示像素值
         contrast_limits = None
@@ -838,6 +899,18 @@ class AnnotationWidget(QWidget):
         # 本地刷新
         self._refresh_layers()
         self.layer_combo.setCurrentText(new_layer_name)
+
+        # === 烧录后记录 (Post-Burn Logging) ===
+        try:
+            burn_params = {
+                "source_layer": self.current_source_layer.name if self.current_source_layer else "",
+                "result_layer": new_layer_name,
+                "frame_count": n_frames,
+                "params": self._get_params_dict()
+            }
+            get_logger().log_action("annotation", "burn_in", burn_params)
+        except Exception as e:
+            print(f"[AnnotationWidget] Post-burn log failed: {e}")
     
     def _switch_to_layer(self, layer_name):
         """自动切换焦点"""
@@ -929,3 +1002,118 @@ class AnnotationWidget(QWidget):
         self.preview_overlay_layer = None
         self.interaction_layer = None
         self.status_label.setText(tr("Cleared."))
+
+    # =========================================================================
+    # Session Recovery Support
+    # =========================================================================
+    def _get_params_dict(self) -> dict:
+        """
+        获取当前所有标注参数的字典表示 (用于日志记录和恢复)
+        """
+        return {
+            # Scale Bar
+            "scale_enable": self.use_scale_bar_check.isChecked(),
+            "scale_ratio": self.scale_ratio_spin.value(),
+            "scale_unit": self.scale_unit_edit.text(),
+            "scale_length": self.scale_length_spin.value(),
+            "scale_height": self.scale_height_spin.value(),
+            "scale_thickness": self.scale_thickness_spin.value(),
+            "scale_font_size": self.scale_font_spin.value(),
+            "scale_padding": self.scale_padding_spin.value(),
+            "scale_color": list(self.scale_color),
+            "scale_bg_color": list(self.scale_bg_color),
+            "scale_bg_alpha": self.scale_bg_alpha_slider.value(),
+            "scale_use_bg": self.scale_use_bg_check.isChecked(),
+            "scale_x": self.scale_x_spin.value(),
+            "scale_y": self.scale_y_spin.value(),
+            "scale_auto_size": self.auto_size_check.isChecked(),
+            # Label (Timestamp)
+            "label_enable": self.use_label_check.isChecked(),
+            "label_format": self.label_format_combo.currentText(),
+            "label_custom_fmt": self.label_custom_edit.text(),
+            "label_font_size": self.label_font_spin.value(),
+            "label_color": list(self.label_color),
+            "label_x": self.label_x_spin.value(),
+            "label_y": self.label_y_spin.value(),
+            "label_start": self.label_start_spin.value(),
+            "label_interval": self.label_interval_spin.value(),
+        }
+    
+    def apply_params(self, params: dict):
+        """
+        应用参数字典到 UI (用于会话恢复)
+        
+        Args:
+            params: 从日志中读取的参数字典
+        """
+        self._updating = True
+        try:
+            # Scale Bar
+            if "scale_enable" in params:
+                self.use_scale_bar_check.setChecked(params["scale_enable"])
+            if "scale_ratio" in params:
+                self.scale_ratio_spin.setValue(params["scale_ratio"])
+            if "scale_unit" in params:
+                self.scale_unit_edit.setText(params["scale_unit"])
+            if "scale_length" in params:
+                self.scale_length_spin.setValue(params["scale_length"])
+            if "scale_height" in params:
+                self.scale_height_spin.setValue(params["scale_height"])
+            if "scale_thickness" in params:
+                self.scale_thickness_spin.setValue(params["scale_thickness"])
+            if "scale_font_size" in params:
+                self.scale_font_spin.setValue(params["scale_font_size"])
+            if "scale_padding" in params:
+                self.scale_padding_spin.setValue(params["scale_padding"])
+            if "scale_color" in params:
+                self.scale_color = tuple(params["scale_color"])
+                self._update_btn_style(self.scale_color_btn, self.scale_color)
+            if "scale_bg_color" in params:
+                self.scale_bg_color = tuple(params["scale_bg_color"])
+                self._update_btn_style(self.scale_bg_color_btn, self.scale_bg_color)
+            if "scale_bg_alpha" in params:
+                self.scale_bg_alpha_slider.setValue(params["scale_bg_alpha"])
+            if "scale_use_bg" in params:
+                self.scale_use_bg_check.setChecked(params["scale_use_bg"])
+            if "scale_x" in params:
+                self.scale_x_spin.setValue(params["scale_x"])
+            if "scale_y" in params:
+                self.scale_y_spin.setValue(params["scale_y"])
+            if "scale_auto_size" in params:
+                self.auto_size_check.setChecked(params["scale_auto_size"])
+            
+            # Label (Timestamp)
+            if "label_enable" in params:
+                self.use_label_check.setChecked(params["label_enable"])
+            if "label_format" in params:
+                idx = self.label_format_combo.findText(params["label_format"])
+                if idx >= 0:
+                    self.label_format_combo.setCurrentIndex(idx)
+            if "label_custom_fmt" in params:
+                self.label_custom_edit.setText(params["label_custom_fmt"])
+            if "label_font_size" in params:
+                self.label_font_spin.setValue(params["label_font_size"])
+            if "label_color" in params:
+                self.label_color = tuple(params["label_color"])
+                self._update_btn_style(self.label_color_btn, self.label_color)
+            if "label_x" in params:
+                self.label_x_spin.setValue(params["label_x"])
+            if "label_y" in params:
+                self.label_y_spin.setValue(params["label_y"])
+            if "label_start" in params:
+                self.label_start_spin.setValue(params["label_start"])
+            if "label_interval" in params:
+                self.label_interval_spin.setValue(params["label_interval"])
+        finally:
+            self._updating = False
+        
+        # 刷新图层列表（确保能选中正确的源图层）
+        self._refresh_layers()
+        
+        # 刷新预览 (如果已激活则更新，否则尝试创建)
+        if self.preview_overlay_layer is not None:
+            self._refresh_overlay_only()
+            self._create_interaction_box()
+        elif self.current_source_layer is not None:
+            # 如果有源图层但没有预览，自动创建预览
+            self._create_preview()

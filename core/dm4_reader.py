@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import concurrent.futures
 from tqdm import tqdm
 from utils.memory_utils import create_huge_array
+from utils.utils import natural_sort_key
 import os
 import platform
 
@@ -117,7 +118,7 @@ def read_dm4_sequence(folder_path: str,
     读取文件夹中的DM4序列 (OOM Safe)
     """
     folder = Path(folder_path)
-    dm4_files = sorted(folder.glob('**/*.dm4'))
+    dm4_files = sorted(folder.glob('**/*.dm4'), key=natural_sort_key)
     
     if not dm4_files:
         raise ValueError(f"No DM4 files found in {folder_path}")

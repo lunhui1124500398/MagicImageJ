@@ -22,6 +22,7 @@ from widgets.settings_widget import tr
 # 引入工具函数
 from utils.video_export import export_to_video, export_to_tiff_stack, get_available_codecs
 from utils.utils import elide_text
+from utils.ui_utils import setup_safe_scroll_all
 
 class ExportThread(QThread):
     """导出后台线程"""
@@ -305,6 +306,13 @@ class ExportWidget(QWidget):
         self.setLayout(main_layout)
         
         self._refresh_layers()
+
+        # [Safety] Prevent accidental mouse wheel scroll
+        setup_safe_scroll_all(
+            self.layer_combo,
+            self.spin_fps, self.spin_qual, self.combo_codec,
+            self.combo_img_fmt
+        )
 
     def _toggle_settings(self):
         """根据选择的格式显示/隐藏对应设置"""
