@@ -418,11 +418,23 @@ class DriftCorrectionWidget(QWidget):
         try:
             count = len(self.correction_history) + 1
             new_layer_name = f"Corrected_v{count}_{source_layer_name}"
+            
+            # [NEW] 传递 original_indices (如果存在)
+            source_layer = self.viewer.layers[source_layer_name]
+            new_metadata = {
+                'source': source_layer_name, 
+                'is_drift_result': True, 
+                'action_id': None
+            }
+            # 继承 original_indices
+            if 'original_indices' in source_layer.metadata:
+                new_metadata['original_indices'] = source_layer.metadata['original_indices']
+            
             new_layer = self.viewer.add_image(
                 corrected_stack, 
                 name=new_layer_name, 
                 colormap='gray', 
-                metadata={'source': source_layer_name, 'is_drift_result': True, 'action_id': None}
+                metadata=new_metadata
             )
 
             self.correction_history.append(new_layer)

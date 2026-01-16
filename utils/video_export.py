@@ -9,7 +9,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 import os
-from typing import Optional
+from typing import Optional, Callable
 from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
 import contextlib
@@ -34,6 +34,7 @@ def export_to_video(image_stack: np.ndarray,
                    quality: int = 100,
                    scale_bar_config: Optional[dict] = None,
                    timestamp_config: Optional[dict] = None,
+                   callback: Optional[Callable[[int, int], None]] = None,
                    ) -> bool:
     """
     导出视频 - 健壮性增强版
@@ -114,6 +115,7 @@ def export_to_video(image_stack: np.ndarray,
                         return False
 
                 # 6. 逐帧写入
+                total_frames = len(source_data)
                 for i, frame in enumerate(tqdm(source_data, desc="Exporting video")):
                     # 归一化
                     if frame.dtype != np.uint8:
@@ -153,6 +155,10 @@ def export_to_video(image_stack: np.ndarray,
                         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
                     out.write(frame_bgr)
+                    
+                    # 调用回调以更新进度
+                    if callback is not None:
+                        callback(i + 1, total_frames)
                     
         except Exception as e:
             # 捕获切换目录可能的错误
@@ -266,3 +272,117 @@ def export_to_tiff_stack(image_stack: np.ndarray, output_path: str) -> bool:
         imwrite(save_path, image_stack, compression='zlib')
         return True
     except: return False
+
+def export_to_gif(image_stack: np.ndarray, 
+                  output_path: str, 
+                  fps: int = 10,
+                  loop: int = 0,
+                  colors: int = 256,
+                  scale_bar_config: Optional[dict] = None,
+                  timestamp_config: Optional[dict] = None,
+                  callback: Optional[Callable[[int, int], None]] = None) -> bool:
+    """
+    导出 GIF 动图
+    
+    Args:
+        image_stack: numpy 数组 (T, H, W) 或 (T, H, W, C)
+        output_path: 输出文件路径
+        fps: 帧率，用于计算每帧持续时间 (ms)
+        loop: 循环次数，0 表示无限循环
+        scale_bar_config: 比例尺配置 (可选)
+        timestamp_config: 时间戳配置 (可选)
+    
+    Returns:
+        bool: 成功返回 True，失败返回 False
+    """
+    try:
+        # 1. 检查数据维度
+        if image_stack.ndim == 3:
+            T, H, W = image_stack.shape
+            is_color = False
+        elif image_stack.ndim == 4:
+            T, H, W, C = image_stack.shape
+            is_color = True
+        else:
+            raise ValueError(f"Unsupported image shape: {image_stack.shape}")
+        
+        full_path = Path(output_path).resolve()
+        if not full_path.suffix:
+            full_path = full_path.with_suffix('.gif')
+        
+        # 确保父目录存在
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 2. 计算每帧持续时间 (毫秒)
+        duration_ms = int(1000 / fps) if fps > 0 else 100
+        
+        # 3. 预计算归一化参数
+        glob_min, rng = 0, 1.0
+        if image_stack.dtype != np.uint8:
+            glob_min = image_stack.min()
+            glob_max = image_stack.max()
+            rng = glob_max - glob_min
+            if rng <= 0: rng = 1.0
+        
+        # 4. 转换为 PIL Image 列表
+        pil_frames = []
+        total_gif_frames = len(image_stack)
+        for i, frame in enumerate(tqdm(image_stack, desc="Exporting GIF")):
+            # 归一化
+            if frame.dtype != np.uint8:
+                frame_norm = ((frame - glob_min) / rng * 255).astype(np.uint8)
+            else:
+                frame_norm = frame
+            
+            # 转 RGB
+            if is_color:
+                if frame_norm.shape[-1] == 4:
+                    frame_rgb = cv2.cvtColor(frame_norm, cv2.COLOR_RGBA2RGB)
+                else:
+                    frame_rgb = frame_norm
+            else:
+                frame_rgb = cv2.cvtColor(frame_norm, cv2.COLOR_GRAY2RGB)
+            
+            # 创建 PIL Image
+            pil_img = Image.fromarray(frame_rgb)
+            
+            # 绘制 Overlay (如果配置了)
+            has_overlay = (scale_bar_config and scale_bar_config.get('enable')) or \
+                          (timestamp_config and timestamp_config.get('enable'))
+            
+            if has_overlay:
+                draw = ImageDraw.Draw(pil_img, 'RGBA')
+                if scale_bar_config and scale_bar_config.get('enable', False):
+                    _draw_scale_bar_pil(draw, scale_bar_config)
+                if timestamp_config and timestamp_config.get('enable', False):
+                    _draw_timestamp_pil(draw, timestamp_config, i)
+                # 转回 RGB 模式 (GIF 不支持 RGBA)
+                pil_img = pil_img.convert('RGB')
+            
+            # 转换为调色板模式 (GIF 优化)
+            pil_img = pil_img.quantize(colors=colors)
+            
+            # 调用回调以更新进度
+            if callback is not None:
+                callback(i + 1, total_gif_frames)
+            pil_frames.append(pil_img)
+        
+        # 5. 保存 GIF
+        if pil_frames:
+            pil_frames[0].save(
+                str(full_path),
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=duration_ms,
+                loop=loop,
+                optimize=True
+            )
+            print(f"GIF saved: {full_path}")
+            return True
+        return False
+        
+    except Exception as e:
+        print(f"Error exporting GIF: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

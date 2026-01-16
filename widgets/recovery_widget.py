@@ -532,19 +532,22 @@ class RecoveryWidget(QWidget):
             # 重新选中当前会话并显示详情
             self._show_session_details()
     
-    def _edit_session_label(self):
+    def _edit_session_label(self, session=None):
         """编辑当前会话的标签"""
         from utils.session_logger import SessionLogger
         from qtpy.QtWidgets import QInputDialog
         
-        if not self.current_session:
+        # 兼容信号(bool)和直接调用
+        target_session = session if isinstance(session, dict) else self.current_session
+        
+        if not target_session:
             return
         
-        log_path = self.current_session.get("_log_path")
+        log_path = target_session.get("_log_path")
         if not log_path:
             return
         
-        current_label = self.current_session.get("label", "")
+        current_label = target_session.get("label", "")
         
         new_label, ok = QInputDialog.getText(
             self, tr("Session Label"), 
@@ -555,7 +558,7 @@ class RecoveryWidget(QWidget):
         if ok:
             if SessionLogger.update_session_file(Path(log_path), label=new_label):
                 # 更新本地状态
-                self.current_session["label"] = new_label
+                target_session["label"] = new_label
                 # 刷新列表和详情
                 self._refresh_sessions()
                 self._show_session_details()
@@ -568,7 +571,7 @@ class RecoveryWidget(QWidget):
         idx = item.data(Qt.UserRole)
         if idx is not None and idx < len(self.sessions):
             self.current_session = self.sessions[idx]
-            self._edit_session_label()
+            self._edit_session_label(self.current_session)
     
     def _get_data_sources(self, session_data):
         """从会话数据中提取数据源信息"""

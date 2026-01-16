@@ -356,9 +356,8 @@ class EnhanceWidget(QWidget):
         if not layer_name or layer_name not in self.viewer.layers: return
         total_frames = len(self.viewer.layers[layer_name].data)
         window_size = self.window_spin.value()
-        # Core逻辑: output = T - window + 1
-        output_frames = max(0, total_frames - window_size + 1)
-        self.frame_loss_label.setText(tr("Output: %s frames (Loss: %s)") % (output_frames, window_size-1))
+        # Core逻辑: output = T (Padding applied)
+        self.frame_loss_label.setText(tr("Output: %s frames (Padding: Edge)") % (total_frames))
 
     def _get_enhancement_params(self):
         return {

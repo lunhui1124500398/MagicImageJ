@@ -33,10 +33,12 @@ from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QFont, QIcon
 from widgets.import_widget import ImportWidget
 from widgets.drift_widget import DriftCorrectionWidget
+from widgets.filter_widget import FilterWidget  # [NEW] 帧筛选控件
 from widgets.geometry_widget import GeometryWidget
 from widgets.enhance_widget import EnhanceWidget
 from widgets.annotation_widget import AnnotationWidget
 from widgets.export_widget import ExportWidget
+from widgets.script_widget import ScriptWidget
 from widgets.recovery_widget import RecoveryWidget
 from widgets.settings_widget import SettingsDialog, GlobalConfig, tr
 import numpy as np
@@ -228,15 +230,19 @@ class TEMWorkflow:
         self.drift_widget = DriftCorrectionWidget(self.viewer)
         self.tab_widget.addTab(self.drift_widget, f"🔧 {tr('Drift Correction')}")
 
-        # 3. 几何变换
+        # 4. 几何变换
         self.geometry_widget = GeometryWidget(self.viewer)
         self.tab_widget.addTab(self.geometry_widget, f"📐 {tr('Geometry')}")
 
-        # 4. 图像增强
+        # 4. 图像增强 (Original 4, actually 5 now)
         self.enhance_widget = EnhanceWidget(self.viewer)
         self.tab_widget.addTab(self.enhance_widget, f"✨ {tr('Enhancement')}")
 
-        # 5. 标注工具
+        # 5. [NEW] 帧筛选
+        self.filter_widget = FilterWidget(self.viewer)
+        self.tab_widget.addTab(self.filter_widget, f"🔍 {tr('Frame Filter')}")
+
+        # 6. 标注工具
         self.annotation_widget = AnnotationWidget(self.viewer)
         self.tab_widget.addTab(self.annotation_widget, f"📝 {tr('Annotation')}")
 
@@ -244,10 +250,13 @@ class TEMWorkflow:
         self.export_widget = ExportWidget(self.viewer)
         self.tab_widget.addTab(self.export_widget, f"💾 {tr('Export')}")
 
-        # 7. 会话恢复
+        # 7. 脚本运行器
+        self.script_widget = ScriptWidget(self.viewer)
+        self.tab_widget.addTab(self.script_widget, f"📜 {tr('Scripts')}")
+
+        # 8. 会话恢复
         self.recovery_widget = RecoveryWidget(self.viewer)
         self.tab_widget.addTab(self.recovery_widget, f"🔄 {tr('Recovery')}")
-
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         # === 4. 将 Tab 加入主布局 ===

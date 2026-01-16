@@ -49,56 +49,57 @@ def rolling_average(image_stack: np.ndarray,
     if T < window_size:
         raise ValueError(f"Not enough frames for window {window_size}")
     
-    output_frames = T - window_size + 1
+    # output_frames = T (preserved via padding)
     
     # === 预分配 (Disk/RAM) ===
-    # 结果可能很大，必须使用 safe alloc
-    avg_stack, temp_file = create_huge_array((output_frames, H, W), np.uint8, fill_zeros=False)
+    # 结果大小与输入完全一致 (T, H, W)
+    avg_stack, temp_file = create_huge_array((T, H, W), np.uint8, fill_zeros=False)
     
-    chunk_size = max(1, H // num_threads)
-    starts = [i * chunk_size for i in range(num_threads)]
-    ends = [start + chunk_size for start in starts]
-    ends[-1] = H
+    chunk_size = max(1, (H + num_threads - 1) // num_threads)
+    starts = list(range(0, H, chunk_size))
+    ends = [min(s + chunk_size, H) for s in starts]
     
+    pad_width = window_size // 2
+
     try:
         def process_chunk(y_start, y_end):
             # 对这一块 Y 区域，处理所有时间帧
-            # 注意：np.cumsum 可能会产生非常大的临时数组 (float32)，这里需要小心
-            # 如果 H 很大，chunk_size 应该尽量小，或者这里不一次性处理所有 T
             
-            # 优化：为了防止内部 cumsum 爆内存，我们可以分批次处理时间轴？
-            # 但 rolling average 需要时间连续。目前的瓶颈是 chunk_data 的大小。
-            # chunk_data shape: (T, chunk_h, W). float32 是 uint8 的4倍。
-            # 如果 T=15000, chunk_h=200, W=2000 -> 15000*200*2000*4 = 24GB !!! 依然会爆。
+            # 1. 提取原有数据 (T, chunk_h, W)
+            chunk_data_raw = image_stack[:, y_start:y_end, :]
             
-            # === 二级优化：在 chunk 内部再分块处理时间轴吗？ ===
-            # Cumsum 必须全时间轴。所以对于超大 T，Rolling Average 很难并行化而不爆内存。
-            # 妥协方案：减小 num_threads (增加 chunk_size) 是反向操作。
-            # 应该减小 chunk_size。让 chunk_h 变小。
+            # 2. 在时间轴 (axis=0) 进行边缘填充 (Replicate/Edge Padding)
+            # pad_width 个首帧, pad_width 个尾帧
+            chunk_padded = np.pad(chunk_data_raw, ((pad_width, pad_width), (0, 0), (0, 0)), mode='edge').astype(np.float32)
             
-            # 即使 chunk_h = 1 行: 15000 * 1 * 2048 * 4 bytes = 122 MB. 
-            # 只要切得够细，内存是可以控制的。
+            # 3. 计算 Cumsum
+            # Padded shape: (T + 2*pad, ...)
+            chunk_cum = np.zeros((chunk_padded.shape[0] + 1, y_end - y_start, W), dtype=np.float32)
+            np.cumsum(chunk_padded, axis=0, out=chunk_cum[1:])
             
-            chunk_data = image_stack[:, y_start:y_end, :].astype(np.float32)
-            chunk_cum = np.zeros((chunk_data.shape[0] + 1, y_end - y_start, W), dtype=np.float32)
-            np.cumsum(chunk_data, axis=0, out=chunk_cum[1:])
-            
-            # 计算平均
+            # 4. 计算平均
+            # Window sum at valid positions
+            # The result should have length T.
+            # Start index: window_size (which is 2*pad + 1). 
+            # We want T outputs.
             chunk_avg_float = (chunk_cum[window_size:] - chunk_cum[:-window_size]) / window_size
             
             # 释放大数组
-            del chunk_data
+            del chunk_data_raw
+            del chunk_padded
             del chunk_cum
             
             return y_start, y_end, np.clip(chunk_avg_float, 0, 255).astype(np.uint8)
         
         # 强制增加线程数/切片数以减小单块内存
         # 如果图像很大，强制切成更多条带
-        safe_threads = max(num_threads, 32) 
-        chunk_size = max(1, H // safe_threads)
-        starts = [i * chunk_size for i in range(safe_threads)]
-        ends = [start + chunk_size for start in starts]
-        ends[-1] = H
+        safe_threads = max(num_threads, 32)
+        
+        # Safer chunking calculation
+        # Use ceil division-like logic or just simple steps
+        chunk_size = max(1, (H + safe_threads - 1) // safe_threads)
+        starts = list(range(0, H, chunk_size))
+        ends = [min(s + chunk_size, H) for s in starts]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor: # 实际并发线程仍受参数控制
             futures = [executor.submit(process_chunk, y_start, y_end) 

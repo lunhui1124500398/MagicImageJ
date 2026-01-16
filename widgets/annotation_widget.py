@@ -70,7 +70,7 @@ class AnnotationWidget(QWidget):
         """当外部选中图层时同步"""
         active_layer = self.viewer.layers.selection.active
         if active_layer:
-            idx = self.layer_combo.findText(active_layer.name)
+            idx = self.layer_combo.findData(active_layer.name)
             if idx >= 0:
                 self.layer_combo.setCurrentIndex(idx)
 

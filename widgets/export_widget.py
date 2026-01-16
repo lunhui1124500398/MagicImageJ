@@ -20,7 +20,7 @@ import cv2
 from widgets.settings_widget import tr
 
 # 引入工具函数
-from utils.video_export import export_to_video, export_to_tiff_stack, get_available_codecs
+from utils.video_export import export_to_video, export_to_tiff_stack, export_to_gif, get_available_codecs
 from utils.utils import elide_text
 from utils.ui_utils import setup_safe_scroll_all
 
@@ -50,17 +50,26 @@ class ExportThread(QThread):
                 del self.func_params['frame_range']
             
             if self.export_type == 'video':
-                # Video 导出
+                # Video 导出 - 使用回调更新进度
                 success = export_to_video(
-                    self.image_stack, str(self.output_path), **self.func_params
+                    self.image_stack, str(self.output_path), 
+                    callback=self._emit_progress,
+                    **self.func_params
                 )
-                # 视频导出进度目前封装在 utils 里，这里发送完成信号
-                self.progress.emit(100, 100)
                 
             elif self.export_type == 'tiff':
                 # TIFF Stack 导出
                 success = export_to_tiff_stack(self.image_stack, str(self.output_path))
                 self.progress.emit(100, 100)
+                
+            elif self.export_type == 'gif':
+                # GIF 导出 - 使用回调更新进度
+                from utils.video_export import export_to_gif
+                success = export_to_gif(
+                    self.image_stack, str(self.output_path), 
+                    callback=self._emit_progress,
+                    **self.func_params
+                )
                 
             elif self.export_type == 'image_sequence':
                 # 序列导出
@@ -75,6 +84,10 @@ class ExportThread(QThread):
             import traceback
             traceback.print_exc() # 打印堆栈方便调试
             self.error.emit(str(e))
+
+    def _emit_progress(self, current: int, total: int):
+        """进度回调，用于传递给底层导出函数"""
+        self.progress.emit(current, total)
 
     def _export_image_sequence(self):
         output_path = Path(self.output_path)
@@ -91,6 +104,9 @@ class ExportThread(QThread):
         pat = self.params.get('name_pattern', 'frame_{:04d}')
         total = len(self.image_stack)
         
+        # [NEW] 获取原始索引（如果存在）
+        original_indices = self.params.get('original_indices', None)
+        
         for i, frame in enumerate(self.image_stack):
             # 简单的 RGB 处理
             if frame.ndim == 3 and frame.shape[2] in [3, 4]:
@@ -101,7 +117,13 @@ class ExportThread(QThread):
             else:
                 frame_out = frame
             
-            fname = folder / f"{pat.format(i)}.{fmt}"
+            # [NEW] 使用原始索引进行命名（如果存在）
+            if original_indices is not None and i < len(original_indices):
+                frame_idx = original_indices[i]
+            else:
+                frame_idx = i
+            
+            fname = folder / f"{pat.format(frame_idx)}.{fmt}"
             cv2.imwrite(str(fname), frame_out)
             
             if i % 10 == 0: 
@@ -182,18 +204,22 @@ class ExportWidget(QWidget):
         
         self.radio_vid = QRadioButton(tr("Video (.mp4, .avi)"))
         self.radio_vid.setChecked(True)
+        self.radio_gif = QRadioButton(tr("GIF Animation (.gif)"))
         self.radio_tiff = QRadioButton(tr("TIFF Stack (.tiff)"))
         self.radio_seq = QRadioButton(tr("Image Sequence (Folder)"))
         
         self.bg_type.addButton(self.radio_vid)
+        self.bg_type.addButton(self.radio_gif)
         self.bg_type.addButton(self.radio_tiff)
         self.bg_type.addButton(self.radio_seq)
         
         l_type.addWidget(self.radio_vid)
+        l_type.addWidget(self.radio_gif)
         l_type.addWidget(self.radio_tiff)
         l_type.addWidget(self.radio_seq)
         
         self.radio_vid.toggled.connect(self._toggle_settings)
+        self.radio_gif.toggled.connect(self._toggle_settings)
         self.radio_tiff.toggled.connect(self._toggle_settings)
         self.radio_seq.toggled.connect(self._toggle_settings)
         
@@ -250,6 +276,37 @@ class ExportWidget(QWidget):
         self.g_seq_set.setLayout(l_seq)
         self.g_seq_set.setVisible(False) # Default hidden
         layout.addWidget(self.g_seq_set)
+        
+        # 5.5 GIF Settings (Colors, Loop)
+        self.g_gif_set = QGroupBox(tr("GIF Options"))
+        l_gif = QVBoxLayout()
+        
+        # 颜色数量 (影响文件大小)
+        h_colors = QHBoxLayout()
+        self.lbl_gif_colors = QLabel(tr("Colors (2-256):"))
+        self.lbl_gif_colors.setToolTip(tr("Fewer colors = smaller file size, but lower quality"))
+        h_colors.addWidget(self.lbl_gif_colors)
+        self.spin_gif_colors = QSpinBox()
+        self.spin_gif_colors.setRange(2, 256)
+        self.spin_gif_colors.setValue(256)
+        self.spin_gif_colors.setToolTip(tr("Fewer colors = smaller file size, but lower quality"))
+        h_colors.addWidget(self.spin_gif_colors)
+        l_gif.addLayout(h_colors)
+        
+        # 循环次数
+        h_loop = QHBoxLayout()
+        self.lbl_gif_loop = QLabel(tr("Loop (0=infinite):"))
+        h_loop.addWidget(self.lbl_gif_loop)
+        self.spin_gif_loop = QSpinBox()
+        self.spin_gif_loop.setRange(0, 999)
+        self.spin_gif_loop.setValue(0)
+        self.spin_gif_loop.setToolTip(tr("0 = infinite loop"))
+        h_loop.addWidget(self.spin_gif_loop)
+        l_gif.addLayout(h_loop)
+        
+        self.g_gif_set.setLayout(l_gif)
+        self.g_gif_set.setVisible(False) # Default hidden
+        layout.addWidget(self.g_gif_set)
         
         # 6. Annotations Check
         self.g_anno = QGroupBox(tr("Overlay Annotations"))
@@ -317,9 +374,39 @@ class ExportWidget(QWidget):
     def _toggle_settings(self):
         """根据选择的格式显示/隐藏对应设置"""
         is_video = self.radio_vid.isChecked()
+        is_gif = self.radio_gif.isChecked()
         is_seq = self.radio_seq.isChecked()
-        self.g_vid_set.setVisible(is_video)
+        # Video: 显示完整设置 (FPS, Codec, Quality)
+        # GIF: 只显示 FPS 设置
+        self.g_vid_set.setVisible(is_video or is_gif)
+        if is_gif:
+            # 隐藏 Codec 和 Quality (GIF 不需要)
+            self.combo_codec.parentWidget() if hasattr(self.combo_codec, 'parentWidget') else None
+            self.combo_codec.setVisible(False)
+            self.spin_qual.setVisible(False)
+            # 隐藏它们的标签 (需要找到父布局中的 Label)
+            for i in range(self.g_vid_set.layout().count()):
+                item = self.g_vid_set.layout().itemAt(i)
+                if item and item.layout():
+                    # 检查是否是 Codec 或 Quality 的行
+                    for j in range(item.layout().count()):
+                        w = item.layout().itemAt(j).widget()
+                        if w and isinstance(w, QLabel):
+                            txt = w.text()
+                            if 'Codec' in txt or 'Quality' in txt or '编解码' in txt or '质量' in txt:
+                                w.setVisible(False)
+        else:
+            self.combo_codec.setVisible(True)
+            self.spin_qual.setVisible(True)
+            for i in range(self.g_vid_set.layout().count()):
+                item = self.g_vid_set.layout().itemAt(i)
+                if item and item.layout():
+                    for j in range(item.layout().count()):
+                        w = item.layout().itemAt(j).widget()
+                        if w and isinstance(w, QLabel):
+                            w.setVisible(True)
         self.g_seq_set.setVisible(is_seq)
+        self.g_gif_set.setVisible(is_gif)
         
     def _refresh_layers(self, event=None):
         self._restore_last_path()
@@ -398,6 +485,8 @@ class ExportWidget(QWidget):
         
         if self.radio_vid.isChecked():
             f, _ = QFileDialog.getSaveFileName(self, "Save Video", d, "Video (*.mp4 *.avi)")
+        elif self.radio_gif.isChecked():
+            f, _ = QFileDialog.getSaveFileName(self, "Save GIF", d, "GIF (*.gif)")
         elif self.radio_tiff.isChecked():
             f, _ = QFileDialog.getSaveFileName(self, "Save TIFF", d, "TIFF (*.tiff)")
         else:
@@ -484,6 +573,11 @@ class ExportWidget(QWidget):
         elif self.radio_seq.isChecked():
             params['format'] = self.combo_img_fmt.currentText()
             params['name_pattern'] = self.edit_pattern.text()
+        
+        elif self.radio_gif.isChecked():
+            params['fps'] = self.spin_fps.value()
+            params['colors'] = self.spin_gif_colors.value()
+            params['loop'] = self.spin_gif_loop.value()
             
         return params
 
@@ -531,6 +625,8 @@ class ExportWidget(QWidget):
             
             if self.radio_vid.isChecked():
                 final_path = final_path / "Exported_Videos" / f"{fname}.mp4"
+            elif self.radio_gif.isChecked():
+                final_path = final_path / "Exported_GIFs" / f"{fname}.gif"
             elif self.radio_tiff.isChecked():
                 final_path = final_path / "Exported_Stacks" / f"{fname}.tiff"
             else:
@@ -562,10 +658,15 @@ class ExportWidget(QWidget):
             data_slice = data
             selected_indices = "All"
             
-        etype = 'video' if self.radio_vid.isChecked() else 'tiff' if self.radio_tiff.isChecked() else 'image_sequence'
+        etype = 'video' if self.radio_vid.isChecked() else 'gif' if self.radio_gif.isChecked() else 'tiff' if self.radio_tiff.isChecked() else 'image_sequence'
         params = self._get_export_params()
 
         params['frame_range'] = selected_indices
+        
+        # [NEW] 传递 original_indices 用于序列导出的正确命名
+        original_indices = layer.metadata.get('original_indices', None)
+        if original_indices is not None:
+            params['original_indices'] = original_indices
         
         # 3. 启动线程
         self.export_thread = ExportThread(data_slice, str(final_path), etype, params)

@@ -17,3 +17,7 @@ __pycache__/
 
 # 测试文件
 /tests
+/dist
+/dists
+/build
+/builds

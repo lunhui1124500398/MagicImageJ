@@ -224,7 +224,7 @@ class DoseCalculationThread(QThread):
                     "exposure": float(exposure), "pixel_A": float(pixel_A), "pixel_unit_raw": str(pixel_unit),
                     "mag": float(mag), "mean": float(mean_int)
                 }
-                self.finished.emit(float(dose_rate), candidate.name, info)
+                self.finished.emit(float(dose_rate), str(candidate.resolve()), info)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -381,6 +381,11 @@ class ImportWidget(QWidget):
         h_calc.addStretch()
         l_dose.addLayout(h_calc)
         
+        # [Ref Display Fix] Use ReadOnly LineEdit for full path
+        self.ref_path_edit = QLineEdit(); self.ref_path_edit.setPlaceholderText(tr("Ref Image Path")); self.ref_path_edit.setReadOnly(True); 
+        self.ref_path_edit.setStyleSheet("QLineEdit { border: 1px solid #444; background: #222; color: #AAA; font-size: 10px; border-radius: 3px; padding: 2px; }")
+        l_dose.addWidget(self.ref_path_edit)
+
         self.meta_info_label = QLabel(tr("Select folder to extract date, mag, pixel size...")); self.meta_info_label.setWordWrap(True); self.meta_info_label.setStyleSheet("font-size: 10px; color: gray;")
         l_dose.addWidget(self.meta_info_label); g_dose.setLayout(l_dose); layout.addWidget(g_dose)
 
@@ -592,8 +597,13 @@ class ImportWidget(QWidget):
         if info.get('mag', 0) > 0:
             m = info['mag']
             self.mag_edit.setText(f"{int(m/1000)}K" if m >= 1000 else str(int(m)))
-        short_name = fname if len(fname) < 20 else "..." + fname[-15:]
-        self.meta_info_label.setText(f"Ref: {short_name}\nDate: {info.get('date_fmt', 'N/A')}, Exp: {info.get('exposure', 0)}s\nPixel: {info.get('pixel_A', 0):.2f} Å")
+        
+        # [Fix] Display full path in LineEdit
+        self.ref_path_edit.setText(fname)
+        self.ref_path_edit.setToolTip(fname)
+        self.ref_path_edit.setCursorPosition(0) # Show start of path
+        
+        self.meta_info_label.setText(f"Date: {info.get('date_fmt', 'N/A')}, Exp: {info.get('exposure', 0)}s\nPixel: {info.get('pixel_A', 0):.2f} Å, Mean: {info.get('mean', 0):.1f}")
         self._update_preview()
         self.create_archive_btn.setEnabled(True)
 
