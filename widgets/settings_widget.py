@@ -418,6 +418,9 @@ TRANS_CN = {
     "Adjust Mode.": "调整模式。",
     "Adjust Mode (Click bg to draw)": "调整模式 (点击背景以绘制)",
     "Nothing to clear.": "没有可清除的内容。",
+    "Nothing to undo.": "没有可撤回的操作。",
+    "ROI Undo History:": "ROI 撤销历史:",
+    "Maximum ROI undo history. Larger values use more memory.": "ROI 撤销历史记录上限。数值越大占用内存越多。",
     "Clear All Overlays?": "清除所有覆盖层?",
     "Clear ALL temporary drawings (ROIs, Lines, etc.)?": "清除所有临时绘制 (ROI, 线条 等)?",
     "This action cannot be undone.": "此操作无法撤销。",
@@ -895,6 +898,7 @@ class GlobalConfig:
         "geo_enlarge": True,      # [New] 扩大画布
         "geo_create_denoise": False, # [New] 创建去噪文件夹
         "geo_create_refine": False,  # [New] 创建Refine文件夹
+        "geo_roi_history_max": 128,   # [New] ROI 撤销历史记录上限
 
         # Suffixes
         "geo_suffix_lrtem": "_lrtem",
@@ -1170,6 +1174,14 @@ class SettingsDialog(QDialog):
         f_geo.addRow("", self.geo_sq_check)
         f_geo.addRow("", self.geo_denoise_check)
         f_geo.addRow("", self.geo_refine_check)
+        
+        # ROI 撤销历史记录上限
+        self.geo_history_max_spin = QSpinBox()
+        self.geo_history_max_spin.setRange(10, 1000)
+        self.geo_history_max_spin.setValue(int(GlobalConfig.get("geo_roi_history_max")))
+        self.geo_history_max_spin.setToolTip(tr("Maximum ROI undo history. Larger values use more memory."))
+        f_geo.addRow(tr("ROI Undo History:"), self.geo_history_max_spin)
+        
         f_geo.addRow(QLabel("<hr>")) # 分割线
 
         self.suff_main = QLineEdit(str(GlobalConfig.get("geo_suffix")))
@@ -1683,6 +1695,7 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("geo_force_square", self.geo_sq_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_create_denoise", self.geo_denoise_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_create_refine", self.geo_refine_check.isChecked(), emit_signal=False)
+        GlobalConfig.set("geo_roi_history_max", self.geo_history_max_spin.value(), emit_signal=False)
 
         # 5. Save Suffixes
         GlobalConfig.set("geo_suffix", self.suff_main.text(), emit_signal=False)

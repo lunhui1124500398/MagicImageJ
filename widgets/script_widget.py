@@ -318,17 +318,6 @@ class ScriptWidget(QWidget):
         else:
             subprocess.run(['xdg-open', str(self.scripts_dir)])
     
-    def _is_gui_script(self, script_path: str) -> bool:
-        """检测脚本是否包含 GUI (tkinter/PyQt)"""
-        try:
-            with open(script_path, 'r', encoding='utf-8') as f:
-                content = f.read(5000)
-            # 检测常见 GUI 关键字
-            gui_keywords = ['tkinter', 'Tk()', 'mainloop', 'PyQt', 'QApplication', 'QWidget']
-            return any(kw in content for kw in gui_keywords)
-        except:
-            return False
-    
     def _run_script(self):
         """运行选中的脚本"""
         item = self.script_list.currentItem()
@@ -350,13 +339,68 @@ class ScriptWidget(QWidget):
         self.console.append(f"[Path] {script_path}\n")
         self.console.append("-" * 50 + "\n")
         
-        # 检测是否为 GUI 脚本
-        if self._is_gui_script(script_path):
-            # GUI 脚本：直接启动，不捕获输出
-            self._run_gui_script(script_path, args)
+        # 读取脚本内容以进行检测
+        try:
+             with open(script_path, 'r', encoding='utf-8') as f:
+                content = f.read(5000)
+        except:
+            content = ""
+
+        # 1. 检测是否需要 Napari Viewer (in-process execution)
+        if "def main(viewer):" in content or "def main(viewer," in content:
+            self._run_in_process_script(script_path)
+        # 2. 检测是否为 GUI 脚本 (独立进程)
+        elif self._is_gui_script_content(content):
+             self._run_gui_script(script_path, args)
+        # 3. 普通脚本 (子进程后台)
         else:
-            # 普通脚本：后台线程执行并捕获输出
             self._run_console_script(script_path, args)
+
+    def _is_gui_script(self, script_path: str) -> bool:
+        """(Legacy wrapper)"""
+        try:
+            with open(script_path, 'r', encoding='utf-8') as f:
+                content = f.read(5000)
+            return self._is_gui_script_content(content)
+        except:
+            return False
+
+    def _is_gui_script_content(self, content: str) -> bool:
+         # 检测常见 GUI 关键字
+        gui_keywords = ['tkinter', 'Tk()', 'mainloop', 'PyQt', 'QApplication', 'QWidget']
+        return any(kw in content for kw in gui_keywords)
+
+    def _run_in_process_script(self, script_path: str):
+        """在当前进程中运行脚本 (阻塞式，用于操作 viewer)"""
+        self.console.append("[Info] Executing in-process (Napari Viewer Access)...\n")
+        try:
+            import importlib.util
+            
+            # 动态加载模块
+            spec = importlib.util.spec_from_file_location("dynamic_script_module", script_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules["dynamic_script_module"] = module
+                spec.loader.exec_module(module)
+                
+                # 检查并调用 main(viewer)
+                if hasattr(module, 'main'):
+                    self.console.append("[Info] Calling main(viewer)...\n")
+                    module.main(self.viewer)
+                    self.console.append(f"✅ {tr('Script executed successfully.')}\n")
+                else:
+                    self.console.append("[Error] Function 'main(viewer)' not found in script.\n")
+            else:
+                 self.console.append("[Error] Failed to load script module.\n")
+                 
+        except Exception as e:
+            import traceback
+            err_msg = traceback.format_exc()
+            self.console.append(f"[Error] Exception in script:\n{err_msg}\n")
+            self.console.append(f"❌ {tr('Script failed.')}\n")
+        finally:
+             if "dynamic_script_module" in sys.modules:
+                 del sys.modules["dynamic_script_module"]
     
     def _run_gui_script(self, script_path: str, args: list):
         """运行 GUI 脚本 (直接启动，不捕获输出)"""

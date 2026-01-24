@@ -14,13 +14,9 @@ my_datas = []
 my_binaries = []
 my_hiddenimports = []
 
-mydatas = [
-    ('assets/arial.ttf', 'assets'),
-    ('assets/app_icon.ico', 'assets'),
-]
-
 add_files = [
     ('assets','assets'),
+    ('scripts','scripts'),
 ]
 
 # ========================================================

@@ -285,6 +285,9 @@ class GeometryWidget(QWidget):
         self.viewer = viewer
         self._is_updating = False 
         self._force_view_active = False 
+        self._roi_history = []  # ROI 状态快照栈，用于撤销
+        self._roi_history_max = int(GlobalConfig.get("geo_roi_history_max"))  # 历史记录上限
+        self._prev_roi_state = None  # 追踪"变更前"的状态
         self._setup_ui()
 
         # 初始化与热更新
@@ -936,6 +939,70 @@ class GeometryWidget(QWidget):
 
         self.status_label.setText(f"""✅ {tr("Crop applied. Press '%s' to Undo.") % undo_key}""")
 
+    # --- ROI History for Undo ---
+    def _init_roi_history_tracking(self):
+        """初始化历史追踪（在开始绘制时调用）"""
+        self._roi_history = []
+        self._prev_roi_state = None  # 追踪"变更前"的状态
+        # 保存初始空状态，允许撤销回空
+        self._prev_roi_state = {'data': [], 'features': {'label': [], 'frame_range': [], 'frame_info': []}}
+    
+    def _save_prev_state(self):
+        """保存当前状态作为"下一次变更前"的状态"""
+        if "Batch_ROI" not in self.viewer.layers:
+            return
+        layer = self.viewer.layers["Batch_ROI"]
+        
+        import copy
+        self._prev_roi_state = {
+            'data': [roi.copy() for roi in layer.data] if len(layer.data) > 0 else [],
+            'features': copy.deepcopy(dict(layer.features)) if len(layer.data) > 0 else {'label': [], 'frame_range': [], 'frame_info': []}
+        }
+    
+    def _push_roi_history(self):
+        """将"变更前的状态"推入历史栈"""
+        if self._prev_roi_state is None:
+            return
+        
+        # 推入的是变更前的状态，而非当前状态
+        self._roi_history.append(self._prev_roi_state)
+        
+        # 限制历史记录数量
+        if len(self._roi_history) > self._roi_history_max:
+            self._roi_history.pop(0)
+
+    def _pop_roi_history(self):
+        """从历史栈恢复 ROI 状态"""
+        if not self._roi_history:
+            return False
+        
+        if "Batch_ROI" not in self.viewer.layers:
+            return False
+        
+        layer = self.viewer.layers["Batch_ROI"]
+        snapshot = self._roi_history.pop()
+        
+        self._is_updating = True
+        try:
+            layer.data = snapshot['data']
+            layer.features = snapshot['features']
+            layer.selected_data = set()
+        finally:
+            self._is_updating = False
+            layer.refresh()
+        
+        self._last_shape_count = len(layer.data)
+        
+        # 恢复后，更新 _prev_roi_state 为当前状态
+        self._save_prev_state()
+        return True
+
+    def _clear_roi_history(self):
+        """清空历史栈（新建会话时调用）"""
+        self._roi_history = []
+        self._prev_roi_state = {'data': [], 'features': {'label': [], 'frame_range': [], 'frame_info': []}}
+
+
     # --- Batch Crop Logic ---
     def _start_batch_mode(self):
         view_layer = self.batch_view_combo.currentData()
@@ -1001,21 +1068,18 @@ class GeometryWidget(QWidget):
 
         self._bind_smart_mode_switch(roi_layer)
         
-        # 绑定撤销 (保持原有逻辑)
+        # ===【增强】清空历史栈，开始新会话 ===
+        self._clear_roi_history()
+        
+        # ===【增强】绑定撤销 (支持绘制模式和选择模式) ===
         undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
-        @roi_layer.bind_key(undo_key)
+        @roi_layer.bind_key(undo_key, overwrite=True)
         def undo_batch_rect(layer):
-            if layer.mode == 'add_rectangle' and len(layer.data) > 0:
-                self._is_updating = True 
-                try:
-                    layer.data = layer.data[:-1]
-                    layer.features = {k: v[:-1] for k, v in layer.features.items()}
-                    layer.selected_data = set()
-                    self.status_label.setText(f"↩️ {tr('Last ROI removed.')}")
-                except: pass
-                finally:
-                    self._is_updating = False
-                    layer.refresh()
+            if self._pop_roi_history():
+                self.status_label.setText(f"↩️ {tr('Undone. Adjust ROI and try again.')}")
+            else:
+                self.status_label.setText(f"⚠️ {tr('Nothing to undo.')}")
+        
         switch_key = GlobalConfig.get_napari_shortcut("shortcut_switch_mode")
         self.status_label.setText(f"""✏️ {tr("Drawing on '%s'. (New Layer)") % view_layer}""")
         self._last_shape_count = 0
@@ -1227,6 +1291,9 @@ class GeometryWidget(QWidget):
         if self._is_updating: return
         if "Batch_ROI" not in self.viewer.layers: return
         
+        # ===【增强】修改前保存状态到历史栈 ===
+        self._push_roi_history()
+        
         layer = self.viewer.layers["Batch_ROI"]
         current_count = len(layer.data)
 
@@ -1246,11 +1313,31 @@ class GeometryWidget(QWidget):
         
         self._last_shape_count = current_count
         
+        # 获取图像尺寸用于边界检查和强制正方形
+        # 优先使用 combo box 选择的图层，否则使用任意可见图像图层
         view_layer_name = self.batch_view_combo.currentData()
-        if view_layer_name not in self.viewer.layers: return
+        img_layer = None
         
-        img_layer = self.viewer.layers[view_layer_name]
-        IMG_H, IMG_W = img_layer.data.shape[-2], img_layer.data.shape[-1]
+        if view_layer_name and view_layer_name in self.viewer.layers:
+            img_layer = self.viewer.layers[view_layer_name]
+        else:
+            # 回退：查找任意可见的图像图层
+            for l in self.viewer.layers:
+                if isinstance(l, napari.layers.Image) and l.visible:
+                    img_layer = l
+                    break
+            # 如果没有可见的，查找任意图像图层
+            if img_layer is None:
+                for l in self.viewer.layers:
+                    if isinstance(l, napari.layers.Image):
+                        img_layer = l
+                        break
+        
+        # 如果完全没有图像图层，只更新标签不做尺寸约束
+        if img_layer is None:
+            IMG_H, IMG_W = float('inf'), float('inf')  # 无限大，不做边界约束
+        else:
+            IMG_H, IMG_W = img_layer.data.shape[-2], img_layer.data.shape[-1]
         
         layer = self.viewer.layers["Batch_ROI"]
         if len(layer.data) == 0: return
@@ -1336,6 +1423,9 @@ class GeometryWidget(QWidget):
                 "rois": rois_snapshot
             })
         except: pass
+        
+        # ===【增强】处理完成后，保存当前状态作为下一次变更的"前状态" ===
+        self._save_prev_state()
 
     
     # === [新增] 全面清理 (带弹窗保护) ===
@@ -1786,6 +1876,134 @@ class GeometryWidget(QWidget):
             print(f"Error adding layer '{name}' to viewer: {e}")
             # 如果出错，给用户一个非阻塞的提示（可选）
             self.status_label.setText(f"❌ Failed to add layer: {name}")
+
+    def restore_from_processing_log(self, log_path):
+        """
+        从 processing_log.json 恢复 ROI (核心方法)
+        此方法直接创建图层，不依赖 _start_batch_mode (避免 combo box 空的问题)
+        """
+        from pathlib import Path
+        
+        log_path = Path(log_path)
+        if not log_path.exists():
+            QMessageBox.critical(None, tr("Error"), f"Log file not found: {log_path}")
+            return False
+        
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(None, tr("Error"), f"Failed to load JSON: {e}")
+            return False
+        
+        if "batch_crop" not in data or "rois" not in data["batch_crop"]:
+            QMessageBox.warning(None, tr("Error"), "Invalid JSON format: missing 'batch_crop' or 'rois'")
+            return False
+        
+        rois_list = data["batch_crop"]["rois"]
+        if not rois_list:
+            QMessageBox.information(None, tr("Info"), "No ROIs found in log.")
+            return False
+        
+        # 1. 先清除旧的 Batch_ROI 图层
+        if "Batch_ROI" in self.viewer.layers:
+            self.viewer.layers.remove("Batch_ROI")
+        
+        # 2. 解析数据
+        new_data = []
+        new_labels = []
+        new_ranges = []
+        new_infos = []
+        
+        for i, item in enumerate(rois_list):
+            bbox = item.get("bbox")
+            roi_id = item.get("id", i + 1)
+            fr = str(item.get("frame_range_used", ""))
+            
+            # 处理帧范围显示
+            if fr.lower() == "nan" or fr.strip() == "":
+                fr_display = "All"  # nan 或空表示使用全部帧
+                fr_store = ""  # 存储空值以保持后续导出一致
+            else:
+                fr_display = fr
+                fr_store = fr
+            
+            if bbox and len(bbox) == 4:
+                # processing_log 格式: [x1, y1, x2, y2]
+                # Napari rectangle 格式: [[y1, x1], [y1, x2], [y2, x2], [y2, x1]]
+                x1, y1, x2, y2 = bbox
+                rect = np.array([[y1, x1], [y1, x2], [y2, x2], [y2, x1]])
+                new_data.append(rect)
+                new_labels.append(str(roi_id))
+                new_ranges.append(fr_store)  # 存储用于导出
+                # frame_info 用于显示帧范围 (显示在ROI上)
+                new_infos.append(f"[{fr_display}]")
+        
+        if not new_data:
+            QMessageBox.information(None, tr("Info"), "No valid ROIs extracted from log.")
+            return False
+        
+        # 3. 直接创建图层 (不调用 _start_batch_mode)
+        box_col = GlobalConfig.get("style_batch_box_color")
+        width = int(GlobalConfig.get("style_batch_width"))
+        txt_col = GlobalConfig.get("style_batch_text_color")
+        font_size = int(GlobalConfig.get("style_batch_font_size"))
+
+        roi_layer = self.viewer.add_shapes(
+            data=new_data,
+            name="Batch_ROI",
+            shape_type='rectangle',
+            edge_color=box_col, 
+            face_color=[0, 1, 0, 0.05],
+            edge_width=width,
+            text={
+                'string': '{label}\n{frame_info}', 
+                'size': font_size, 
+                'color': txt_col, 
+                'anchor': 'upper_left', 
+                'translation': [-5, -5]
+            },
+            features={
+                'label': new_labels, 
+                'frame_range': new_ranges, 
+                'frame_info': new_infos
+            }
+        )
+        
+        # 4. 绑定事件 (用于后续编辑)
+        roi_layer.events.data.connect(self._on_batch_data_change)
+        roi_layer.events.set_data.connect(self._on_selection_change)
+        
+        # 4.1 绑定智能模式切换 (双击背景切换绘制模式)
+        self._bind_smart_mode_switch(roi_layer)
+        
+        # ===【增强】清空历史栈，开始新会话 ===
+        self._clear_roi_history()
+        
+        # ===【增强】绑定撤销 (支持绘制模式和选择模式) ===
+        undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
+        @roi_layer.bind_key(undo_key, overwrite=True)
+        def undo_batch_rect(layer):
+            if self._pop_roi_history():
+                self.status_label.setText(f"↩️ {tr('Undone. Adjust ROI and try again.')}")
+            else:
+                self.status_label.setText(f"⚠️ {tr('Nothing to undo.')}")
+        
+        # 6. 同步状态
+        self._last_shape_count = len(new_data)
+        
+        # 7. 切换到选择模式
+        roi_layer.mode = 'select'
+        self.viewer.layers.selection.active = roi_layer
+        
+        # 8. 刷新下拉框，确保后续操作可以正常识别图层
+        self._refresh_layers()
+        
+        # 9. 保存初始恢复状态，以便后续撤销
+        self._save_prev_state()
+        
+        QMessageBox.information(None, tr("Success"), f"Restored {len(new_data)} ROIs.")
+        return True
 
     def _restore_rois_to_layer(self, data_dump):
         """恢复 ROI - 不依赖 _start_batch_mode 以处理无图层的情况"""
