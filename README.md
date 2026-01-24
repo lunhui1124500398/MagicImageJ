@@ -10,7 +10,7 @@
 
 ## 🎯 这是什么？
 
-**MagicImageJ** 是一款基于 [Napari](https://napari.org/) 的液相透射电子显微镜 (LP-TEM) 数据处理神器。
+**MagicImageJ(YSImageJ)** 是一款基于 [Napari](https://napari.org/) 的液相透射电子显微镜 (LP-TEM) 数据处理神器。
 
 如果你曾经被 ImageJ 的繁琐操作(没有撤回，单次导出crop等)折磨得头秃，或者对着一堆 `.dm4` 文件不知所措，那么恭喜你——救星来了！🎉
 
