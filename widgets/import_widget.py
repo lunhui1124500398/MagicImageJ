@@ -44,6 +44,8 @@ except ImportError:
     DM4_LIB_AVAILABLE = False
 
 from core.dm4_reader import read_dm4_sequence
+from core.dm3_reader import read_dm3_sequence, read_dm3_metadata
+
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -105,12 +107,26 @@ class LoaderThread(QThread):
         try:
             def callback(current, total):
                 self.progress.emit(current, total)
-            image_stack, metadata = read_dm4_sequence(
-                self.folder_path, self.bit_depth, self.max_workers, callback
-            )
+            
+            # Auto-detect format
+            has_dm4 = list(Path(self.folder_path).glob('**/*.dm4'))
+            has_dm3 = list(Path(self.folder_path).glob('**/*.dm3'))
+            
+            if has_dm4:
+                image_stack, metadata = read_dm4_sequence(
+                    self.folder_path, self.bit_depth, self.max_workers, callback
+                )
+            elif has_dm3:
+                image_stack, metadata = read_dm3_sequence(
+                    self.folder_path, self.bit_depth, self.max_workers, callback
+                )
+            else:
+                 raise ValueError("No DM4 or DM3 files found in folder.")
+                 
             self.finished.emit(image_stack, metadata)
         except Exception as e:
             self.error.emit(str(e))
+
 
 class DoseCalculationThread(QThread):
     """剂量计算线程"""
@@ -144,13 +160,18 @@ class DoseCalculationThread(QThread):
         return datetime.datetime.now().strftime("%Y%m%d")
 
     def run(self):
-        if not DM4_LIB_AVAILABLE:
-            self.error.emit("Library 'dm4' not found.")
-            return
+        # Allow DM3 even if DM4 lib missing (if ncempy is there)
+        # if not DM4_LIB_AVAILABLE: ... (Skip check or make it smarter)
+        
         try:
-            files = sorted(list(self.folder_path.rglob("*.dm4")), key=natural_sort_key)
+            p = self.folder_path
+            # Mixed list? Usually one type. Prioritize user selection or mixed.
+            files_dm4 = sorted(list(p.rglob("*.dm4")), key=natural_sort_key)
+            files_dm3 = sorted(list(p.rglob("*.dm3")), key=natural_sort_key)
+            files = files_dm4 + files_dm3
+            
             if not files:
-                self.error.emit("No .dm4 files found.")
+                self.error.emit("No .dm4 or .dm3 files found.")
                 return
             
             total_files = len(files)
@@ -161,72 +182,202 @@ class DoseCalculationThread(QThread):
                 end = min(total_files, mid + 5)
                 candidates_list = files[start:end] if files[start:end] else files
                 candidate = max(candidates_list, key=lambda f: f.stat().st_size)
-                target_idx = files.index(candidate)
+                # Find index in full list
+                if candidate in files:
+                    target_idx = files.index(candidate)
             else:
                 target_idx = max(0, min(self.frame_idx, total_files - 1))
                 candidate = files[target_idx]
             
             candidate = files[target_idx]
+            ext = candidate.suffix.lower()
             
-            with dm4.DM4File.open(str(candidate)) as dm4file:
-                tags = dm4file.read_directory()
-                image_list = tags.named_subdirs['ImageList']
-                image_data_dir = None
-                image_tags_dir = None
-                for subdir in image_list.unnamed_subdirs:
-                    if 'ImageData' in subdir.named_subdirs:
-                        image_data_dir = subdir.named_subdirs['ImageData']
-                        image_tags_dir = subdir.named_subdirs.get('ImageTags')
-                        break
-                if not image_data_dir: raise ValueError("No ImageData found.")
 
-                exposure = 0.0; acq_date_raw = ""; mag = 0
-                if image_tags_dir:
-                    if 'DataBar' in image_tags_dir.named_subdirs:
-                        db = image_tags_dir.named_subdirs['DataBar']
-                        if 'Exposure Time (s)' in db.named_tags: exposure = dm4file.read_tag_data(db.named_tags['Exposure Time (s)'])
-                        if 'Acquisition Date' in db.named_tags: acq_date_raw = self._decode_string(dm4file.read_tag_data(db.named_tags['Acquisition Date']))
-                        if 'Magnification' in db.named_tags: mag = dm4file.read_tag_data(db.named_tags['Magnification'])
-                    if mag == 0 and 'Microscope Info' in image_tags_dir.named_subdirs:
-                        mi = image_tags_dir.named_subdirs['Microscope Info']
-                        if 'Indicated Magnification' in mi.named_tags: mag = dm4file.read_tag_data(mi.named_tags['Indicated Magnification'])
-                    if exposure == 0 and 'Acquisition' in image_tags_dir.named_subdirs:
-                        acq = image_tags_dir.named_subdirs['Acquisition'].named_subdirs.get('Parameters', {}).named_subdirs.get('High Level', {})
-                        if 'Exposure' in acq.named_tags: exposure = dm4file.read_tag_data(acq.named_tags['Exposure'])
+            # === Metadata Caching Strategy ===
+            # Key: (width, height, binning) -> {pixel_size, unit, brightness, mag, exposure}
+            # We use this to fill in missing info for frames in the same sequence
+            if not hasattr(self, '_seq_meta_cache'):
+                self._seq_meta_cache = {}
 
-                acq_date = self._parse_date(acq_date_raw)
-                pixel_size = 1.0; pixel_unit = "nm"; brightness = 1.0
+            # Parse DM4 Metadata (Common Logic extraction)
+            def parse_dm4_meta(dm4_path):
+                with dm4.DM4File.open(str(dm4_path)) as f:
+                    tags = f.read_directory()
+                    image_list = tags.named_subdirs['ImageList']
+                    image_data_dir = None
+                    image_tags_dir = None
+                    
+                    # Logic to find correct ImageData (avoid thumbnail if possible, though mostly index 0 or 1)
+                    # For simple files, usually index 0 is valid or index 1 is valid.
+                    # We check for 'Dimensions' to be sure
+                    target_subdir = None
+                    for subdir in image_list.unnamed_subdirs:
+                        if 'ImageData' in subdir.named_subdirs:
+                            # Verify dims?
+                            target_subdir = subdir
+                            # If we see 'Calibrations' with non-1.0 scale, this is a winner.
+                            # But we might just take what we find.
+                            # Prefer the one with actual data?
+                            # Often index 1 is the main image if index 0 is thumbnail.
+                            pass
+                            
+                    # Re-iterate to pick best
+                    # Heuristic: Pick the one with largest Data size matching file size roughly?
+                    # Or just use the last one? Or ncempy logic?
+                    # Current existing logic loop:
+                    for subdir in image_list.unnamed_subdirs:
+                        if 'ImageData' in subdir.named_subdirs:
+                            image_data_dir = subdir.named_subdirs['ImageData']
+                            image_tags_dir = subdir.named_subdirs.get('ImageTags')
+                            # If this looks like a thumbnail (small dims), maybe skip?
+                            # For now, keep existing behavior but maybe improve later.
+                            break
+                            
+                    if not image_data_dir: raise ValueError("No ImageData found.")
+
+                    # Read Basic Info
+                    dims = [0, 0]
+                    if 'Dimensions' in image_data_dir.named_subdirs:
+                        d_tag = image_data_dir.named_subdirs['Dimensions']
+                        if len(d_tag.unnamed_tags) >= 2:
+                            dims[0] = f.read_tag_data(d_tag.unnamed_tags[0])
+                            dims[1] = f.read_tag_data(d_tag.unnamed_tags[1])
+
+                    exposure = 0.0; acq_date_raw = ""; mag = 0; binning = 1
+                    
+                    if image_tags_dir:
+                        if 'DataBar' in image_tags_dir.named_subdirs:
+                            db = image_tags_dir.named_subdirs['DataBar']
+                            if 'Exposure Time (s)' in db.named_tags: exposure = f.read_tag_data(db.named_tags['Exposure Time (s)'])
+                            if 'Acquisition Date' in db.named_tags: acq_date_raw = self._decode_string(f.read_tag_data(db.named_tags['Acquisition Date']))
+                            if 'Magnification' in db.named_tags: mag = f.read_tag_data(db.named_tags['Magnification'])
+                            if 'Binning' in db.named_tags: binning = f.read_tag_data(db.named_tags['Binning'])
+                            
+                        if mag == 0 and 'Microscope Info' in image_tags_dir.named_subdirs:
+                            mi = image_tags_dir.named_subdirs['Microscope Info']
+                            # Indicated Mag (60k) vs Actual Mag (83k). Prefer Indicated for UI.
+                            if 'Indicated Magnification' in mi.named_tags: 
+                                mag = f.read_tag_data(mi.named_tags['Indicated Magnification'])
+                            if mag == 0 and 'Magnification' in mi.named_tags:
+                                mag = f.read_tag_data(mi.named_tags['Magnification'])
+
+                        if exposure == 0 and 'Acquisition' in image_tags_dir.named_subdirs:
+                            acq = image_tags_dir.named_subdirs['Acquisition'].named_subdirs.get('Parameters', {}).named_subdirs.get('High Level', {})
+                            if 'Exposure' in acq.named_tags: exposure = f.read_tag_data(acq.named_tags['Exposure'])
+
+                    acq_date = self._parse_date(acq_date_raw)
+                    pixel_size = 1.0; pixel_unit = "nm"; brightness = 1.0
+                    
+                    calibrations = image_data_dir.named_subdirs.get('Calibrations')
+                    if calibrations and 'Dimension' in calibrations.named_subdirs:
+                        dim_x = calibrations.named_subdirs['Dimension'].unnamed_subdirs[0]
+                        if 'Scale' in dim_x.named_tags: pixel_size = f.read_tag_data(dim_x.named_tags['Scale'])
+                        if 'Units' in dim_x.named_tags: pixel_unit = self._decode_string(f.read_tag_data(dim_x.named_tags['Units']))
+                    if calibrations and 'Brightness' in calibrations.named_subdirs:
+                        br = calibrations.named_subdirs['Brightness']
+                        if 'Scale' in br.named_tags: brightness = f.read_tag_data(br.named_tags['Scale'])
+
+                    data = np.array(f.read_tag_data(image_data_dir.named_tags['Data']))
+                    
+                    return {
+                        'data': data,
+                        'exposure': float(exposure),
+                        'pixel_size': float(pixel_size),
+                        'unit': str(pixel_unit),
+                        'brightness': float(brightness),
+                        'mag': float(mag),
+                        'date_raw': str(acq_date_raw),
+                        'date': str(acq_date),
+                        'dims': tuple(dims),
+                        'binning': int(binning)
+                    }
+
+            # --- Execution ---
+            if ext == '.dm3':
+                # DM3 path (Use core reader)
+                from core.dm3_reader import read_dm3_metadata
+                data, meta = read_dm3_metadata(str(candidate))
+                if data is None: raise ValueError("Failed to read DM3")
                 
-                calibrations = image_data_dir.named_subdirs.get('Calibrations')
-                if calibrations and 'Dimension' in calibrations.named_subdirs:
-                    dim_x = calibrations.named_subdirs['Dimension'].unnamed_subdirs[0]
-                    if 'Scale' in dim_x.named_tags: pixel_size = dm4file.read_tag_data(dim_x.named_tags['Scale'])
-                    if 'Units' in dim_x.named_tags: pixel_unit = self._decode_string(dm4file.read_tag_data(dim_x.named_tags['Units']))
-                if calibrations and 'Brightness' in calibrations.named_subdirs:
-                    br = calibrations.named_subdirs['Brightness']
-                    if 'Scale' in br.named_tags: brightness = dm4file.read_tag_data(br.named_tags['Scale'])
-
-                data = np.array(dm4file.read_tag_data(image_data_dir.named_tags['Data']))
-                
-                pixel_A = pixel_size
-                if 'nm' in pixel_unit: pixel_A *= 10.0
-                elif 'um' in pixel_unit: pixel_A *= 10000.0
-                elif 'pm' in pixel_unit: pixel_A *= 0.01
-                
-                total_electrons = np.sum(data, dtype=np.float64) * brightness
-                area_A2 = data.size * (pixel_A**2)
-                if exposure <= 0: exposure = 1.0
-                dose_rate = total_electrons / (area_A2 * exposure)
-                mean_int = np.mean(data)
-
-                info = {
-                    "file": str(candidate.name), "date_raw": str(acq_date_raw), "date_fmt": str(acq_date),
-                    "exposure": float(exposure), "pixel_A": float(pixel_A), "pixel_unit_raw": str(pixel_unit),
-                    "mag": float(mag), "mean": float(mean_int)
+                # Normalize keys to match internal parsed struct
+                res = {
+                    'data': data,
+                    'exposure': meta.get('exposure', 0.1), # Avoid 0 div
+                    'pixel_size': meta.get('pixel_size', 1.0),
+                    'unit': meta.get('unit', 'nm'),
+                    'brightness': meta.get('brightness_scale', 1.0),
+                    'mag': meta.get('magnification', 0),
+                    'date_raw': meta.get('raw_date', ''),
+                    'date': meta.get('date', ''),
+                    'dims': data.shape,
+                    'binning': 1 # Unknown for DM3 usually
                 }
-                self.finished.emit(float(dose_rate), str(candidate.resolve()), info)
+            else:
+                # DM4 Path
+                if not DM4_LIB_AVAILABLE:
+                    self.error.emit("Library 'dm4' not found.")
+                    return
+                res = parse_dm4_meta(candidate)
+
+            # Metadata Inheritance / Caching Logic
+            cache_key = (res['dims'], res['binning']) 
+            
+            # Check if current is "Valid" (has calibration)
+            is_valid = (res['pixel_size'] != 1.0) and (res['brightness'] != 1.0)
+            
+            if is_valid:
+                # Update Cache
+                self._seq_meta_cache[cache_key] = {
+                    'pixel_size': res['pixel_size'],
+                    'unit': res['unit'],
+                    'brightness': res['brightness'],
+                    'mag': res['mag'],
+                    'exposure': res['exposure'] if res['exposure'] > 0 else 1.0
+                }
+            elif cache_key in self._seq_meta_cache:
+                # Inherit from Cache
+                cached = self._seq_meta_cache[cache_key]
+                print(f"Inheriting metadata for {candidate.name} from cache.")
+                if res['pixel_size'] == 1.0: 
+                    res['pixel_size'] = cached['pixel_size']
+                    res['unit'] = cached['unit']
+                if res['brightness'] == 1.0:
+                    res['brightness'] = cached['brightness']
+                if res['mag'] == 0:
+                    res['mag'] = cached['mag']
+                # Exposure might vary per frame, but if 0, maybe inherit? 
+                # Usually exposure is constant in a stack.
+                if res['exposure'] <= 0:
+                     res['exposure'] = cached['exposure']
+
+            # Final Calculations
+            pixel_A = res['pixel_size']
+            if 'nm' in res['unit']: pixel_A *= 10.0
+            elif 'um' in res['unit']: pixel_A *= 10000.0
+            elif 'pm' in res['unit']: pixel_A *= 0.01
+
+            exposure = res['exposure'] if res['exposure'] > 0 else 1.0
+            
+            # Recalc Total Electrons with (potentially inherited) brightness
+            total_electrons = np.sum(res['data'], dtype=np.float64) * res['brightness']
+            
+            area_A2 = res['data'].size * (pixel_A**2)
+            dose_rate = total_electrons / (area_A2 * exposure)
+            mean_int = np.mean(res['data'])
+
+            info = {
+                "file": str(candidate.name), 
+                "date_raw": res['date_raw'], "date_fmt": res['date'],
+                "exposure": float(exposure), "pixel_A": float(pixel_A), "pixel_unit_raw": res['unit'],
+                "mag": float(res['mag']), "mean": float(mean_int)
+            }
+            self.finished.emit(float(dose_rate), str(candidate.resolve()), info)
+
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.error.emit(str(e))
+
 
 class ImportWidget(QWidget):
     def __init__(self, viewer):
@@ -558,7 +709,7 @@ class ImportWidget(QWidget):
 
     def _pick_single_file_for_dose(self):
         if not self.current_folder: return
-        f, _ = QFileDialog.getOpenFileName(self, tr("Select DM4 Image for Dose Calculation"), self.current_folder, "DM4 Files (*.dm4)")
+        f, _ = QFileDialog.getOpenFileName(self, tr("Select Image for Dose Calculation"), self.current_folder, "Microscopy Files (*.dm4 *.dm3)")
         if f:
             self.status.setText(tr("Locating file index..."))
             try:
