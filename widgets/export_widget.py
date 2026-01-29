@@ -260,6 +260,19 @@ class ExportWidget(QWidget):
         self.g_seq_set = QGroupBox(tr("Sequence Options"))
         l_seq = QVBoxLayout()
         
+        # [NEW] Auto-create subfolder option
+        self.check_auto_folder = QCheckBox(tr("Auto-create subfolder"))
+        self.check_auto_folder.setChecked(True)
+        self.check_auto_folder.setToolTip(tr("Automatically create a named subfolder (e.g. LayerName_20260129_143022)"))
+        self.check_auto_folder.toggled.connect(self._update_folder_preview)
+        l_seq.addWidget(self.check_auto_folder)
+        
+        # [NEW] Folder name preview
+        self.lbl_folder_preview = QLabel("")
+        self.lbl_folder_preview.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+        self.lbl_folder_preview.setWordWrap(True)
+        l_seq.addWidget(self.lbl_folder_preview)
+        
         h_fmt = QHBoxLayout()
         h_fmt.addWidget(QLabel(tr("Format:")))
         self.combo_img_fmt = QComboBox()
@@ -408,6 +421,10 @@ class ExportWidget(QWidget):
         self.g_seq_set.setVisible(is_seq)
         self.g_gif_set.setVisible(is_gif)
         
+        # [NEW] Update folder preview when switching to sequence mode
+        if is_seq:
+            self._update_folder_preview()
+        
     def _refresh_layers(self, event=None):
         self._restore_last_path()
         curr_data = self.layer_combo.currentData()
@@ -490,7 +507,8 @@ class ExportWidget(QWidget):
         elif self.radio_tiff.isChecked():
             f, _ = QFileDialog.getSaveFileName(self, "Save TIFF", d, "TIFF (*.tiff)")
         else:
-            f = QFileDialog.getExistingDirectory(self, "Select Output Folder", d)
+            # [MODIFIED] Sequence export: select parent folder
+            f = QFileDialog.getExistingDirectory(self, tr("Select Parent Folder for Sequence"), d)
             
         if f:
             self.output_path = f
@@ -498,10 +516,12 @@ class ExportWidget(QWidget):
             self.lbl_path.setStyleSheet("color: #E0E0E0; font-size: 10px;")
             
             p = Path(f)
-            # 如果是文件，保存其父目录；如果是文件夹，保存该目录
             save_dir = str(p.parent) if p.suffix else str(p)
             self.settings.setValue("last_dir", save_dir)
             self.btn_run.setEnabled(True)
+            
+            # [NEW] Update folder preview if in sequence mode
+            self._update_folder_preview()
 
     def _restore_last_path(self):
         # 检查全局归档路径 (from Import Widget)
@@ -634,6 +654,11 @@ class ExportWidget(QWidget):
             
             final_path.parent.mkdir(parents=True, exist_ok=True)
         
+        # [NEW] Sequence export: auto-create subfolder
+        elif self.radio_seq.isChecked() and self.check_auto_folder.isChecked():
+            folder_name = self._generate_auto_folder_name()
+            final_path = final_path / folder_name
+        
         # 2. 准备数据 (切片处理)
         layer = self.viewer.layers[layer_name]
         data = layer.data
@@ -723,3 +748,36 @@ class ExportWidget(QWidget):
             return sorted(list(indices))
         except ValueError:
             return []
+    
+    def _generate_auto_folder_name(self):
+        """Generate auto folder name: {LayerName}_{YYYYMMDD}_{HHMMSS}"""
+        layer_name = self.layer_combo.currentData()
+        if not layer_name:
+            layer_name = "Sequence"
+        
+        # Safe layer name (remove special characters)
+        safe_name = "".join([c if c.isalnum() or c in "-_" else "_" for c in layer_name])
+        # Limit length
+        if len(safe_name) > 30:
+            safe_name = safe_name[:30]
+        
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{safe_name}_{ts}"
+    
+    def _update_folder_preview(self):
+        """Update the auto-create folder preview display"""
+        if not self.radio_seq.isChecked():
+            self.lbl_folder_preview.setText("")
+            return
+        
+        if not self.check_auto_folder.isChecked():
+            self.lbl_folder_preview.setText("")
+            return
+        
+        if not self.output_path:
+            self.lbl_folder_preview.setText(tr("Select a folder first"))
+            return
+        
+        folder_name = self._generate_auto_folder_name()
+        preview_path = Path(self.output_path) / folder_name
+        self.lbl_folder_preview.setText(f"📂 {tr('Will create')}: {preview_path.name}/")

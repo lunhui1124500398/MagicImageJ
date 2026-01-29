@@ -638,6 +638,11 @@ TRANS_CN = {
     "Timestamp": "时间戳",
     "No path selected": "未选择路径",
     "Styles loaded from Annotation Tab": "样式从标注标签加载",
+    "Auto-create subfolder": "自动创建子文件夹",
+    "Automatically create a named subfolder (e.g. LayerName_20260129_143022)": "自动创建一个命名的子文件夹 (例如 图层名_20260129_143022)",
+    "Select Parent Folder for Sequence": "选择序列输出的父文件夹",
+    "Select a folder first": "请先选择文件夹",
+    "Will create": "将创建",
     
     # Settings
     "Preferences & Configuration": "偏好设置",
