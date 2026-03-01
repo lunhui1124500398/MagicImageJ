@@ -50,11 +50,19 @@ my_datas += extra_datas
 # 解决 ModuleNotFoundError 和 资源丢失
 # ========================================================
 # 对核心复杂库进行全量收集
-for package in ['napari', 'vispy', 'magicgui', 'imageio', 'dm4']:
+for package in ['napari', 'vispy', 'magicgui', 'imageio', 'dm4', 'freetype']:
     tmp_datas, tmp_binaries, tmp_hidden = collect_all(package)
     my_datas += tmp_datas
     my_binaries += tmp_binaries
     my_hiddenimports += tmp_hidden
+
+# ========== 关键修复：显式收集 freetype DLL ==========
+# 解决 FT_Exception: cannot open resource
+import glob
+freetype_path = os.path.join(site_packages, 'freetype')
+for dll in glob.glob(os.path.join(freetype_path, '*.dll')):
+    my_binaries.append((dll, 'freetype'))
+    print(f"添加 freetype DLL: {dll}")
 
 # ========================================================
 # 4. 手动补充隐式导入
@@ -73,6 +81,13 @@ explicit_imports = [
     'scipy.signal',
     'pydantic',
     'qtpy',
+    # ========== 字体相关修复 (解决 FT_Exception: cannot open resource) ==========
+    'vispy.util.fonts',
+    'vispy.util.fonts._freetype',
+    'vispy.visuals.text',
+    'vispy.visuals.text.text',
+    'freetype',
+    'freetype.ft_errors',
 ]
 my_hiddenimports += explicit_imports
 
@@ -87,8 +102,8 @@ a = Analysis(
     hiddenimports=my_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
-    excludes=['tkinter','h5py'], 
+    runtime_hooks=['scripts/rthook_freetype_fix.py'],
+    excludes=['tkinter'], 
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

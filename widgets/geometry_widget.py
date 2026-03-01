@@ -123,11 +123,16 @@ class BatchExportThread(QThread):
             
             # Naming components
             date_str = self.p['date_str']
-            dataset_id = self.p['dataset_id']
+            dataset_id = self.p.get('dataset_id', '')
             sub_name = self.p['sub_name']
             
+            # === View Layer Export Options ===
+            export_view = self.p.get('export_view', False)
+            view_stack = self.p.get('view_stack', None)
+            view_suffix_main = self.p.get('view_suffix_main', '_contrasted')
+            
             # === Suffixes ===
-            suffix_main = self.p['suffix_main'] # 来自 UI 输入框 (e.g., "_contrasted" or "_origin")
+            suffix_main = self.p['suffix_main'] # 来自 UI 输入框 (e.g., "_origin")
             aux_suffixes = self.p['aux_suffixes'] # 来自 Settings (e.g., {'lrtem': '_lrtem', ...})
             
             # Flags
@@ -161,13 +166,23 @@ class BatchExportThread(QThread):
                 crop = crop_image_stack(filtered_data_stack, bbox)
 
                 # 4. 构建基础名称
-                # 格式: 20251104_Dataset3_CRY2_NP1
-                base_name = f"{date_str}_{dataset_id}_{sub_name}_NP{i+1}"
+                # 格式: 20251104_Dataset3_CRY2_NP1 或者 20251104_CRY2_NP1
+                dataset_str = f"_{dataset_id}" if dataset_id else ""
+                base_name = f"{date_str}{dataset_str}_{sub_name}_NP{i+1}"
                 
                 # 主数据文件夹 (加上 UI 输入的主后缀)
-                # e.g. ..._NP1_contrasted
+                # e.g. ..._NP1_origin
                 folder_main = output_dir / f"{base_name}{suffix_main}"
                 folder_main.mkdir(parents=True, exist_ok=True)
+                
+                # 同理准备视图层导出文件夹
+                folder_view = None
+                if export_view and view_stack is not None:
+                    folder_view = output_dir / f"{base_name}{view_suffix_main}"
+                    folder_view.mkdir(parents=True, exist_ok=True)
+                    # 执行视图层的裁切
+                    filtered_view_stack = np.asarray(view_stack[selected_indices])
+                    crop_view = crop_image_stack(filtered_view_stack, bbox)
                 
                 # === [修改点] 辅助文件夹现在包含 suffix_main ===
                 # e.g. ..._NP1_contrasted_lrtem
@@ -184,9 +199,11 @@ class BatchExportThread(QThread):
                 # 5. 保存文件到 main 文件夹
                 if is_tiff:
                     export_to_tiff_stack(crop, str(folder_main / f"{base_name}.tiff"))
+                    if export_view and folder_view:
+                        export_to_tiff_stack(crop_view, str(folder_view / f"{base_name}.tiff"))
                 else:
                     for k, img in enumerate(crop):
-                        # 归一化
+                        # 归一化数据层
                         if img.dtype in [np.float32, np.float64]:
                             mn, mx = img.min(), img.max()
                             if mx > mn: img = ((img - mn) / (mx - mn) * 255).astype(np.uint8)
@@ -203,6 +220,21 @@ class BatchExportThread(QThread):
                             if is_success: im_buf.tofile(save_path)
                         except Exception as save_err:
                             print(f"Save Error: {save_err}")
+                            
+                        # 保存视图层
+                        if export_view and folder_view:
+                            img_v = crop_view[k]
+                            if img_v.dtype != np.uint8:
+                                mn_v, mx_v = img_v.min(), img_v.max()
+                                if mx_v > mn_v: img_v = ((img_v - mn_v) / (mx_v - mn_v) * 255).astype(np.uint8)
+                                else: img_v = img_v.astype(np.uint8)
+                                
+                            save_path_v = str(folder_view / file_name)
+                            try:
+                                is_success_v, im_buf_v = cv2.imencode(".png", img_v)
+                                if is_success_v: im_buf_v.tofile(save_path_v)
+                            except Exception as save_err:
+                                print(f"View Layer Save Error: {save_err}")
                 
                 # 6. 日志
                 log_crops.append({
@@ -436,18 +468,39 @@ class GeometryWidget(QWidget):
         self.date_edit.setFixedWidth(75) 
         self.date_edit.setToolTip(tr("Date prefix (YYYYMMDD). Loaded from Archive or Today."))
         name_layout.addWidget(self.date_edit)
+        
+        # [Dataset Ext/Input] - Added Feature
+        name_layout.addWidget(QLabel(tr("Dataset:")))
+        default_ds = QSettings("NapariUser", "Global").value("current_dataset_id", "ds1")
+        self.dataset_edit = QLineEdit(default_ds)
+        self.dataset_edit.setFixedWidth(50)
+        self.dataset_edit.setToolTip(tr("Dataset ID (e.g. ds123). Mostly auto-extracted."))
+        name_layout.addWidget(self.dataset_edit)
 
         name_layout.addWidget(QLabel(tr("Sub:")))
         self.sample_name_edit = QLineEdit("CRY2")
-        name_layout.addWidget(self.sample_name_edit, 1)
+        self.sample_name_edit.setFixedWidth(60)
+        name_layout.addWidget(self.sample_name_edit)
 
         # [Req 3] Suffix Input (Flexible)
         name_layout.addWidget(QLabel(tr("Suffix:")))
         self.suffix_edit = QLineEdit("_origin")
-        self.suffix_edit.setPlaceholderText("e.g. _origin, _contrasted")
+        self.suffix_edit.setPlaceholderText("e.g. _origin")
         self.suffix_edit.setMinimumWidth(80)
         name_layout.addWidget(self.suffix_edit, 1)
         batch_layout.addLayout(name_layout)
+        
+        # [View Export] - Added Feature
+        view_export_layout = QHBoxLayout()
+        self.export_view_check = QCheckBox(tr("Export View Layer"))
+        self.export_view_check.setToolTip(tr("Additionally export the view layer (e.g. contrasted image)."))
+        view_export_layout.addWidget(self.export_view_check)
+        
+        view_export_layout.addWidget(QLabel(tr("Suffix:")))
+        self.export_view_suffix = QLineEdit("_contrasted")
+        self.export_view_suffix.setPlaceholderText(tr("Suffix (e.g. _contrasted)"))
+        view_export_layout.addWidget(self.export_view_suffix, 1)
+        batch_layout.addLayout(view_export_layout)
 
         # [Req 4 & 5] Checkboxes for extra folders
         h_checks = QHBoxLayout()
@@ -683,7 +736,25 @@ class GeometryWidget(QWidget):
         self.batch_data_combo.blockSignals(False)
         self.batch_view_combo.blockSignals(False)
         self._try_load_archived_substance()
+        
+        # [Dataset Ext/Input] - Auto detect on refresh using current data layer
+        if self.batch_data_combo.currentData():
+            self._auto_detect_dataset(self.batch_data_combo.currentData())
 
+    def _auto_detect_dataset(self, layer_name):
+        """[Enhanced Feature] Auto-detect dataset ID from layer name using regex."""
+        import re
+        match_ds = re.search(r"dataset[-_]?.*?(\d+)", layer_name, re.IGNORECASE)
+        # 也可以尝试匹配 ds 开头
+        if not match_ds:
+            match_ds = re.search(r"ds[-_]?.*?(\d+)", layer_name, re.IGNORECASE)
+            
+        if match_ds:
+            ds_num = match_ds.group(1)
+            # 只有当 UI 当前的值为空或者默认的 "ds1" 时才强行覆盖，或者总是覆盖以图层为主？
+            # 为了流畅体验，这里选择只要匹配到就更新文本框
+            self.dataset_edit.setText(f"ds{ds_num}")
+            
     def _try_load_archived_substance(self):
         try:
             archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
@@ -2071,7 +2142,7 @@ class GeometryWidget(QWidget):
         if not date_str:
             date_str = datetime.datetime.now().strftime("%Y%m%d")
             
-        ds_id = QSettings("NapariUser", "Global").value("current_dataset_id", "")
+        ds_id = self.dataset_edit.text().strip()
         sub_name = self.sample_name_edit.text().strip() or "Sample"
         
         archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
@@ -2085,7 +2156,10 @@ class GeometryWidget(QWidget):
                 start_dir = str(Path.home())
             d = QFileDialog.getExistingDirectory(self, "Select Output Directory", start_dir)
             if not d: return
-            output_dir = Path(d) / f"{date_str}_{sub_name}_Exports"
+            
+            # 使用包含 dataset 编号的文件夹名称
+            dataset_str = f"_{ds_id}" if ds_id else ""
+            output_dir = Path(d) / f"{date_str}{dataset_str}_{sub_name}_Exports"
             output_dir.mkdir(parents=True, exist_ok=True)
 
         # 4. 打包参数
@@ -2100,6 +2174,11 @@ class GeometryWidget(QWidget):
             'date_str': date_str,
             'dataset_id': ds_id,
             'sub_name': sub_name,
+            
+            # [View Export] - User Feature
+            'export_view': self.export_view_check.isChecked(),
+            'view_stack': view_stack,
+            'view_suffix_main': self.export_view_suffix.text().strip() or "_contrasted",
             
             # [Key Change] Pass configured suffixes
             'suffix_main': self.suffix_edit.text().strip(), 
@@ -2134,7 +2213,14 @@ class GeometryWidget(QWidget):
         # [Req 6] 获取当前帧数
         current_frame_idx = self.viewer.dims.current_step[0]
         
-        self.export_thread.finished.connect(lambda c, path: self._on_export_finished(c, path, view_stack, rois, sub_name, output_dir, current_frame_idx))
+        export_view_flag = self.export_view_check.isChecked()
+        view_suffix = self.export_view_suffix.text().strip() or "_contrasted"
+        data_suffix = self.suffix_edit.text().strip() or "_origin"
+        
+        self.export_thread.finished.connect(lambda c, path: self._on_export_finished(
+            c, path, data_stack, view_stack, rois, sub_name, output_dir, current_frame_idx,
+            export_view_flag, data_suffix, view_suffix
+        ))
         self.export_thread.error.connect(self._on_export_error)
         self.export_thread.start()
         
@@ -2143,11 +2229,13 @@ class GeometryWidget(QWidget):
             self.export_thread.requestInterruption()
             self.status_label.setText(f"⚠️ {tr('Export canceled.')}")
 
-    def _on_export_finished(self, count, path_name, view_stack, rois, sub_name, output_dir, frame_idx):
+    def _on_export_finished(self, count, path_name, data_stack, view_stack, rois, sub_name, output_dir, frame_idx, export_view_flag, data_suffix, view_suffix):
         self.batch_progress.close()
         
-        # [Req 6] 使用指定的 frame_idx
-        self._create_overview_map(view_stack, rois, sub_name, output_dir, frame_idx)
+        # [Req 6] 使用指定的 frame_idx 分别导出数据层和视图层的概览图
+        self._create_overview_map(data_stack, rois, sub_name, output_dir, frame_idx, suffix=data_suffix)
+        if export_view_flag and view_stack is not None:
+            self._create_overview_map(view_stack, rois, sub_name, output_dir, frame_idx, suffix=view_suffix)
         
         self.status_label.setText(f"✅ {tr('Exported %s crops.') % count}")
         self._force_view_active = False
@@ -2158,7 +2246,7 @@ class GeometryWidget(QWidget):
         self.status_label.setText(f"❌ {tr('Error:')} {err}")
         QMessageBox.critical(self, tr("Export Error"), str(err))
 
-    def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx):
+    def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx, suffix=""):
         """保存 Overview Map"""
         if len(image_stack) == 0: return
         
@@ -2182,7 +2270,7 @@ class GeometryWidget(QWidget):
             draw.rectangle([x1, y1, x2, y2], outline="yellow", width=3)
             draw.text((x1, y1 - 25 if y1 > 25 else y1+5), f"NP{i+1}", fill="yellow", font=font)
             
-        pil_img.save(output_dir / f"{sample_name}_Overview_Frame{idx}.png")
+        pil_img.save(output_dir / f"{sample_name}_Overview_Frame{idx}{suffix}.png")
         
         # 记录 overview 使用的帧
         json_path = output_dir / "processing_log.json"
