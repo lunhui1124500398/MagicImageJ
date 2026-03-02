@@ -118,6 +118,14 @@ TRANS_CN = {
     "1. Rotation (Horizon)": "1. 旋转 (水平校正)",
     "2. Simple Crop (Single)": "2. 简单裁剪 (单图)",
     "3. Batch Extraction (Multi-ROI)": "3. 批量提取 (多区域)",
+    "Log file not found: %s": "未找到日志文件: %s",
+    "Failed to load JSON: %s": "加载 JSON 失败: %s",
+    "Invalid JSON format: missing 'batch_crop' or 'rois'": "无效的 JSON 格式: 缺少 'batch_crop' 或 'rois'",
+    "No ROIs found in log.": "日志中未找到 ROI。",
+    "No valid ROIs extracted from log.": "未能从日志中提取出有效的 ROI。",
+    "Restored %s ROIs.": "成功恢复了 %s 个 ROI。",
+    "Info": "提示",
+    "Success": "成功",
     "Draw Horizon Line": "绘制水平线",
     "Apply Rotation": "应用旋转",
     "Enlarge Canvas (Fit All)": "扩大画布 (保留全图)",
@@ -146,10 +154,18 @@ TRANS_CN = {
     "View Layer (Reference):": "视图层 (参考):",
     "Set View Layer same as Data Layer": "将视图层设置为与数据层相同",
     "Hold to temporarily show Data Layer to check alignment": "按住以临时显示数据层以检查对齐",
+    "Dataset:": "数据集:",
+    "Dataset ID (e.g. ds123). Mostly auto-extracted.": "数据集 ID (例如 ds123)。大多数会自动提取。",
     "Date:": "日期:",
     "Date prefix (YYYYMMDD). Loaded from Archive or Today.": "日期前缀 (YYYYMMDD)。从归档或今天加载。",
     "Sub:": "样品:",
     "Suffix:": "后缀:",
+    "Suffix (e.g. _contrasted)": "后缀 (例如 _contrasted)",
+    "Export View Layer": "导出视图层",
+    "Export View Layer by Default": "默认导出视图层",
+    "Additionally export the view layer (e.g. contrasted image).": "同时导出视图层 (如调整过对比度的图像)。",
+    "PNG Sequence (Folder)": "PNG 序列 (文件夹)",
+    "TIFF Stack (.tiff)": "TIFF 图像堆栈 (.tiff)",
     "Gen Denoise Folders": "生成去噪文件夹",
     "Creates empty folders with Main Suffix + Configured Suffix (e.g. _contrasted_lrtem)": "创建带有主后缀 + 配置后缀的空文件夹 (例如 _contrasted_lrtem)",
     "Gen Refine Folder": "生成精修文件夹",
@@ -903,6 +919,7 @@ class GlobalConfig:
         "geo_enlarge": True,      # [New] 扩大画布
         "geo_create_denoise": False, # [New] 创建去噪文件夹
         "geo_create_refine": False,  # [New] 创建Refine文件夹
+        "geo_export_view": False,    # [New] 默认导出视图层
         "geo_roi_history_max": 128,   # [New] ROI 撤销历史记录上限
 
         # Suffixes
@@ -1174,11 +1191,15 @@ class SettingsDialog(QDialog):
         self.geo_denoise_check.setChecked(bool(GlobalConfig.get("geo_create_denoise")))
         self.geo_refine_check = QCheckBox(tr("Create Refine Folders (Mask)"))
         self.geo_refine_check.setChecked(bool(GlobalConfig.get("geo_create_refine")))
+        self.geo_export_view_check = QCheckBox(tr("Export View Layer by Default"))
+        self.geo_export_view_check.setChecked(bool(GlobalConfig.get("geo_export_view")))
+        
         f_geo.addRow("", self.geo_enl_check)
         f_geo.addRow("", self.geo_keep_idx_check)
         f_geo.addRow("", self.geo_sq_check)
         f_geo.addRow("", self.geo_denoise_check)
         f_geo.addRow("", self.geo_refine_check)
+        f_geo.addRow("", self.geo_export_view_check)
         
         # ROI 撤销历史记录上限
         self.geo_history_max_spin = QSpinBox()
@@ -1700,6 +1721,7 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("geo_force_square", self.geo_sq_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_create_denoise", self.geo_denoise_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_create_refine", self.geo_refine_check.isChecked(), emit_signal=False)
+        GlobalConfig.set("geo_export_view", self.geo_export_view_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_roi_history_max", self.geo_history_max_spin.value(), emit_signal=False)
 
         # 5. Save Suffixes

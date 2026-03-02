@@ -490,10 +490,10 @@ class GeometryWidget(QWidget):
         name_layout.addWidget(self.suffix_edit, 1)
         batch_layout.addLayout(name_layout)
         
-        # [View Export] - Added Feature
         view_export_layout = QHBoxLayout()
         self.export_view_check = QCheckBox(tr("Export View Layer"))
         self.export_view_check.setToolTip(tr("Additionally export the view layer (e.g. contrasted image)."))
+        self.export_view_check.setChecked(bool(GlobalConfig.get("geo_export_view")))
         view_export_layout.addWidget(self.export_view_check)
         
         view_export_layout.addWidget(QLabel(tr("Suffix:")))
@@ -516,15 +516,15 @@ class GeometryWidget(QWidget):
         h_checks.addWidget(self.check_refine)
         batch_layout.addLayout(h_checks)
 
-        # 添加信号
         self.check_denoise.stateChanged.connect(lambda v: GlobalConfig.set("geo_create_denoise", bool(v)))
         self.check_refine.stateChanged.connect(lambda v: GlobalConfig.set("geo_create_refine", bool(v)))
+        self.export_view_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_export_view", bool(v)))
         self.suffix_edit.editingFinished.connect(lambda: GlobalConfig.set("geo_suffix", self.suffix_edit.text()))
 
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel(tr("Export Format:")))
         self.batch_format_combo = QComboBox()
-        self.batch_format_combo.addItems(["PNG Sequence (Folder)","TIFF Stack (.tiff)"])
+        self.batch_format_combo.addItems([tr("PNG Sequence (Folder)"), tr("TIFF Stack (.tiff)")])
         format_layout.addWidget(self.batch_format_combo)
         batch_layout.addLayout(format_layout)
 
@@ -1957,23 +1957,23 @@ class GeometryWidget(QWidget):
         
         log_path = Path(log_path)
         if not log_path.exists():
-            QMessageBox.critical(None, tr("Error"), f"Log file not found: {log_path}")
+            QMessageBox.critical(None, tr("Error"), tr("Log file not found: %s") % log_path)
             return False
         
         try:
             with open(log_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as e:
-            QMessageBox.critical(None, tr("Error"), f"Failed to load JSON: {e}")
+            QMessageBox.critical(None, tr("Error"), tr("Failed to load JSON: %s") % e)
             return False
         
         if "batch_crop" not in data or "rois" not in data["batch_crop"]:
-            QMessageBox.warning(None, tr("Error"), "Invalid JSON format: missing 'batch_crop' or 'rois'")
+            QMessageBox.warning(None, tr("Error"), tr("Invalid JSON format: missing 'batch_crop' or 'rois'"))
             return False
         
         rois_list = data["batch_crop"]["rois"]
         if not rois_list:
-            QMessageBox.information(None, tr("Info"), "No ROIs found in log.")
+            QMessageBox.information(None, tr("Info"), tr("No ROIs found in log."))
             return False
         
         # 1. 先清除旧的 Batch_ROI 图层
@@ -2011,7 +2011,7 @@ class GeometryWidget(QWidget):
                 new_infos.append(f"[{fr_display}]")
         
         if not new_data:
-            QMessageBox.information(None, tr("Info"), "No valid ROIs extracted from log.")
+            QMessageBox.information(None, tr("Info"), tr("No valid ROIs extracted from log."))
             return False
         
         # 3. 直接创建图层 (不调用 _start_batch_mode)
@@ -2073,7 +2073,7 @@ class GeometryWidget(QWidget):
         # 9. 保存初始恢复状态，以便后续撤销
         self._save_prev_state()
         
-        QMessageBox.information(None, tr("Success"), f"Restored {len(new_data)} ROIs.")
+        QMessageBox.information(None, tr("Success"), tr("Restored %s ROIs.") % len(new_data))
         return True
 
     def _restore_rois_to_layer(self, data_dump):
@@ -2286,7 +2286,7 @@ class GeometryWidget(QWidget):
         """热更新：从配置读取状态"""
         # Block signals
         widgets = [self.enlarge_check, self.keep_index_check, self.force_square_check, 
-                   self.check_denoise, self.check_refine, self.suffix_edit, self.padding_spin]
+                   self.check_denoise, self.check_refine, self.export_view_check, self.suffix_edit, self.padding_spin]
         for w in widgets: w.blockSignals(True)
 
         self.enlarge_check.setChecked(bool(GlobalConfig.get("geo_enlarge")))
@@ -2294,6 +2294,7 @@ class GeometryWidget(QWidget):
         self.force_square_check.setChecked(bool(GlobalConfig.get("geo_force_square")))
         self.check_denoise.setChecked(bool(GlobalConfig.get("geo_create_denoise")))
         self.check_refine.setChecked(bool(GlobalConfig.get("geo_create_refine")))
+        self.export_view_check.setChecked(bool(GlobalConfig.get("geo_export_view")))
         self.suffix_edit.setText(str(GlobalConfig.get("geo_suffix")))
         self.padding_spin.setValue(int(GlobalConfig.get("geo_padding")))
 
