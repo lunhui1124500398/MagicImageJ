@@ -28,6 +28,12 @@ import datetime
 from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
 from utils.utils import elide_text
+from core.geometry_helpers import (
+    clone_roi_data, stamp_roi_data, get_roi_size,
+    clamp_frame_index, compute_slider_gradient_css,
+    compute_adaptive_font_size,
+    generate_grid_lines, find_grid_cell_bounds
+)
 
 # ==========================================
 #  新增：后台图像读取线程 (防止界面卡死)
@@ -320,6 +326,32 @@ class GeometryWidget(QWidget):
         self._roi_history = []  # ROI 状态快照栈，用于撤销
         self._roi_history_max = int(GlobalConfig.get("geo_roi_history_max"))  # 历史记录上限
         self._prev_roi_state = None  # 追踪"变更前"的状态
+
+        # === [Feature 1] ROI Clone & Stamp state ===
+        self._last_roi_size = None       # (h, w) of last drawn ROI for stamping
+        self._clone_start_pos = None     # start position for clone drag
+        self._clone_source_roi = None    # source ROI data for clone
+
+        # === [Feature 2] Slider Range Lock state ===
+        self._slider_lock_enabled = False
+        self._slider_lock_min = 0
+        self._slider_lock_max = 0
+        self._slider_overlay = None  # [Fix 4] QWidget overlay for range indicator
+
+        # === [Feature 3] Adaptive Font state ===
+        self._zoom_handler_connected = False
+        self._reference_zoom = None  # set when batch mode starts
+
+        # === [Feature 4] Grid Partition state ===
+        self._grid_enabled = False
+        self._saved_camera_state = None  # (center, zoom) before local zoom
+
+        # === [Fix 2] Debounce timer for _on_batch_data_change ===
+        self._data_change_timer = QTimer()
+        self._data_change_timer.setSingleShot(True)
+        self._data_change_timer.setInterval(80)  # 80ms debounce
+        self._data_change_timer.timeout.connect(self._do_batch_data_change)
+
         self._setup_ui()
 
         # 初始化与热更新
@@ -542,6 +574,66 @@ class GeometryWidget(QWidget):
         self.btn_set_specific_range.setStyleSheet("background-color: #555; font-size: 10px; padding: 4px;")
         frame_layout.addWidget(self.btn_set_specific_range)
         batch_layout.addLayout(frame_layout)
+
+        # === [Feature 2] Slider Range Lock UI ===
+        slider_lock_layout = QHBoxLayout()
+        self.btn_set_in = QPushButton("In")
+        self.btn_set_in.setToolTip(tr("Set current frame as range start"))
+        self.btn_set_in.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.btn_set_in.clicked.connect(self._slider_set_in)
+        slider_lock_layout.addWidget(self.btn_set_in)
+
+        self.btn_set_out = QPushButton("Out")
+        self.btn_set_out.setToolTip(tr("Set current frame as range end"))
+        self.btn_set_out.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.btn_set_out.clicked.connect(self._slider_set_out)
+        slider_lock_layout.addWidget(self.btn_set_out)
+
+        self.lbl_slider_range = QLabel("—")
+        self.lbl_slider_range.setStyleSheet("color: #4CAF50; font-size: 11px; padding: 0 4px; min-width: 50px;")
+        slider_lock_layout.addWidget(self.lbl_slider_range)
+
+        self.chk_slider_lock = QCheckBox(tr("Lock"))
+        self.chk_slider_lock.setToolTip(tr("Lock slider to the set In/Out range"))
+        self.chk_slider_lock.stateChanged.connect(self._on_slider_lock_toggle)
+        slider_lock_layout.addWidget(self.chk_slider_lock)
+
+        self.btn_clear_range = QPushButton(tr("Clear"))
+        self.btn_clear_range.setToolTip(tr("Clear slider range lock"))
+        self.btn_clear_range.setStyleSheet("padding: 2px 6px; font-size: 10px; color: #FF5252;")
+        self.btn_clear_range.clicked.connect(self._slider_clear_range)
+        slider_lock_layout.addWidget(self.btn_clear_range)
+        slider_lock_layout.addStretch()
+        batch_layout.addLayout(slider_lock_layout)
+
+        # === [Feature 4] Grid Partition UI ===
+        grid_layout = QHBoxLayout()
+        self.chk_grid = QCheckBox(tr("Grid"))
+        self.chk_grid.setToolTip(tr("Enable partition grid for local zoom"))
+        self.chk_grid.stateChanged.connect(self._on_grid_toggle)
+        grid_layout.addWidget(self.chk_grid)
+
+        grid_layout.addWidget(QLabel(tr("Rows:")))
+        self.grid_rows_spin = QSpinBox()
+        self.grid_rows_spin.setRange(1, 10)
+        self.grid_rows_spin.setValue(int(GlobalConfig.get("geo_grid_rows")))
+        self.grid_rows_spin.setFixedWidth(45)
+        grid_layout.addWidget(self.grid_rows_spin)
+
+        grid_layout.addWidget(QLabel(tr("Cols:")))
+        self.grid_cols_spin = QSpinBox()
+        self.grid_cols_spin.setRange(1, 10)
+        self.grid_cols_spin.setValue(int(GlobalConfig.get("geo_grid_cols")))
+        self.grid_cols_spin.setFixedWidth(45)
+        grid_layout.addWidget(self.grid_cols_spin)
+
+        self.btn_refresh_grid = QPushButton(tr("Refresh"))
+        self.btn_refresh_grid.setToolTip(tr("Regenerate grid with current rows/cols"))
+        self.btn_refresh_grid.setStyleSheet("padding: 2px 6px; font-size: 10px;")
+        self.btn_refresh_grid.clicked.connect(self._regenerate_grid)
+        grid_layout.addWidget(self.btn_refresh_grid)
+        grid_layout.addStretch()
+        batch_layout.addLayout(grid_layout)
 
         # Naming options
         naming_layout = QHBoxLayout()
@@ -1150,97 +1242,166 @@ class GeometryWidget(QWidget):
                 self.status_label.setText(f"↩️ {tr('Undone. Adjust ROI and try again.')}")
             else:
                 self.status_label.setText(f"⚠️ {tr('Nothing to undo.')}")
+                
+        # ===【Feature 4】绑定 Esc 退回全局视图 ===
+        @roi_layer.bind_key('Escape', overwrite=True)
+        def escape_grid_from_roi(layer):
+            if self._grid_enabled:
+                self._restore_global_view()
         
         switch_key = GlobalConfig.get_napari_shortcut("shortcut_switch_mode")
         self.status_label.setText(f"""✏️ {tr("Drawing on '%s'. (New Layer)") % view_layer}""")
         self._last_shape_count = 0
+
+        # === [Feature 3] 连接缩放事件以自适应字体 ===
+        self._reference_zoom = self.viewer.camera.zoom
+        self._connect_zoom_handler()
     
     def _bind_smart_mode_switch(self, layer):
         """
-        使用 napari 的鼠标事件，更精确地处理交互
+        处理快捷键修饰符:
+        - Alt + 按下ROI: 克隆并在原地生成，允许立即拖拽(Clone)
+        - Shift + 按下背景: 在点击位置直接盖章(Stamp)
         """
-        
-        self._last_click_time = 0
-        self._double_click_threshold = 0.3
-        self._mouse_press_pos = None
-        self._drag_threshold = 5
-        
-        # === 【方案1】使用 mouse_double_click 事件（推荐）===
-        @layer.mouse_double_click_callbacks.append
-        def on_double_click(layer, event):
-            """双击事件专用处理"""
-            if layer.mode != 'select':
-                return
-            
-            # 检查是否双击在背景上
-            clicked_on_shape = False
-            click_pos = event.position
-            
-            for shape_data in layer.data:
-                ys, xs = shape_data[:, 0], shape_data[:, 1]
-                y_min, y_max = np.min(ys), np.max(ys)
-                x_min, x_max = np.min(xs), np.max(xs)
-                
-                click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
-                click_x = click_pos[-1]
-                
-                if y_min <= click_y <= y_max and x_min <= click_x <= x_max:
-                    clicked_on_shape = True
-                    break
-            
-            # 双击背景 → 切换到绘制模式
-            if not clicked_on_shape:
-                layer.mode = 'add_rectangle'
-                layer.selected_data = set()
-                self.status_label.setText(f"✏️ {tr('Draw Mode (double-click bg)')}")
-        
-        # === 【可选】单击背景取消选择（不切换模式）===
-        self._is_dragging = False
-        self._press_pos = None
-        
-        @layer.mouse_drag_callbacks.append  
-        def track_drag(layer, event):
-            """追踪拖拽，区分点击和拖拽"""
+        _clone_mod = str(GlobalConfig.get("geo_clone_modifier")).lower()
+        _stamp_mod = str(GlobalConfig.get("geo_stamp_modifier")).lower()
+
+        _qt_mod_map = {
+            'alt': Qt.AltModifier,
+            'shift': Qt.ShiftModifier,
+            'ctrl': Qt.ControlModifier,
+            'control': Qt.ControlModifier,
+        }
+        _clone_qt_flag = _qt_mod_map.get(_clone_mod, Qt.AltModifier)
+        _stamp_qt_flag = _qt_mod_map.get(_stamp_mod, Qt.ShiftModifier)
+
+        def _check_qt_modifier(qt_flag):
+            from qtpy.QtWidgets import QApplication
+            return bool(QApplication.keyboardModifiers() & qt_flag)
+
+        # 把这几个 hook 强行插在最前面 (index 0)
+        # 这样我们可以先于 napari 的默认处理执行
+        def intercept_mouse_press(layer, event):
             if layer.mode != 'select':
                 return
             
             if event.type == 'mouse_press':
-                self._press_pos = np.array(event.position)
-                self._is_dragging = False
-                
-            elif event.type == 'mouse_move' and self._press_pos is not None:
-                current_pos = np.array(event.position)
-                distance = np.linalg.norm(current_pos - self._press_pos)
-                if distance > self._drag_threshold:
-                    self._is_dragging = True
+                click_pos = event.position
+                click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
+                click_x = click_pos[-1]
+
+                # 1. 检测点击在哪个 shape 上
+                clicked_shape_idx = -1
+                for i in range(len(layer.data)-1, -1, -1):
+                    shape_data = layer.data[i]
+                    ys, xs = shape_data[:, 0], shape_data[:, 1]
+                    if np.min(ys) <= click_y <= np.max(ys) and np.min(xs) <= click_x <= np.max(xs):
+                        clicked_shape_idx = i
+                        break
+
+                # 2. 如果点在 shape 上且按住了 Clone 键 -> 执行 Clone -> 自己处理拖拽以拦截napari/viewer的事件
+                if clicked_shape_idx >= 0 and _check_qt_modifier(_clone_qt_flag):
+                    from core.geometry_helpers import clone_roi_data
+                    source_roi = layer.data[clicked_shape_idx]
+                    new_roi = clone_roi_data(source_roi, 0, 0)
                     
-            elif event.type == 'mouse_release':
-                # 单击背景（非拖拽）→ 取消选择
-                if not self._is_dragging and self._press_pos is not None:
-                    clicked_on_shape = False
-                    click_pos = event.position
+                    current_data = list(layer.data)
+                    current_data.append(new_roi)
+                    layer.data = current_data
+                    layer.selected_data = {len(current_data) - 1}
+                    self.status_label.setText(f"📋 Cloned & Dragging ROI #{len(current_data)}")
                     
-                    for shape_data in layer.data:
-                        ys, xs = shape_data[:, 0], shape_data[:, 1]
-                        y_min, y_max = np.min(ys), np.max(ys)
-                        x_min, x_max = np.min(xs), np.max(xs)
-                        click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
-                        click_x = click_pos[-1]
+                    # 生成器接管 `mouse_move`，防止事件冒泡给 Viewer 变成"小蓝框缩放"
+                    last_pos = np.array([click_y, click_x])
+                    yield
+                    while event.type == 'mouse_move':
+                        new_pos_y = event.position[-2] if len(event.position)>1 else event.position[0]
+                        new_pos_x = event.position[-1]
+                        new_pos = np.array([new_pos_y, new_pos_x])
+                        offset = new_pos - last_pos
                         
-                        if y_min <= click_y <= y_max and x_min <= click_x <= x_max:
-                            clicked_on_shape = True
-                            break
-                    
-                    if not clicked_on_shape:
-                        layer.selected_data = set()
-                        self.status_label.setText(f"🖐️ {tr('Select Mode (double-click bg to draw)')}")
+                        # 手动偏移刚克隆的 ROI
+                        updated_data = list(layer.data)
+                        updated_data[-1] = updated_data[-1] + offset
+                        layer.data = updated_data
+                        layer.selected_data = {len(updated_data) - 1}
+                        
+                        last_pos = new_pos
+                        yield
+                    return 
                 
-                self._press_pos = None
-                self._is_dragging = False
-    
+                # 3. 如果点在背景且按住了 Stamp 键 -> 执行 Stamp
+                if clicked_shape_idx == -1 and _check_qt_modifier(_stamp_qt_flag):
+                    self._update_last_roi_size()
+                    self._perform_stamp(click_y, click_x)
+                    # 选中新盖章的 ROI
+                    if len(layer.data) > 0:
+                        layer.selected_data = {len(layer.data) - 1}
+                    yield  # 消耗事件
+                    return 
+
+        # 显式插入到开头
+        layer.mouse_drag_callbacks.insert(0, intercept_mouse_press)
+
+        # [Fix 1] 右键网格导航 —— 与双击切绘制模式解耦
+        def intercept_right_click(layer, event):
+            """右键空白: 如果网格开启，zoom 到对应单元格"""
+            if event.button != 2:  # 2 = 右键
+                return
+            if not self._grid_enabled or "Grid_Lines" not in self.viewer.layers:
+                return
+            
+            click_pos = event.position
+            click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
+            click_x = click_pos[-1]
+            
+            # 检查是否点在某个 shape 上（右键 shape 不做 zoom）
+            for shape_data in layer.data:
+                ys, xs = shape_data[:, 0], shape_data[:, 1]
+                if np.min(ys) <= click_y <= np.max(ys) and np.min(xs) <= click_x <= np.max(xs):
+                    return  # 点在 shape 上，不处理
+            
+            # 空白处右键 → 网格 zoom
+            grid_layer = self.viewer.layers["Grid_Lines"]
+            from core.geometry_helpers import find_grid_cell_bounds
+            view_layer_name = self.batch_view_combo.currentData()
+            if view_layer_name and view_layer_name in self.viewer.layers:
+                img_h = self.viewer.layers[view_layer_name].data.shape[-2]
+                img_w = self.viewer.layers[view_layer_name].data.shape[-1]
+                y_min, y_max, x_min, x_max = find_grid_cell_bounds(
+                    click_y, click_x, list(grid_layer.data), img_h, img_w
+                )
+                self._zoom_to_cell(y_min, y_max, x_min, x_max)
+            yield  # 消耗事件，防止冒泡
+        
+        layer.mouse_drag_callbacks.append(intercept_right_click)
+
+        @layer.mouse_double_click_callbacks.append
+        def on_double_click(layer, event):
+            if layer.mode != 'select':
+                return
+            
+            click_pos = event.position
+            click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
+            click_x = click_pos[-1]
+            
+            clicked_on_shape = False
+            for shape_data in layer.data:
+                ys, xs = shape_data[:, 0], shape_data[:, 1]
+                y_min, y_max = np.min(ys), np.max(ys)
+                x_min, x_max = np.min(xs), np.max(xs)
+                if y_min <= click_y <= y_max and x_min <= click_x <= x_max:
+                    clicked_on_shape = True
+                    break
+            
+            if not clicked_on_shape:
+                # 双击空白 → 始终切回绘制模式（不再被网格 zoom 拦截）
+                layer.mode = 'add_rectangle'
+                layer.selected_data = set()
+                self.status_label.setText(f"✏️ {tr('Draw Mode (double-click bg)')}")
+
     def _on_selection_change(self, event=None):
         pass
-        # """当用户点击背景时，自动切回绘制模式"""
         # if "Batch_ROI" not in self.viewer.layers: 
         #     return
         # layer = self.viewer.layers["Batch_ROI"]
@@ -1359,6 +1520,13 @@ class GeometryWidget(QWidget):
             self.status_label.setText(f"🖐️ {tr('Adjust Mode.')}")
 
     def _on_batch_data_change(self, event=None):
+        """[Fix 2] 防抖入口：启动/重启计时器，避免拖拽绘制时每次 mouse_move 都触发重量级处理"""
+        if self._is_updating: return
+        if "Batch_ROI" not in self.viewer.layers: return
+        self._data_change_timer.start()  # restart 80ms countdown
+
+    def _do_batch_data_change(self):
+        """实际的数据变更处理（防抖后触发）"""
         if self._is_updating: return
         if "Batch_ROI" not in self.viewer.layers: return
         
@@ -1459,6 +1627,15 @@ class GeometryWidget(QWidget):
                 info_list.append("")
             range_list = range_list[:n_shapes]
             info_list = info_list[:n_shapes]
+            # [Fix 5] 应用标签间距配置
+            spacing_chars = '\n' * (int(GlobalConfig.get("style_batch_font_spacing")) + 1)
+            layer.text = {
+                'string': '{label}' + spacing_chars + '{frame_info}',
+                'size': layer.text.size if hasattr(layer.text, 'size') else GlobalConfig.get("style_batch_font_size"),
+                'color': GlobalConfig.get("style_batch_text_color"),
+                'anchor': 'upper_left',
+                'translation': [-5, -5]
+            }
             
             layer.features = {
                 'label': labels,
@@ -2412,3 +2589,393 @@ class GeometryWidget(QWidget):
             from qtpy.QtWidgets import QMessageBox
             QMessageBox.critical(self, tr("Error"), str(e))
             self.status_label.setText(f"❌ Error: {e}")
+
+    # =====================================================================
+    #   Feature 1: ROI Clone & Stamp helpers (GUI hooks)
+    # =====================================================================
+
+    def _update_last_roi_size(self):
+        """从 Batch_ROI 层获取最后一个 ROI 的大小，供盖章使用"""
+        if "Batch_ROI" not in self.viewer.layers:
+            return
+        layer = self.viewer.layers["Batch_ROI"]
+        if len(layer.data) > 0:
+            self._last_roi_size = get_roi_size(layer.data[-1])
+
+    def _perform_stamp(self, click_y, click_x):
+        """在指定位置盖章一个新 ROI"""
+        if self._last_roi_size is None:
+            self.status_label.setText("⚠️ No previous ROI size for stamp.")
+            return
+        
+        h, w = self._last_roi_size
+        center = bool(GlobalConfig.get("geo_roi_stamp_center"))
+        
+        # 获取图像边界
+        img_h, img_w = None, None
+        view_layer_name = self.batch_view_combo.currentData()
+        if view_layer_name and view_layer_name in self.viewer.layers:
+            img_layer = self.viewer.layers[view_layer_name]
+            img_h, img_w = img_layer.data.shape[-2], img_layer.data.shape[-1]
+        
+        new_roi = stamp_roi_data(click_y, click_x, h, w,
+                                 center=center, img_h=img_h, img_w=img_w)
+        
+        layer = self.viewer.layers["Batch_ROI"]
+        current_data = list(layer.data)
+        current_data.append(new_roi)
+        layer.data = current_data
+        self.status_label.setText(f"📌 Stamped ROI #{len(current_data)} ({h:.0f}×{w:.0f})")
+
+    def _perform_clone(self, roi_index, offset_y, offset_x):
+        """克隆指定索引的 ROI 并偏移"""
+        if "Batch_ROI" not in self.viewer.layers:
+            return
+        layer = self.viewer.layers["Batch_ROI"]
+        if roi_index >= len(layer.data):
+            return
+        
+        source_roi = layer.data[roi_index]
+        new_roi = clone_roi_data(source_roi, offset_y, offset_x)
+        
+        current_data = list(layer.data)
+        current_data.append(new_roi)
+        layer.data = current_data
+        self.status_label.setText(f"📋 Cloned ROI #{roi_index + 1} → #{len(current_data)}")
+
+    # =====================================================================
+    #   Feature 2: Slider Range Lock handlers
+    # =====================================================================
+
+    def _get_current_frame(self):
+        """获取当前帧索引"""
+        try:
+            return int(self.viewer.dims.current_step[0])
+        except (IndexError, TypeError):
+            return 0
+
+    def _get_total_frames(self):
+        """获取总帧数"""
+        view_layer_name = self.batch_view_combo.currentData()
+        if view_layer_name and view_layer_name in self.viewer.layers:
+            layer = self.viewer.layers[view_layer_name]
+            if layer.data.ndim >= 3:
+                return layer.data.shape[0]
+        # 回退: 从 dims 获取
+        if self.viewer.dims.ndim >= 1 and self.viewer.dims.range:
+            try:
+                return int(self.viewer.dims.range[0][1])
+            except Exception:
+                pass
+        return 1
+
+    def _slider_set_in(self):
+        """设置当前帧为滑条范围起点"""
+        self._slider_lock_min = self._get_current_frame()
+        if self._slider_lock_max < self._slider_lock_min:
+            self._slider_lock_max = self._slider_lock_min
+        self._update_slider_range_label()
+
+    def _slider_set_out(self):
+        """设置当前帧为滑条范围终点"""
+        self._slider_lock_max = self._get_current_frame()
+        if self._slider_lock_min > self._slider_lock_max:
+            self._slider_lock_min = self._slider_lock_max
+        self._update_slider_range_label()
+
+    def _slider_clear_range(self):
+        """清除滑条范围锁定"""
+        self._slider_lock_enabled = False
+        self._slider_lock_min = 0
+        self._slider_lock_max = 0
+        self.chk_slider_lock.setChecked(False)
+        self.lbl_slider_range.setText("—")
+        self._restore_slider_css()
+
+    def _update_slider_range_label(self):
+        """更新滑条范围 UI 标签"""
+        self.lbl_slider_range.setText(f"[{self._slider_lock_min}–{self._slider_lock_max}]")
+        if self._slider_lock_enabled:
+            self._apply_slider_css()
+
+    def _on_slider_lock_toggle(self, state):
+        """滑条锁定复选框更改"""
+        self._slider_lock_enabled = bool(state)
+        if self._slider_lock_enabled:
+            # 连接 dims 事件以强制范围
+            try:
+                self.viewer.dims.events.current_step.connect(self._enforce_slider_range)
+            except Exception:
+                pass
+            self._apply_slider_css()
+        else:
+            try:
+                self.viewer.dims.events.current_step.disconnect(self._enforce_slider_range)
+            except Exception:
+                pass
+            self._restore_slider_css()
+
+    def _enforce_slider_range(self, event=None):
+        """强制帧索引保持在锁定范围内"""
+        if not self._slider_lock_enabled:
+            return
+        current = self._get_current_frame()
+        clamped = clamp_frame_index(current, self._slider_lock_min, self._slider_lock_max)
+        if clamped != current:
+            self.viewer.dims.current_step = (clamped,) + self.viewer.dims.current_step[1:]
+
+    def _apply_slider_css(self):
+        """[Fix 4] 使用 QWidget overlay 显示滑条上的锁定范围指示器"""
+        try:
+            total = self._get_total_frames()
+            if total <= 1:
+                return
+            
+            slider = self._find_napari_slider()
+            if slider is None or slider.parent() is None:
+                return
+            
+            parent = slider.parent()
+            
+            # 创建或复用 overlay widget（作为 slider 父容器的 child）
+            if self._slider_overlay is None:
+                self._slider_overlay = QWidget(parent)
+                self._slider_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                self._slider_overlay.setStyleSheet(
+                    "background-color: rgba(76, 175, 80, 120); "
+                    "border: 1px solid #4CAF50; "
+                    "border-radius: 3px;"
+                )
+            
+            # 获取 slider 的样式选项以精确计算位置
+            from qtpy.QtWidgets import QStyle, QStyleOptionSlider
+            opt = QStyleOptionSlider()
+            opt.initFrom(slider)
+            slider.initStyleOption(opt)
+            style = slider.style()
+            
+            # 获取最小值对应的滑块边界
+            opt.sliderPosition = max(slider.minimum(), min(self._slider_lock_min, slider.maximum()))
+            opt.sliderValue = opt.sliderPosition
+            rect_min = style.subControlRect(QStyle.CC_ScrollBar, opt, QStyle.SC_ScrollBarSlider, slider)
+            
+            # 获取最大值对应的滑块边界
+            opt.sliderPosition = max(slider.minimum(), min(self._slider_lock_max, slider.maximum()))
+            opt.sliderValue = opt.sliderPosition
+            rect_max = style.subControlRect(QStyle.CC_ScrollBar, opt, QStyle.SC_ScrollBarSlider, slider)
+            
+            # 覆盖范围应涵盖左滑块左边缘 到 右滑块右边缘（滑块自身中心对准刻度，因此整个滑块的宽度也算是锁定区域的视觉表示）
+            start_x = rect_min.left()
+            end_x = rect_max.right() + 1
+            w = max(4, end_x - start_x)
+            
+            # 转换到 parent 坐标系
+            slider_geom = slider.geometry()
+            ox = slider_geom.x() + start_x
+            
+            self._slider_overlay.setGeometry(ox, slider_geom.y(), w, slider_geom.height())
+            self._slider_overlay.show()
+            self._slider_overlay.raise_()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+
+    def _restore_slider_css(self):
+        """[Fix 4] 隐藏/销毁 overlay 指示器"""
+        try:
+            if self._slider_overlay is not None:
+                self._slider_overlay.hide()
+                self._slider_overlay.deleteLater()
+                self._slider_overlay = None
+        except Exception:
+            pass
+
+    def _find_napari_slider(self):
+        """
+        查找 napari 底层的 QScrollBar 控件。
+        """
+        try:
+            from qtpy.QtWidgets import QScrollBar
+            qt_viewer = self.viewer.window._qt_viewer
+            
+            all_sliders = qt_viewer.findChildren(QScrollBar)
+            if all_sliders:
+                # 返回最宽的一个，通常是帧控制滑条
+                best = max(all_sliders, key=lambda s: s.width())
+                return best
+        except Exception:
+            pass
+        return None
+
+    # =====================================================================
+    #   Feature 3: ROI 字体自适应缩放
+    # =====================================================================
+
+    def _connect_zoom_handler(self):
+        """连接相机缩放事件"""
+        if not self._zoom_handler_connected:
+            try:
+                self.viewer.camera.events.zoom.connect(self._on_zoom_change)
+                self._zoom_handler_connected = True
+            except Exception:
+                pass
+
+    def _on_zoom_change(self, event=None):
+        """相机缩放变化时动态调整 ROI 标签字体大小"""
+        if "Batch_ROI" not in self.viewer.layers:
+            return
+        
+        layer = self.viewer.layers["Batch_ROI"]
+        zoom = self.viewer.camera.zoom
+        base_font = int(GlobalConfig.get("style_batch_font_size"))
+        ref_zoom = self._reference_zoom or 1.0
+        
+        new_size = compute_adaptive_font_size(
+            zoom=zoom,
+            base_font_size=base_font,
+            min_font_size=4,
+            max_font_size=int(GlobalConfig.get("style_batch_font_max_size")),  # [Fix 3] 可配置上限
+            reference_zoom=ref_zoom
+        )
+        
+        try:
+            # 更新 text size 和 [Fix 5] line spacing
+            text_params = layer.text
+            spacing_chars = '\n' * (int(GlobalConfig.get("style_batch_font_spacing")) + 1)
+            new_string = '{label}' + spacing_chars + '{frame_info}'
+            
+            if hasattr(text_params, 'size'):
+                # 如果字号或者行距变了，就更新
+                current_string = text_params.string
+                if text_params.size != new_size or current_string != new_string:
+                    layer.text = {
+                        'string': new_string,
+                        'size': new_size,
+                        'color': text_params.color if hasattr(text_params, 'color') else GlobalConfig.get("style_batch_text_color"),
+                        'anchor': 'upper_left',
+                        'translation': [-5, -5]
+                    }
+        except Exception:
+            pass
+
+    # =====================================================================
+    #   Feature 4: Grid Partition & Local Zoom
+    # =====================================================================
+
+    def _on_grid_toggle(self, state):
+        """网格复选框启用/禁用"""
+        self._grid_enabled = bool(state)
+        if self._grid_enabled:
+            self._regenerate_grid()
+        else:
+            self._remove_grid()
+            self._restore_global_view()
+
+    def _regenerate_grid(self):
+        """重新生成网格线图层"""
+        self._remove_grid()
+        
+        # 获取参考图像尺寸
+        view_layer_name = self.batch_view_combo.currentData()
+        if not view_layer_name or view_layer_name not in self.viewer.layers:
+            self.status_label.setText("⚠️ Select a view layer first.")
+            return
+        
+        img_layer = self.viewer.layers[view_layer_name]
+        img_h, img_w = img_layer.data.shape[-2], img_layer.data.shape[-1]
+        rows = self.grid_rows_spin.value()
+        cols = self.grid_cols_spin.value()
+        
+        lines = generate_grid_lines(img_h, img_w, rows, cols)
+        if not lines:
+            self.status_label.setText("⚠️ 1×1 grid has no lines.")
+            return
+        
+        grid_layer = self.viewer.add_shapes(
+            lines,
+            name="Grid_Lines",
+            shape_type='line',
+            edge_color='#FFEB3B',
+            edge_width=2,
+            face_color=[0, 0, 0, 0],
+        )
+        grid_layer.mode = 'select'
+        
+        # [Fix 1] 右键网格导航 (从 Grid_Lines 层本身也支持)
+        def grid_right_click(layer, event):
+            if event.button != 2:
+                return
+            click_pos = event.position
+            click_y = click_pos[-2] if len(click_pos) > 1 else click_pos[0]
+            click_x = click_pos[-1]
+            current_lines = list(layer.data)
+            y_min, y_max, x_min, x_max = find_grid_cell_bounds(
+                click_y, click_x, current_lines, img_h, img_w
+            )
+            self._zoom_to_cell(y_min, y_max, x_min, x_max)
+            yield  # 消耗事件
+        
+        grid_layer.mouse_drag_callbacks.append(grid_right_click)
+        
+        # Esc 退回全局
+        @grid_layer.bind_key('Escape', overwrite=True)
+        def escape_grid(layer):
+            self._restore_global_view()
+        
+        self.status_label.setText(f"📐 Grid {rows}×{cols} enabled. Right-click cell to zoom.")
+        
+        # === 修复 Grid 层挡住 Drawing 层的问题 ===
+        if "Batch_ROI" in self.viewer.layers:
+            # 如果已有绘制层，必须把我们刚生成的网格层置于其下，或者把 Batch_ROI 置于顶层
+            roi_idx = self.viewer.layers.index(self.viewer.layers["Batch_ROI"])
+            grid_idx = self.viewer.layers.index(grid_layer)
+            if roi_idx < grid_idx:
+                # 把 Batch_ROI 挪到最前面
+                self.viewer.layers.move(roi_idx, len(self.viewer.layers) - 1)
+                self.viewer.layers.selection.active = self.viewer.layers["Batch_ROI"]
+
+    def _remove_grid(self):
+        """移除网格图层"""
+        if "Grid_Lines" in self.viewer.layers:
+            self.viewer.layers.remove("Grid_Lines")
+
+    def _zoom_to_cell(self, y_min, y_max, x_min, x_max):
+        """缩放相机至指定单元格区域"""
+        if self._saved_camera_state is None:
+            self._saved_camera_state = (
+                tuple(self.viewer.camera.center),
+                self.viewer.camera.zoom
+            )
+        
+        cell_h = y_max - y_min
+        cell_w = x_max - x_min
+        
+        # 计算中心点
+        center_y = (y_min + y_max) / 2
+        center_x = (x_min + x_max) / 2
+        
+        # 计算缩放比例以填充视图
+        canvas_h = self.viewer.window._qt_viewer.canvas.size[1]
+        canvas_w = self.viewer.window._qt_viewer.canvas.size[0]
+        
+        zoom_y = canvas_h / cell_h if cell_h > 0 else 1
+        zoom_x = canvas_w / cell_w if cell_w > 0 else 1
+        target_zoom = min(zoom_y, zoom_x) * 0.95  # 留 5% 边距
+        
+        # 安全设置
+        ndim = self.viewer.dims.ndim
+        if ndim >= 3:
+            self.viewer.camera.center = (self.viewer.camera.center[0], center_y, center_x)
+        else:
+            self.viewer.camera.center = (center_y, center_x)
+        self.viewer.camera.zoom = target_zoom
+        
+        self.status_label.setText(f"🔍 Zoomed to cell. Press Esc to zoom out.")
+
+    def _restore_global_view(self):
+        """恢复到全局视图"""
+        if self._saved_camera_state:
+            center, zoom = self._saved_camera_state
+            self.viewer.camera.center = center
+            self.viewer.camera.zoom = zoom
+            self._saved_camera_state = None
+            self.status_label.setText(f"🌐 Restored global view.")

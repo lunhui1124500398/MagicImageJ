@@ -40,6 +40,10 @@ TRANS_CN = {
     "Apply": "应用",
     "Reset": "重置",
     "Workers:": "线程数:",
+    "Max Font Size:": "最大字号:",
+    "Upper limit for adaptive font scaling when zoomed out.": "缩小视图时自适应字体的大小上限。",
+    "Label Spacing:": "标签间距:",
+    "Line spacing between ROI label and frame info.": "数字标号和帧数信息之间的换行间距。",
     "Target Layer:": "目标图层:",
     "Source Layer:": "源图层:",
     "Refresh Layers": "刷新图层",
@@ -85,7 +89,11 @@ TRANS_CN = {
     "Show a popup message with size and mode details after archiving.": "归档后显示包含大小和模式详情的弹窗消息。",
     "Bit Depth:": "位深:",
     "Import & Archive": "导入与归档",
-    "Preview Folder Name:": "预览文件夹名称:",
+    "Geo Export options...": "几何导出选项...",
+    "Clone/Drag Modifier:": "克隆/正方形修饰键:",
+    "Stamp Modifier:": "全图盖章修饰键:",
+    "Press Key...": "按下按键...",
+    "⚠ (Not recommended to use 'Alt')": "⚠ (强烈不建议使用 'Alt')",
     
     # Drift Widget
     "Step 1: Draw ROI": "第一步：绘制感兴趣区域 (ROI)",
@@ -874,6 +882,19 @@ TRANS_CN = {
     "No frames dropped. Nothing to do.": "未删除任何帧。无需操作。",
     "Created: %s (%s frames)": "已创建: %s (%s 帧)",
     "Ref Image Path": "参考图像路径",
+    # === Geometry Enhancements translations ===
+    "Set current frame as range start": "设置当前帧为范围起点",
+    "Set current frame as range end": "设置当前帧为范围终点",
+    "Lock": "锁定",
+    "Lock slider to the set In/Out range": "将滑条锁定在设定的起止范围",
+    "Clear slider range lock": "清除滑条范围锁定",
+    "Grid": "网格",
+    "Enable partition grid for local zoom": "启用分区网格以进行局部放大",
+    "Rows:": "行:",
+    "Cols:": "列:",
+    "Regenerate grid with current rows/cols": "使用当前行列数重新生成网格",
+    "Clear": "清除",
+    "Refresh": "刷新",
 }
 
 def tr(text):
@@ -922,6 +943,15 @@ class GlobalConfig:
         "geo_export_view": False,    # [New] 默认导出视图层
         "geo_roi_history_max": 128,   # [New] ROI 撤销历史记录上限
 
+        # ROI Clone & Stamp (快速复制)
+        "geo_clone_modifier": "Shift",        # 克隆ROI的修饰键 (Shift+拖拽)
+        "geo_stamp_modifier": "Alt",      # 盖章ROI的修饰键 (Alt+点击)
+        "geo_roi_stamp_center": True,       # 盖章时以点击位置为中心 (False=左上角)
+
+        # Grid Partition (分区网格)
+        "geo_grid_rows": 3,      # 默认网格行数
+        "geo_grid_cols": 3,      # 默认网格列数
+
         # Suffixes
         "geo_suffix_lrtem": "_lrtem",
         "geo_suffix_hrtem": "_hrtem",
@@ -944,6 +974,8 @@ class GlobalConfig:
         "style_batch_width": 2,
         "style_batch_text_color": "#00FF00",
         "style_batch_font_size": 10,
+        "style_batch_font_max_size": 24,  # [Fix 3] 字体自适应上限
+        "style_batch_font_spacing": 0,    # [Fix 5] 字体行间距
 
         # System
         "sys_ram_threshold_gb": 4.0,
@@ -1022,6 +1054,16 @@ class GlobalConfig:
         if "Ctrl " in napari_key: napari_key = napari_key.replace("Ctrl ", "Control-")
         return napari_key
 
+
+def set_font_for_widget(widget: QWidget, is_bold: bool = False, size: int = None):
+    font = widget.font()
+    if size: font.setPointSize(size)
+    if is_bold: font.setBold(True)
+    widget.setFont(font)
+
+
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1086,7 +1128,7 @@ class SettingsDialog(QDialog):
             self.drift_k_spin, self.drift_w_spin,
             self.enh_sigma_spin, self.enh_win_spin, self.enh_work_spin,
             self.style_meas_w, self.style_meas_font,
-            self.style_batch_w, self.style_batch_font,
+            self.style_batch_w, self.style_batch_font, self.style_batch_font_max, self.style_batch_font_spacing,
             self.sys_ram, self.sys_disk, self.sys_move, self.sys_mem_warn,
             self.session_max_keep, self.session_starred_threshold, self.session_reminder_cooldown
         )
@@ -1142,6 +1184,30 @@ class SettingsDialog(QDialog):
         self.warn_clear_check = QCheckBox(tr("Show Warning when Clearing Overlays"))
         self.warn_clear_check.setChecked(bool(GlobalConfig.get("show_clear_warning")))
         f_ui.addRow(self.warn_clear_check)
+        
+        # Modifier Keys Configuration
+        h_clone = QHBoxLayout()
+        self.clone_mod_edit = QComboBox()
+        self.clone_mod_edit.addItems(["Shift", "Control", "Alt"])
+        curr_clone = str(GlobalConfig.get("geo_clone_modifier"))
+        if curr_clone in ["Shift", "Control", "Alt"]:
+            self.clone_mod_edit.setCurrentText(curr_clone)
+            
+        lbl_warn = QLabel(tr("⚠ (Not recommended to use 'Alt')"))
+        lbl_warn.setStyleSheet("color: orange; font-style: italic; font-size: 10px;")
+        h_clone.addWidget(self.clone_mod_edit)
+        h_clone.addWidget(lbl_warn)
+        h_clone.addStretch()
+        f_ui.addRow(tr("Clone/Drag Modifier:"), h_clone)
+        
+        self.stamp_mod_edit = QComboBox()
+        self.stamp_mod_edit.addItems(["Shift", "Control", "Alt"])
+        curr_stamp = str(GlobalConfig.get("geo_stamp_modifier"))
+        if curr_stamp in ["Shift", "Control", "Alt"]:
+            self.stamp_mod_edit.setCurrentText(curr_stamp)
+            
+        f_ui.addRow(tr("Stamp Modifier:"), self.stamp_mod_edit)
+        
         g_ui.setLayout(f_ui)
         l.addWidget(g_ui)
 
@@ -1288,6 +1354,20 @@ class SettingsDialog(QDialog):
         h_b.addWidget(QLabel(tr("Width:"))); h_b.addWidget(self.style_batch_w)
         h_b.addWidget(QLabel(tr("Font Size:"))); h_b.addWidget(self.style_batch_font)
         l_batch.addLayout(h_b)
+        
+        # [Fix 3] Max font size SpinBox
+        h_b2 = QHBoxLayout()
+        self.style_batch_font_max = QSpinBox(); self.style_batch_font_max.setRange(10, 100); self.style_batch_font_max.setValue(int(GlobalConfig.get("style_batch_font_max_size")))
+        self.style_batch_font_max.setToolTip(tr("Upper limit for adaptive font scaling when zoomed out."))
+        h_b2.addWidget(QLabel(tr("Max Font Size:"))); h_b2.addWidget(self.style_batch_font_max)
+        
+        # [Fix 5] Line spacing SpinBox
+        self.style_batch_font_spacing = QSpinBox(); self.style_batch_font_spacing.setRange(0, 10); self.style_batch_font_spacing.setValue(int(GlobalConfig.get("style_batch_font_spacing")))
+        self.style_batch_font_spacing.setToolTip(tr("Line spacing between ROI label and frame info."))
+        h_b2.addWidget(QLabel(tr("Label Spacing:"))); h_b2.addWidget(self.style_batch_font_spacing)
+        
+        l_batch.addLayout(h_b2)
+        
         g_batch.setLayout(l_batch); l.addWidget(g_batch)
 
         l.addStretch(); w.setLayout(l)
@@ -1715,7 +1795,9 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("enh_window", self.enh_win_spin.value(), emit_signal=False)
         GlobalConfig.set("enh_workers", self.enh_work_spin.value(), emit_signal=False)
 
-        # 4. Save Geometry Options [New]
+        # 4. Save Geometry / Interaction Options [New]
+        GlobalConfig.set("geo_clone_modifier", self.clone_mod_edit.currentText(), emit_signal=False)
+        GlobalConfig.set("geo_stamp_modifier", self.stamp_mod_edit.currentText(), emit_signal=False)
         GlobalConfig.set("geo_enlarge", self.geo_enl_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_keep_index", self.geo_keep_idx_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_force_square", self.geo_sq_check.isChecked(), emit_signal=False)
@@ -1740,6 +1822,8 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("style_batch_text_color", self.style_batch_txt_col.text(), emit_signal=False)
         GlobalConfig.set("style_batch_width", self.style_batch_w.value(), emit_signal=False)
         GlobalConfig.set("style_batch_font_size", self.style_batch_font.value(), emit_signal=False)
+        GlobalConfig.set("style_batch_font_max_size", self.style_batch_font_max.value(), emit_signal=False)
+        GlobalConfig.set("style_batch_font_spacing", self.style_batch_font_spacing.value(), emit_signal=False)
 
         # Save System
         GlobalConfig.set("sys_ram_threshold_gb", self.sys_ram.value(), emit_signal=False)
