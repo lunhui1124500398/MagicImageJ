@@ -11,7 +11,7 @@
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QHBoxLayout, QComboBox, QGroupBox, 
                             QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, 
-                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication)
+                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication, QColorDialog, QDialog)
 from qtpy.QtCore import Qt, QTimer, QSettings, QThread, Signal
 import numpy as np
 from pathlib import Path
@@ -701,6 +701,71 @@ class GeometryWidget(QWidget):
         h_quick_import.addWidget(btn_load_png)
         h_quick_import.addWidget(btn_load_tiff)
         batch_layout.addLayout(h_quick_import)
+
+        # === [新增] Overview Map Settings ===
+        overview_group = QGroupBox(tr("Overview Map Settings"))
+        overview_layout = QVBoxLayout()
+        
+        h_ov1 = QHBoxLayout()
+        h_ov1.addWidget(QLabel(tr("Frame:")))
+        self.overview_frame_edit = QLineEdit()
+        self.overview_frame_edit.setPlaceholderText(tr("Empty=Current"))
+        self.overview_frame_edit.setToolTip(tr("Leave empty to use the current viewer frame."))
+        self.overview_frame_edit.setFixedWidth(80)
+        h_ov1.addWidget(self.overview_frame_edit)
+        
+        h_ov1.addWidget(QLabel(tr("Font Size:")))
+        self.overview_font_spin = QSpinBox()
+        self.overview_font_spin.setRange(10, 100)
+        self.overview_font_spin.setValue(24)
+        h_ov1.addWidget(self.overview_font_spin)
+        overview_layout.addLayout(h_ov1)
+        
+        h_ov2 = QHBoxLayout()
+        h_ov2.addWidget(QLabel(tr("Box Color:")))
+        self.btn_box_color = QPushButton()
+        self.btn_box_color.setFixedSize(24, 24)
+        box_c = GlobalConfig.get("geo_overview_box_color") or "#FFFF00"
+        self.btn_box_color.setStyleSheet(f"background-color: {box_c}; border: 1px solid #555;")
+        self.btn_box_color.setProperty("color_val", box_c)
+        self.btn_box_color.clicked.connect(self._pick_box_color)
+        h_ov2.addWidget(self.btn_box_color)
+        
+        h_ov2.addWidget(QLabel(tr("Text Color:")))
+        self.btn_text_color = QPushButton()
+        self.btn_text_color.setFixedSize(24, 24)
+        text_c = GlobalConfig.get("geo_overview_text_color") or "#FFFF00"
+        self.btn_text_color.setStyleSheet(f"background-color: {text_c}; border: 1px solid #555;")
+        self.btn_text_color.setProperty("color_val", text_c)
+        self.btn_text_color.clicked.connect(self._pick_text_color)
+        h_ov2.addWidget(self.btn_text_color)
+        overview_layout.addLayout(h_ov2)
+        
+        h_ov3 = QHBoxLayout()
+        h_ov3.addWidget(QLabel(tr("Text Pos:")))
+        self.overview_text_pos = QComboBox()
+        self.overview_text_pos.addItems(["Top", "Bottom", "Left", "Right"])
+        self.overview_text_pos.setCurrentText(str(GlobalConfig.get("geo_overview_text_pos") or "Top"))
+        h_ov3.addWidget(self.overview_text_pos)
+        overview_layout.addLayout(h_ov3)
+        
+        self._preview_dialog = None
+        
+        # Load core UI (tools, exports, etc.)default for other components
+        self.overview_frame_edit.setText(GlobalConfig.get("geo_overview_frame") or "")
+        self.overview_font_spin.setValue(int(GlobalConfig.get("geo_overview_font_size") or 24))
+        
+        # Connect signals for real-time preview updating
+        self.overview_font_spin.valueChanged.connect(self._on_overview_settings_changed)
+        self.overview_frame_edit.textChanged.connect(self._on_overview_settings_changed)
+        self.overview_text_pos.currentTextChanged.connect(self._on_overview_settings_changed)
+        
+        self.preview_overview_btn = QPushButton(f"👁️ {tr('Preview Overview')}")
+        self.preview_overview_btn.clicked.connect(self._preview_overview)
+        overview_layout.addWidget(self.preview_overview_btn)
+        
+        overview_group.setLayout(overview_layout)
+        batch_layout.addWidget(overview_group)
 
         self.export_batch_btn = QPushButton(f"💾 {tr('Export Crops & Map')}")
         self.export_batch_btn.clicked.connect(self._export_batch_crops)
@@ -2390,13 +2455,21 @@ class GeometryWidget(QWidget):
         # [Req 6] 获取当前帧数
         current_frame_idx = self.viewer.dims.current_step[0]
         
+        # 获取 Overview Map 用户配置
+        ov_frame_text = self.overview_frame_edit.text().strip()
+        ov_frame_idx = int(ov_frame_text) if ov_frame_text.isdigit() else current_frame_idx
+        box_c = self.btn_box_color.property("color_val")
+        text_c = self.btn_text_color.property("color_val")
+        f_size = self.overview_font_spin.value()
+        t_pos = self.overview_text_pos.currentText()
+        
         export_view_flag = self.export_view_check.isChecked()
         view_suffix = self.export_view_suffix.text().strip() or "_contrasted"
         data_suffix = self.suffix_edit.text().strip() or "_origin"
         
         self.export_thread.finished.connect(lambda c, path: self._on_export_finished(
             c, path, data_stack, view_stack, rois, sub_name, output_dir, current_frame_idx,
-            export_view_flag, data_suffix, view_suffix
+            export_view_flag, data_suffix, view_suffix, ov_frame_idx, box_c, text_c, f_size, t_pos
         ))
         self.export_thread.error.connect(self._on_export_error)
         self.export_thread.start()
@@ -2406,13 +2479,13 @@ class GeometryWidget(QWidget):
             self.export_thread.requestInterruption()
             self.status_label.setText(f"⚠️ {tr('Export canceled.')}")
 
-    def _on_export_finished(self, count, path_name, data_stack, view_stack, rois, sub_name, output_dir, frame_idx, export_view_flag, data_suffix, view_suffix):
+    def _on_export_finished(self, count, path_name, data_stack, view_stack, rois, sub_name, output_dir, frame_idx, export_view_flag, data_suffix, view_suffix, ov_frame, box_c, text_c, f_size, t_pos):
         self.batch_progress.close()
         
         # [Req 6] 使用指定的 frame_idx 分别导出数据层和视图层的概览图
-        self._create_overview_map(data_stack, rois, sub_name, output_dir, frame_idx, suffix=data_suffix)
+        self._create_overview_map(data_stack, rois, sub_name, output_dir, ov_frame, suffix=data_suffix, box_color=box_c, font_size=f_size, font_color=text_c, text_pos=t_pos)
         if export_view_flag and view_stack is not None:
-            self._create_overview_map(view_stack, rois, sub_name, output_dir, frame_idx, suffix=view_suffix)
+            self._create_overview_map(view_stack, rois, sub_name, output_dir, ov_frame, suffix=view_suffix, box_color=box_c, font_size=f_size, font_color=text_c, text_pos=t_pos)
         
         self.status_label.setText(f"✅ {tr('Exported %s crops.') % count}")
         self._force_view_active = False
@@ -2423,9 +2496,9 @@ class GeometryWidget(QWidget):
         self.status_label.setText(f"❌ {tr('Error:')} {err}")
         QMessageBox.critical(self, tr("Export Error"), str(err))
 
-    def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx, suffix=""):
+    def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx, suffix="", box_color="yellow", font_size=24, font_color="yellow", text_pos="Top"):
         """保存 Overview Map"""
-        if len(image_stack) == 0: return
+        if len(image_stack) == 0: return None
         
         # 使用传入的 frame_idx，防止越界
         idx = max(0, min(frame_idx, len(image_stack)-1))
@@ -2438,26 +2511,166 @@ class GeometryWidget(QWidget):
             
         pil_img = Image.fromarray(bg_img).convert("RGB")
         draw = ImageDraw.Draw(pil_img)
-        try: font = ImageFont.truetype("arial.ttf", 24)
+        try: font = ImageFont.truetype("arial.ttf", font_size)
         except: font = ImageFont.load_default()
 
         for i, roi in enumerate(rois):
             ys, xs = roi[:, 0], roi[:, 1]
             x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-            draw.rectangle([x1, y1, x2, y2], outline="yellow", width=3)
-            draw.text((x1, y1 - 25 if y1 > 25 else y1+5), f"NP{i+1}", fill="yellow", font=font)
+            draw.rectangle([x1, y1, x2, y2], outline=box_color, width=3)
             
-        pil_img.save(output_dir / f"{sample_name}_Overview_Frame{idx}{suffix}.png")
-        
-        # 记录 overview 使用的帧
-        json_path = output_dir / "processing_log.json"
-        if json_path.exists():
+            text_str = f"NP{i+1}"
             try:
-                with open(json_path, 'r') as f: log_data = json.load(f)
-                if "batch_crop" in log_data:
-                    log_data["batch_crop"]["overview_frame"] = idx
-                with open(json_path, 'w') as f: json.dump(log_data, f, indent=2)
-            except: pass
+                left, top, right, bottom = draw.textbbox((0, 0), text_str, font=font)
+                t_w, t_h = right - left, bottom - top
+            except:
+                t_w, t_h = font_size * len(text_str) * 0.6, font_size
+            
+            if text_pos == "Bottom":
+                t_x, t_y = x1, y2 + 5
+            elif text_pos == "Left":
+                t_x, t_y = x1 - t_w - 5, y1
+            elif text_pos == "Right":
+                t_x, t_y = x2 + 5, y1
+            else: # Top
+                t_x, t_y = x1, (y1 - t_h - 10 if y1 > t_h + 10 else y1 + 5)
+                
+            draw.text((t_x, t_y), text_str, fill=font_color, font=font)
+            
+        if output_dir is not None:
+            pil_img.save(output_dir / f"{sample_name}_Overview_Frame{idx}{suffix}.png")
+            
+            # 记录 overview 使用的帧
+            json_path = output_dir / "processing_log.json"
+            if json_path.exists():
+                try:
+                    with open(json_path, 'r') as f: log_data = json.load(f)
+                    if "batch_crop" in log_data:
+                        log_data["batch_crop"]["overview_frame"] = idx
+                    with open(json_path, 'w') as f: json.dump(log_data, f, indent=2)
+                except: pass
+        return pil_img
+
+    def _pick_box_color(self):
+        from qtpy.QtGui import QColor
+        current = self.btn_box_color.property("color_val") or "#FFFF00"
+        dialog = QColorDialog(QColor(current), self)
+        dialog.setWindowTitle(tr("Box Color"))
+        
+        def on_color_changed(color):
+            if color.isValid():
+                hex_val = color.name()
+                self.btn_box_color.setStyleSheet(f"background-color: {hex_val}; border: 1px solid #555;")
+                self.btn_box_color.setProperty("color_val", hex_val)
+                self._on_overview_settings_changed()
+                
+        dialog.currentColorChanged.connect(on_color_changed)
+        if dialog.exec_():
+            on_color_changed(dialog.selectedColor())
+        else:
+            on_color_changed(QColor(current)) # revert bounds
+            
+    def _pick_text_color(self):
+        from qtpy.QtGui import QColor
+        current = self.btn_text_color.property("color_val") or "#FFFF00"
+        dialog = QColorDialog(QColor(current), self)
+        dialog.setWindowTitle(tr("Text Color"))
+        
+        def on_color_changed(color):
+            if color.isValid():
+                hex_val = color.name()
+                self.btn_text_color.setStyleSheet(f"background-color: {hex_val}; border: 1px solid #555;")
+                self.btn_text_color.setProperty("color_val", hex_val)
+                self._on_overview_settings_changed()
+                
+        dialog.currentColorChanged.connect(on_color_changed)
+        if dialog.exec_():
+            on_color_changed(dialog.selectedColor())
+        else:
+            on_color_changed(QColor(current)) # revert bounds
+            
+    def _on_overview_settings_changed(self):
+        # Save to GlobalConfig
+        GlobalConfig.set("geo_overview_frame", self.overview_frame_edit.text().strip())
+        GlobalConfig.set("geo_overview_font_size", self.overview_font_spin.value())
+        GlobalConfig.set("geo_overview_box_color", self.btn_box_color.property("color_val"))
+        GlobalConfig.set("geo_overview_text_color", self.btn_text_color.property("color_val"))
+        GlobalConfig.set("geo_overview_text_pos", self.overview_text_pos.currentText())
+        
+        # Update Modeless Dialog if open
+        if self._preview_dialog is not None and self._preview_dialog.isVisible():
+            self._update_preview_image()
+
+    def _preview_overview(self):
+        if self._preview_dialog is None:
+            self._preview_dialog = QDialog(self)
+            self._preview_dialog.setWindowTitle(tr("Overview Preview"))
+            self._preview_dialog.setWindowFlags(self._preview_dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+            # Make it modeless
+            self._preview_dialog.setModal(False)
+            
+            l = QVBoxLayout()
+            scroll = QScrollArea()
+            self._preview_lbl = QLabel()
+            self._preview_lbl.setAlignment(Qt.AlignCenter)
+            scroll.setWidget(self._preview_lbl)
+            scroll.setWidgetResizable(True)
+            l.addWidget(scroll)
+            self._preview_dialog.setLayout(l)
+            self._preview_dialog.resize(800, 800)
+            
+        # Update contents and show it
+        self._update_preview_image()
+        self._preview_dialog.show()
+        self._preview_dialog.raise_()
+        self._preview_dialog.activateWindow()
+
+    def _update_preview_image(self):
+        data_layer_name = self.batch_data_combo.currentData()
+        if "Batch_ROI" not in self.viewer.layers or not len(self.viewer.layers["Batch_ROI"].data):
+            self._preview_lbl.setText(f"❌ {tr('No ROIs to preview.')}")
+            return
+            
+        layer = self.viewer.layers["Batch_ROI"]
+        rois = layer.data 
+        
+        frame_text = self.overview_frame_edit.text().strip()
+        if frame_text.isdigit():
+            frame_idx = int(frame_text)
+        else:
+            frame_idx = self.viewer.dims.current_step[0]
+            
+        box_c = self.btn_box_color.property("color_val") or "#FFFF00"
+        text_c = self.btn_text_color.property("color_val") or "#FFFF00"
+        f_size = self.overview_font_spin.value()
+        t_pos = self.overview_text_pos.currentText()
+        
+        image_stack = None
+        if data_layer_name and data_layer_name in self.viewer.layers:
+            image_stack = self.viewer.layers[data_layer_name].data
+        if image_stack is None or len(image_stack) == 0:
+            self._preview_lbl.setText(f"❌ {tr('No image data found for preview.')}")
+            return
+            
+        pil_img = self._create_overview_map(
+            image_stack=image_stack, rois=rois, sample_name="Preview", output_dir=None, 
+            frame_idx=frame_idx, suffix="", 
+            box_color=box_c, font_size=f_size, font_color=text_c, text_pos=t_pos
+        )
+        
+        if pil_img:
+            from qtpy.QtGui import QImage, QPixmap
+            import io
+            byte_io = io.BytesIO()
+            pil_img.save(byte_io, format='PNG')
+            qimg = QImage.fromData(byte_io.getvalue())
+            pixmap = QPixmap.fromImage(qimg)
+            
+            # Scale down if too large, max 1000x1000 for preview
+            if pixmap.width() > 1000 or pixmap.height() > 1000:
+                pixmap = pixmap.scaled(1000, 1000, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+            self._preview_lbl.setPixmap(pixmap)
     
     def _load_params_from_config(self):
         """热更新：从配置读取状态"""

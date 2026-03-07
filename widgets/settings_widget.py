@@ -487,6 +487,24 @@ TRANS_CN = {
     "Image Source Detection Report": "图像源检测报告",
     "View Layer": "视图图层",
     "Found": "已找到",
+    "Overview Map Settings": "概览图设置",
+    "Frame:": "帧 (Frame):",
+    "Empty=Current": "空=当前帧",
+    "Leave empty to use the current viewer frame.": "留空以使用当前视图的帧。",
+    "Font Size:": "字体大小 (Font Size):",
+    "Box Color:": "边框颜色 (Box Color):",
+    "Text Color:": "文字颜色 (Text Color):",
+    "Preview Overview": "预览概览图",
+    "Text Pos:": "文本位置 (Text Pos):",
+    "Top": "顶层 (Top)",
+    "Bottom": "底层 (Bottom)",
+    "Left": "左侧 (Left)",
+    "Right": "右侧 (Right)",
+    "Style Presets": "主题预设 (Style Presets)",
+    "Load": "加载 (Load)",
+    "Save Current...": "保存当前... (Save Current...)",
+    "Preset Name": "预设名称",
+    "Enter a name for the current visual style preset:": "为当前视觉样式预设输入一个名称:",
     
     "DM4 Archive": "DM4 归档",
     "PNG Sequence": "PNG 序列",
@@ -976,6 +994,14 @@ class GlobalConfig:
         "style_batch_font_size": 10,
         "style_batch_font_max_size": 24,  # [Fix 3] 字体自适应上限
         "style_batch_font_spacing": 0,    # [Fix 5] 字体行间距
+        
+        "geo_overview_frame": "",
+        "geo_overview_font_size": 24,
+        "geo_overview_box_color": "#FFFF00",
+        "geo_overview_text_color": "#FFFF00",
+        "geo_overview_text_pos": "Top",
+        
+        "style_presets": {},
 
         # System
         "sys_ram_threshold_gb": 4.0,
@@ -1323,6 +1349,32 @@ class SettingsDialog(QDialog):
             layout.addLayout(h)
             return line
 
+        # === 0. Style Presets [New] ===
+        g_presets = QGroupBox(f"🎭 {tr('Style Presets')}")
+        l_presets = QVBoxLayout()
+        h_presets = QHBoxLayout()
+        
+        self.preset_combo = QComboBox()
+        self._refresh_preset_combo()
+        h_presets.addWidget(self.preset_combo, stretch=1)
+        
+        btn_load_preset = QPushButton(f"🔄 {tr('Load')}")
+        btn_load_preset.clicked.connect(self._load_style_preset)
+        h_presets.addWidget(btn_load_preset)
+        
+        btn_save_preset = QPushButton(f"💾 {tr('Save Current...')}")
+        btn_save_preset.clicked.connect(self._save_style_preset)
+        h_presets.addWidget(btn_save_preset)
+        
+        btn_del_preset = QPushButton("🗑️")
+        btn_del_preset.setFixedWidth(40)
+        btn_del_preset.clicked.connect(self._delete_style_preset)
+        h_presets.addWidget(btn_del_preset)
+        
+        l_presets.addLayout(h_presets)
+        g_presets.setLayout(l_presets)
+        l.addWidget(g_presets)
+
         # 1. Measure Tool
         g_meas = QGroupBox(f"📏 {tr('Measure Tool')}")
         l_meas = QVBoxLayout()
@@ -1370,8 +1422,118 @@ class SettingsDialog(QDialog):
         
         g_batch.setLayout(l_batch); l.addWidget(g_batch)
 
+        # 4. Overview Map [New]
+        g_overview = QGroupBox(f"🖼️ {tr('Overview Map Settings')}")
+        l_overview = QVBoxLayout()
+        
+        self.geo_ov_box_c = add_color_row(l_overview, tr("Box Color:"), "geo_overview_box_color")
+        self.geo_ov_txt_c = add_color_row(l_overview, tr("Text Color:"), "geo_overview_text_color")
+        self.geo_ov_box_c.textChanged.connect(lambda t: GlobalConfig.set("geo_overview_box_color", t))
+        self.geo_ov_txt_c.textChanged.connect(lambda t: GlobalConfig.set("geo_overview_text_color", t))
+        
+        h_ov = QHBoxLayout()
+        h_ov.addWidget(QLabel(tr("Font Size:")))
+        self.geo_ov_font = QSpinBox(); self.geo_ov_font.setRange(10, 100); self.geo_ov_font.setValue(int(GlobalConfig.get("geo_overview_font_size")))
+        self.geo_ov_font.valueChanged.connect(lambda v: GlobalConfig.set("geo_overview_font_size", v))
+        h_ov.addWidget(self.geo_ov_font)
+        
+        h_ov.addWidget(QLabel(tr("Text Pos:")))
+        self.geo_ov_pos = QComboBox()
+        self.geo_ov_pos.addItems(["Top", "Bottom", "Left", "Right"])
+        self.geo_ov_pos.setCurrentText(str(GlobalConfig.get("geo_overview_text_pos")))
+        self.geo_ov_pos.currentTextChanged.connect(lambda text: GlobalConfig.set("geo_overview_text_pos", text))
+        h_ov.addWidget(self.geo_ov_pos)
+        
+        l_overview.addLayout(h_ov)
+        g_overview.setLayout(l_overview); l.addWidget(g_overview)
+
         l.addStretch(); w.setLayout(l)
         return w
+
+    def _refresh_preset_combo(self):
+        self.preset_combo.clear()
+        presets: dict = GlobalConfig.get("style_presets") or {}
+        for name in presets.keys():
+            self.preset_combo.addItem(name)
+            
+    def _save_style_preset(self):
+        from qtpy.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, tr("Preset Name"), tr("Enter a name for the current visual style preset:"))
+        if ok and name.strip():
+            presets: dict = GlobalConfig.get("style_presets") or {}
+            
+            # Pack current panel styles
+            current_style = {
+                "style_measure_color": self.style_meas_col.text(),
+                "style_measure_width": self.style_meas_w.value(),
+                "style_measure_font_size": self.style_meas_font.value(),
+                "style_crop_color": self.style_crop_col.text(),
+                "style_batch_box_color": self.style_batch_box_col.text(),
+                "style_batch_text_color": self.style_batch_txt_col.text(),
+                "style_batch_width": self.style_batch_w.value(),
+                "style_batch_font_size": self.style_batch_font.value(),
+                "geo_overview_box_color": self.geo_ov_box_c.text(),
+                "geo_overview_text_color": self.geo_ov_txt_c.text(),
+                "geo_overview_font_size": self.geo_ov_font.value(),
+                "geo_overview_text_pos": self.geo_ov_pos.currentText(),
+            }
+            
+            presets[name.strip()] = current_style
+            GlobalConfig.set("style_presets", presets)
+            self._refresh_preset_combo()
+            self.preset_combo.setCurrentText(name.strip())
+            
+    def _load_style_preset(self):
+        name = self.preset_combo.currentText()
+        if not name: return
+        
+        presets: dict = GlobalConfig.get("style_presets") or {}
+        if name in presets:
+            st = presets[name]
+            # Load back into visual styles UI components 
+            # Note: We must also trigger the color button updates manually to keep it in sync.
+            def _apply_color(line_widget, color_val):
+                line_widget.setText(color_val)
+                # Find sibling button and update its stylesheet
+                parent_layout = line_widget.parentWidget().layout()
+                if parent_layout:
+                    # Very hacky way to find the button inside the layout created by add_color_row
+                    for i in range(parent_layout.count()):
+                        item = parent_layout.itemAt(i)
+                        if item and item.layout():
+                            sub_layout = item.layout()
+                            for j in range(sub_layout.count()):
+                                widget = sub_layout.itemAt(j).widget()
+                                if widget == line_widget:
+                                    # The button is exactly next to it
+                                    btn = sub_layout.itemAt(j+1).widget()
+                                    if btn and isinstance(btn, QPushButton):
+                                        btn.setStyleSheet(f"background-color: {color_val}; border: 1px solid #555;")
+            
+            if "style_measure_color" in st: _apply_color(self.style_meas_col, st["style_measure_color"])
+            if "style_measure_width" in st: self.style_meas_w.setValue(st["style_measure_width"])
+            if "style_measure_font_size" in st: self.style_meas_font.setValue(st["style_measure_font_size"])
+            
+            if "style_crop_color" in st: _apply_color(self.style_crop_col, st["style_crop_color"])
+            
+            if "style_batch_box_color" in st: _apply_color(self.style_batch_box_col, st["style_batch_box_color"])
+            if "style_batch_text_color" in st: _apply_color(self.style_batch_txt_col, st["style_batch_text_color"])
+            if "style_batch_width" in st: self.style_batch_w.setValue(st["style_batch_width"])
+            if "style_batch_font_size" in st: self.style_batch_font.setValue(st["style_batch_font_size"])
+            
+            if "geo_overview_box_color" in st: _apply_color(self.geo_ov_box_c, st["geo_overview_box_color"])
+            if "geo_overview_text_color" in st: _apply_color(self.geo_ov_txt_c, st["geo_overview_text_color"])
+            if "geo_overview_font_size" in st: self.geo_ov_font.setValue(st["geo_overview_font_size"])
+            if "geo_overview_text_pos" in st: self.geo_ov_pos.setCurrentText(st["geo_overview_text_pos"])
+
+    def _delete_style_preset(self):
+        name = self.preset_combo.currentText()
+        if not name: return
+        presets: dict = GlobalConfig.get("style_presets") or {}
+        if name in presets:
+            del presets[name]
+            GlobalConfig.set("style_presets", presets)
+            self._refresh_preset_combo()
 
     def _create_system_tab(self):
         w = QWidget()

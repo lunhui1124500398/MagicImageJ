@@ -556,7 +556,7 @@ class ImportWidget(QWidget):
         self.sigma_spin = QDoubleSpinBox(); self.sigma_spin.setValue(0.8); self.sigma_spin.setSingleStep(0.1)
         h3.addWidget(QLabel(tr("Avg Win:"))); h3.addWidget(self.win_spin); h3.addWidget(QLabel(tr("Gaus σ:"))); h3.addWidget(self.sigma_spin); l_exp.addLayout(h3)
         
-        l_exp.addWidget(QLabel(tr("Additional Info (Saved to txt):"))); self.buffer_edit = QTextEdit(); self.buffer_edit.setPlaceholderText("e.g. 50mM Tris, pH 7.5..."); self.buffer_edit.setMaximumHeight(45); l_exp.addWidget(self.buffer_edit)
+        l_exp.addWidget(QLabel(tr("Additional Info:"))); self.additional_info_edit = QTextEdit(); self.additional_info_edit.setPlaceholderText("e.g. 50mM Tris, pH 7.5..."); self.additional_info_edit.setMaximumHeight(45); l_exp.addWidget(self.additional_info_edit)
         
         for w in [self.substance_edit, self.solvent_edit, self.dataset_edit, self.mag_edit, self.aperture_combo, self.win_spin, self.sigma_spin]:
             if isinstance(w, (QLineEdit, QTextEdit)): w.textChanged.connect(self._update_preview)
@@ -844,12 +844,11 @@ class ImportWidget(QWidget):
         QSettings("NapariUser", "Global").setValue("current_dataset_id", ds_id)
         # =======================================================
 
-        # 3. 写入 Info
         with open(archive_path / "readme.txt", 'w', encoding='utf-8') as f:
             f.write(f"Archive: {folder_name}\nCreated: {datetime.datetime.now()}\n" + "-"*30 + "\n")
             self.sub_txt = self.substance_edit.currentText()
             f.write(f"Substance: {self.sub_txt}\nSolvent: {self.solvent_edit.text()}\nDataset: {self.dataset_edit.text()}\n")
-            f.write(f"Buffer Info: {self.buffer_edit.toPlainText()}\n" + "-"*30 + "\n")
+            f.write(f"Additional Info: {self.additional_info_edit.toPlainText()}\n" + "-"*30 + "\n")
             f.write("Original DM4 Metadata:\n")
             for k, v in self.meta_cache.items(): f.write(f"{k}: {v}\n")
             
