@@ -913,6 +913,10 @@ TRANS_CN = {
     "Regenerate grid with current rows/cols": "使用当前行列数重新生成网格",
     "Clear": "清除",
     "Refresh": "刷新",
+    
+    # === ROI & Overview Toggle ===
+    "Hide ROI Labels": "隐藏 ROI 标注",
+    "Overview Uses View Layer": "概览图使用视图层数据",
 
     # === Missing Translations Checked (2026-03-07) ===
     "0 = infinite loop": "0 = 无限循环",
@@ -976,6 +980,8 @@ class GlobalConfig:
         "shortcut_undo_drift": "Ctrl+Z",
         "shortcut_apply_crop": "Enter",
         "shortcut_switch_mode": "M",
+        "shortcut_hide_roi": "K",      # [New] 隐藏 ROI 标注
+        "shortcut_toggle_overview": "V",  # [New] 切换概览图独立源
         "shortcut_delete_session": "Delete",  # 删除会话快捷键
         
         # Drift Defaults
@@ -996,6 +1002,8 @@ class GlobalConfig:
         "geo_create_denoise": False, # [New] 创建去噪文件夹
         "geo_create_refine": False,  # [New] 创建Refine文件夹
         "geo_export_view": False,    # [New] 默认导出视图层
+        "geo_hide_roi_labels": False, # [New] 隐藏 ROI 标注
+        "geo_overview_use_view": False, # [New] 概览图使用视图层数据
         "geo_roi_history_max": 128,   # [New] ROI 撤销历史记录上限
 
         # ROI Clone & Stamp (快速复制)
@@ -1323,12 +1331,19 @@ class SettingsDialog(QDialog):
         self.geo_export_view_check = QCheckBox(tr("Export View Layer by Default"))
         self.geo_export_view_check.setChecked(bool(GlobalConfig.get("geo_export_view")))
         
+        self.geo_hide_roi_labels_check = QCheckBox(tr("Hide ROI Labels"))
+        self.geo_hide_roi_labels_check.setChecked(bool(GlobalConfig.get("geo_hide_roi_labels")))
+        self.geo_overview_use_view_check = QCheckBox(tr("Overview Uses View Layer"))
+        self.geo_overview_use_view_check.setChecked(bool(GlobalConfig.get("geo_overview_use_view")))
+        
         f_geo.addRow("", self.geo_enl_check)
         f_geo.addRow("", self.geo_keep_idx_check)
         f_geo.addRow("", self.geo_sq_check)
         f_geo.addRow("", self.geo_denoise_check)
         f_geo.addRow("", self.geo_refine_check)
         f_geo.addRow("", self.geo_export_view_check)
+        f_geo.addRow("", self.geo_hide_roi_labels_check)
+        f_geo.addRow("", self.geo_overview_use_view_check)
         
         # ROI 撤销历史记录上限
         self.geo_history_max_spin = QSpinBox()
@@ -1955,6 +1970,8 @@ class SettingsDialog(QDialog):
             "shortcut_undo_drift": tr("Undo / Clear ROI"),
             "shortcut_apply_crop": tr("Apply Crop / Export"),
             "shortcut_switch_mode": tr("Switch Draw/Select Mode"),
+            "shortcut_hide_roi": tr("Hide ROI Labels"),
+            "shortcut_toggle_overview": tr("Overview Uses View Layer"),
             "shortcut_session_star": tr("Star / Unstar Session"),
             "shortcut_session_label": tr("Edit Session Label"),
             "shortcut_delete_session": tr("Delete Session")
@@ -2003,6 +2020,8 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("geo_create_denoise", self.geo_denoise_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_create_refine", self.geo_refine_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_export_view", self.geo_export_view_check.isChecked(), emit_signal=False)
+        GlobalConfig.set("geo_hide_roi_labels", self.geo_hide_roi_labels_check.isChecked(), emit_signal=False)
+        GlobalConfig.set("geo_overview_use_view", self.geo_overview_use_view_check.isChecked(), emit_signal=False)
         GlobalConfig.set("geo_roi_history_max", self.geo_history_max_spin.value(), emit_signal=False)
 
         # 5. Save Suffixes

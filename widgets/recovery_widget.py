@@ -1133,6 +1133,9 @@ class RecoveryWidget(QWidget):
         aborted = False
         last_result_layer = None  # 跟踪上一个操作产生的图层名
         
+        # UI 提示：开始重放
+        self.viewer.status = "Starting session replay..."
+        
         for action in selected_actions:
             widget = action.get("widget", "")
             action_type = action.get("action", "")
@@ -1204,9 +1207,59 @@ class RecoveryWidget(QWidget):
         except Exception as e:
             print(f"[RecoveryWidget] Failed to log recovery event: {e}")
         
-        # 显示恢复结果
-        QMessageBox.information(self, tr("Session Recovery"), 
-            "\n".join(report_lines))
+        # 设置激活图层并同步给 Geometry 面板
+        if last_result_layer and last_result_layer in self.viewer.layers:
+            self.viewer.layers.selection.active = self.viewer.layers[last_result_layer]
+            
+            # 手动同步 Geometry widget 的下拉框，确保重放后的数据被正确选中
+            try:
+                view_target = last_result_layer
+                data_target = last_result_layer
+                
+                # 获取最新生成的图像图层列表 (修复: 安全检查 ndim 防止 Shapes/Points 等图层数据类型为 list 而导致崩溃)
+                image_layers = [l.name for l in self.viewer.layers 
+                                if hasattr(l, 'data') and hasattr(l.data, 'ndim') and l.data.ndim >= 2]
+                
+                if image_layers:
+                    view_target = image_layers[-1]
+                    data_target = image_layers[-1]
+                    
+                    # 验证：如果最新图层包含 Enh，说明这是视图层。数据层需要往前找一个不包含 Enh 的图层。
+                    if "Enh" in view_target:
+                        for layer_name in reversed(image_layers):
+                            if "Enh" not in layer_name:
+                                data_target = layer_name
+                                break
+
+                for dock in self.viewer.window._dock_widgets.values():
+                    widget = dock.widget()
+                    if hasattr(widget, 'batch_data_combo') and hasattr(widget, 'batch_view_combo'):
+                        idx_data = widget.batch_data_combo.findData(data_target)
+                        if idx_data >= 0: widget.batch_data_combo.setCurrentIndex(idx_data)
+                        
+                        idx_view = widget.batch_view_combo.findData(view_target)
+                        if idx_view >= 0: widget.batch_view_combo.setCurrentIndex(idx_view)
+            except Exception as e:
+                print(f"[RecoveryWidget] Failed to sync geometry widget: {e}")
+
+        # 显示恢复结果 (原为 QMessageBox, 现在改用 QDialog 解决信息太长截断的问题)
+        from qtpy.QtWidgets import QDialog, QTextEdit, QVBoxLayout, QPushButton
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("Session Recovery Report"))
+        dialog.resize(600, 400)
+        dialog_layout = QVBoxLayout(dialog)
+        
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText("\n".join(report_lines))
+        dialog_layout.addWidget(text_edit)
+        
+        btn_ok = QPushButton(tr("OK"))
+        btn_ok.clicked.connect(dialog.accept)
+        btn_ok.setStyleSheet("background-color: #2196F3; color: white; padding: 6px; font-weight: bold;")
+        dialog_layout.addWidget(btn_ok)
+        
+        dialog.exec_()
         
         # 更新状态栏
         self.viewer.status = f"✅ Session recovery: {success_count} success, {len(skipped_actions)} skipped"
@@ -1287,7 +1340,64 @@ class RecoveryWidget(QWidget):
             return self._replay_session_link(params, recovery_mode)
         
         return ("skipped", None)
-    
+        
+    def _find_best_matching_layer(self, target_name: str, last_result_layer: str) -> 'napari.layers.Layer':
+        """
+        智能图层匹配：在重放时找到最合适的源图层。
+        优先顺序：
+        1. 链式首选：上一步产生的 last_result_layer
+        2. 全名精确匹配（目标名在画布中存在）
+        3. 前缀特征模糊匹配（去除 _recovered 干扰）
+        4. 后备：第一个有效的图像图层
+        """
+        image_layers = [l for l in self.viewer.layers 
+                        if hasattr(l, 'data') and l.data is not None and l.data.ndim >= 2]
+        if not image_layers:
+            return None
+
+        # 1. 如果有链式的上一步结果，优先使用
+        if last_result_layer and last_result_layer in self.viewer.layers:
+            return self.viewer.layers[last_result_layer]
+            
+        # 2. 精确匹配
+        if target_name and target_name in self.viewer.layers:
+            return self.viewer.layers[target_name]
+            
+        # 3. 模糊特征匹配
+        if target_name:
+            import re
+            import os
+            # 从目标名提取有效的特征前缀或块。
+            # 常见场景：源名字是 Original_cropped, 重放后画布里的名字变成了 Original_recovered_cropped
+            # 策略：如果画布里有图层包含了所有的单词块，那就是它。
+            # 或者暴力一点：去掉所有 "_recovered" 标志，再进行匹配
+            
+            clean_target = target_name.replace("_recovered", "").replace("__", "_")
+            
+            best_layer = None
+            best_score = -1
+            
+            for layer in image_layers:
+                clean_layer_name = layer.name.replace("_recovered", "").replace("__", "_")
+                
+                # 如果去掉 recovered 后名字完全一致
+                if clean_layer_name == clean_target:
+                    return layer
+                    
+                # 评估重叠程度 (比如 base name 相同且后缀匹配)
+                # 简单的前缀匹配
+                if clean_layer_name.startswith(clean_target) or clean_target.startswith(clean_layer_name):
+                    score = len(os.path.commonprefix([clean_layer_name, clean_target]))
+                    if score > best_score:
+                        best_score = score
+                        best_layer = layer
+            
+            if best_layer:
+                return best_layer
+
+        # 4. Fallback：第一个存在的图像图层
+        return image_layers[0]
+
     def _replay_geometry(self, action_type: str, params: dict, recovery_mode: str, last_result_layer: str = None) -> tuple:
         """重放几何变换操作"""
         import numpy as np
@@ -1295,18 +1405,10 @@ class RecoveryWidget(QWidget):
         try:
             source_layer_name = params.get("source_layer", "")
             
-            # 链式恢复：优先使用上一个操作产生的图层
-            if last_result_layer and last_result_layer in self.viewer.layers:
-                source_layer = self.viewer.layers[last_result_layer]
-            elif source_layer_name and source_layer_name in self.viewer.layers:
-                source_layer = self.viewer.layers[source_layer_name]
-            else:
-                # 使用第一个图像图层
-                image_layers = [l for l in self.viewer.layers 
-                               if hasattr(l, 'data') and l.data is not None and l.data.ndim >= 2]
-                if not image_layers:
-                    return ("failed", None)
-                source_layer = image_layers[0]
+            # 使用智能图层匹配
+            source_layer = self._find_best_matching_layer(source_layer_name, last_result_layer)
+            if not source_layer:
+                return ("failed", None)
             
             image_stack = np.array(source_layer.data)
             
@@ -1533,18 +1635,10 @@ class RecoveryWidget(QWidget):
             if not roi_bbox or len(roi_bbox) != 4:
                 return ("failed", None)
             
-            # 链式恢复：优先使用上一个操作产生的图层
-            if last_result_layer and last_result_layer in self.viewer.layers:
-                source_layer = self.viewer.layers[last_result_layer]
-            elif source_layer_name and source_layer_name in self.viewer.layers:
-                source_layer = self.viewer.layers[source_layer_name]
-            else:
-                # 使用第一个图像图层
-                image_layers = [l for l in self.viewer.layers 
-                               if hasattr(l, 'data') and l.data is not None and l.data.ndim == 3]
-                if not image_layers:
-                    return ("failed", None)
-                source_layer = image_layers[0]
+            # 使用智能匹配，并且增加 ndim 检查
+            source_layer = self._find_best_matching_layer(source_layer_name, last_result_layer)
+            if not source_layer or not hasattr(source_layer, 'data') or source_layer.data.ndim < 3:
+                return ("failed", None)
             
             image_stack = np.array(source_layer.data)
             
@@ -1665,18 +1759,9 @@ class RecoveryWidget(QWidget):
                 source_name = params.get("source_layer", "")
                 inner_params = params
             
-            # 链式恢复：优先使用上一个操作产生的图层
-            if last_result_layer and last_result_layer in self.viewer.layers:
-                source_layer = self.viewer.layers[last_result_layer]
-            elif source_name and source_name in self.viewer.layers:
-                source_layer = self.viewer.layers[source_name]
-            else:
-                # 使用第一个图像图层
-                image_layers = [l for l in self.viewer.layers 
-                               if hasattr(l, 'data') and l.data is not None and l.data.ndim >= 2]
-                if not image_layers:
-                    return ("failed", None)
-                source_layer = image_layers[0]
+            source_layer = self._find_best_matching_layer(source_name, last_result_layer)
+            if not source_layer:
+                return ("failed", None)
             
             data = np.array(source_layer.data)
             

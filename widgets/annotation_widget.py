@@ -65,11 +65,14 @@ class AnnotationWidget(QWidget):
         self._setup_ui()
         # 监听激活图层，自动选中
         self.viewer.layers.selection.events.active.connect(self._on_active_layer_changed)
+        # 监听全局图层增删，保持下拉框同步
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
     
     def _on_active_layer_changed(self, event=None):
         """当外部选中图层时同步"""
         active_layer = self.viewer.layers.selection.active
-        if active_layer:
+        if active_layer and active_layer.name not in ['Preview_Overlay', 'Interaction_Box']:
             idx = self.layer_combo.findData(active_layer.name)
             if idx >= 0:
                 self.layer_combo.setCurrentIndex(idx)
@@ -925,13 +928,14 @@ class AnnotationWidget(QWidget):
             self.layer_combo.setCurrentText(layer_name)
 
     # ========== Utils ==========
-    def _refresh_layers(self):
+    def _refresh_layers(self, event=None):
         """刷新图层并自动选中"""
         current_data = self.layer_combo.currentData()
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
         
         for layer in self.viewer.layers:
+            if layer.name in ['Preview_Overlay', 'Interaction_Box']: continue
             if (hasattr(layer, 'data') and 
                 isinstance(layer.data, np.ndarray) and 
                 len(layer.data.shape) >= 3):
@@ -941,12 +945,16 @@ class AnnotationWidget(QWidget):
         
         # 智能选择逻辑
         active_layer = self.viewer.layers.selection.active
+        best_idx = -1
+        
         if active_layer:
-            idx = self.layer_combo.findData(active_layer.name)
-            if idx >= 0: self.layer_combo.setCurrentIndex(idx)
-        elif current_data:
-            idx = self.layer_combo.findData(current_data)
-            if idx >= 0: self.layer_combo.setCurrentIndex(idx)
+            best_idx = self.layer_combo.findData(active_layer.name)
+            
+        if best_idx < 0 and current_data:
+            best_idx = self.layer_combo.findData(current_data)
+            
+        if best_idx >= 0:
+            self.layer_combo.setCurrentIndex(best_idx)
             
         self.layer_combo.blockSignals(False)
         # 强制更新状态

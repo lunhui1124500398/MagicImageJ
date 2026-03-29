@@ -11,7 +11,8 @@
 from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
                             QLabel, QHBoxLayout, QComboBox, QGroupBox, 
                             QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, 
-                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication, QColorDialog, QDialog)
+                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication, QColorDialog, QDialog, QShortcut)
+from qtpy.QtGui import QKeySequence
 from qtpy.QtCore import Qt, QTimer, QSettings, QThread, Signal
 import numpy as np
 from pathlib import Path
@@ -365,8 +366,13 @@ class GeometryWidget(QWidget):
 
         apply_key = GlobalConfig.get_napari_shortcut("shortcut_apply_crop")
         switch_key = GlobalConfig.get_napari_shortcut("shortcut_switch_mode")
+        hide_roi_key = GlobalConfig.get_napari_shortcut("shortcut_hide_roi")
+        overview_key = GlobalConfig.get_napari_shortcut("shortcut_toggle_overview")
+        
         self.viewer.bind_key(apply_key, self._on_shortcut_apply)
         self.viewer.bind_key(switch_key, self._on_shortcut_switch)
+        self.viewer.bind_key(hide_roi_key, self._on_shortcut_hide_roi)
+        self.viewer.bind_key(overview_key, self._on_shortcut_toggle_overview)
 
     def _setup_ui(self):
         main_layout = QVBoxLayout()
@@ -760,6 +766,12 @@ class GeometryWidget(QWidget):
         self.overview_frame_edit.textChanged.connect(self._on_overview_settings_changed)
         self.overview_text_pos.currentTextChanged.connect(self._on_overview_settings_changed)
         
+        self.overview_use_view_check = QCheckBox(tr("Overview Uses View Layer"))
+        self.overview_use_view_check.setChecked(bool(GlobalConfig.get("geo_overview_use_view")))
+        self.overview_use_view_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_overview_use_view", bool(v)))
+        self.overview_use_view_check.stateChanged.connect(self._on_overview_settings_changed)
+        overview_layout.addWidget(self.overview_use_view_check)
+        
         self.preview_overview_btn = QPushButton(f"👁️ {tr('Preview Overview')}")
         self.preview_overview_btn.clicked.connect(self._preview_overview)
         overview_layout.addWidget(self.preview_overview_btn)
@@ -832,6 +844,34 @@ class GeometryWidget(QWidget):
                 layer.mode = 'add_rectangle'
                 self.status_label.setText(f"⚡ {tr('Mode: Draw')}")
 
+    def _on_shortcut_hide_roi(self, viewer):
+        current = bool(GlobalConfig.get("geo_hide_roi_labels"))
+        new_state = not current
+        GlobalConfig.set("geo_hide_roi_labels", new_state, emit_signal=False)
+        self._load_params_from_config()
+        if "Batch_ROI" in self.viewer.layers:
+            layer = self.viewer.layers["Batch_ROI"]
+            if hasattr(layer, 'text'):
+                spacing_chars = '\n' * (int(GlobalConfig.get("style_batch_font_spacing")) + 1)
+                layer.text = {
+                    'string': '{label}' + spacing_chars + '{frame_info}',
+                    'size': layer.text.size if hasattr(layer.text, 'size') else GlobalConfig.get("style_batch_font_size"),
+                    'color': GlobalConfig.get("style_batch_text_color"),
+                    'anchor': 'upper_left',
+                    'translation': [-5, -5],
+                    'visible': not new_state
+                }
+        self.status_label.setText(f"👁️ {tr('ROI Labels:')} {'Off' if new_state else 'On'}")
+
+    def _on_shortcut_toggle_overview(self, viewer):
+        current = bool(GlobalConfig.get("geo_overview_use_view"))
+        new_state = not current
+        GlobalConfig.set("geo_overview_use_view", new_state, emit_signal=False)
+        self._load_params_from_config()
+        if self._preview_dialog and self._preview_dialog.isVisible():
+            self._update_preview_image()
+        self.status_label.setText(f"👁️ {tr('Overview uses:')} {tr('View Layer') if new_state else tr('Data Layer')}")
+
     def _refresh_layers(self, event=None):
         layers = [
             l.name for l in self.viewer.layers 
@@ -873,16 +913,16 @@ class GeometryWidget(QWidget):
         self.batch_data_combo.blockSignals(True)
         self.batch_view_combo.blockSignals(True)
 
-        data_candidates = [l for l in layers if l.startswith("Cropped_Rotated")]
+        data_candidates = [l for l in layers if l.lower().startswith("cropped_rotated") or "cropped" in l.lower()]
         if not data_candidates:
-             data_candidates = [l for l in layers if "Rotated" in l and "Enh" not in l and "Contrast" not in l and "Burned" not in l]
+             data_candidates = [l for l in layers if "rotated" in l.lower() and "enh" not in l.lower() and "contrast" not in l.lower() and "burned" not in l.lower()]
         if data_candidates:
             idx = self.batch_data_combo.findData(data_candidates[-1])
             if idx >= 0: self.batch_data_combo.setCurrentIndex(idx)
 
-        view_candidates = [l for l in layers if l.startswith("Contrast_Enh")]
+        view_candidates = [l for l in layers if l.lower().startswith("contrast_enh")]
         if not view_candidates:
-            view_candidates = [l for l in layers if l.startswith("Enh")]
+            view_candidates = [l for l in layers if l.lower().startswith("enh")]
         if view_candidates:
             idx = self.batch_view_combo.findData(view_candidates[-1])
             if idx >= 0: self.batch_view_combo.setCurrentIndex(idx)
@@ -1699,7 +1739,8 @@ class GeometryWidget(QWidget):
                 'size': layer.text.size if hasattr(layer.text, 'size') else GlobalConfig.get("style_batch_font_size"),
                 'color': GlobalConfig.get("style_batch_text_color"),
                 'anchor': 'upper_left',
-                'translation': [-5, -5]
+                'translation': [-5, -5],
+                'visible': not bool(GlobalConfig.get("geo_hide_roi_labels"))
             }
             
             layer.features = {
@@ -2609,6 +2650,10 @@ class GeometryWidget(QWidget):
             # Make it modeless
             self._preview_dialog.setModal(False)
             
+            # Add shortcut so V works even when dialog is focused
+            self._overview_dialog_shortcut = QShortcut(QKeySequence(""), self._preview_dialog)
+            self._overview_dialog_shortcut.activated.connect(lambda: self._on_shortcut_toggle_overview(None))
+            
             l = QVBoxLayout()
             scroll = QScrollArea()
             self._preview_lbl = QLabel()
@@ -2619,6 +2664,11 @@ class GeometryWidget(QWidget):
             self._preview_dialog.setLayout(l)
             self._preview_dialog.resize(800, 800)
             
+        # Update shortcut key in case it was changed in Settings
+        overview_key = str(GlobalConfig.get("shortcut_toggle_overview"))
+        if hasattr(self, '_overview_dialog_shortcut') and overview_key:
+            self._overview_dialog_shortcut.setKey(QKeySequence(overview_key))
+            
         # Update contents and show it
         self._update_preview_image()
         self._preview_dialog.show()
@@ -2626,7 +2676,8 @@ class GeometryWidget(QWidget):
         self._preview_dialog.activateWindow()
 
     def _update_preview_image(self):
-        data_layer_name = self.batch_data_combo.currentData()
+        use_view = bool(GlobalConfig.get("geo_overview_use_view"))
+        data_layer_name = self.batch_view_combo.currentData() if use_view else self.batch_data_combo.currentData()
         if "Batch_ROI" not in self.viewer.layers or not len(self.viewer.layers["Batch_ROI"].data):
             self._preview_lbl.setText(f"❌ {tr('No ROIs to preview.')}")
             return
@@ -2677,6 +2728,9 @@ class GeometryWidget(QWidget):
         # Block signals
         widgets = [self.enlarge_check, self.keep_index_check, self.force_square_check, 
                    self.check_denoise, self.check_refine, self.export_view_check, self.suffix_edit, self.padding_spin]
+        if hasattr(self, 'overview_use_view_check'):
+            widgets.append(self.overview_use_view_check)
+            
         for w in widgets: w.blockSignals(True)
 
         self.enlarge_check.setChecked(bool(GlobalConfig.get("geo_enlarge")))
@@ -2687,6 +2741,8 @@ class GeometryWidget(QWidget):
         self.export_view_check.setChecked(bool(GlobalConfig.get("geo_export_view")))
         self.suffix_edit.setText(str(GlobalConfig.get("geo_suffix")))
         self.padding_spin.setValue(int(GlobalConfig.get("geo_padding")))
+        if hasattr(self, 'overview_use_view_check'):
+            self.overview_use_view_check.setChecked(bool(GlobalConfig.get("geo_overview_use_view")))
 
         # Update Style Configs (Color etc.) for Draw Rect logic
         # 这里的样式参数会在 _draw_crop_rect 调用时实时读取 GlobalConfig.get()，无需刷新 UI 控件
