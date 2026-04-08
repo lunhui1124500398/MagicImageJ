@@ -26,8 +26,11 @@ import napari
 import json
 import os
 import datetime
+import subprocess
+import sys
 from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
+from utils.auto_crop_session_locator import find_current_session_root
 from utils.utils import elide_text
 from core.geometry_helpers import (
     clone_roi_data, stamp_roi_data, get_roi_size,
@@ -689,9 +692,14 @@ class GeometryWidget(QWidget):
         btn_load_roi = QPushButton(f"📂 {tr('Load ROIs')}")
         btn_load_roi.clicked.connect(self._load_rois_from_json)
         btn_load_roi.setToolTip(tr("Load ROI JSON & Auto-load Image"))
+
+        self.auto_propose_roi_btn = QPushButton(f"🤖 {tr('Auto Propose ROI')}")
+        self.auto_propose_roi_btn.clicked.connect(self._auto_propose_roi)
+        self.auto_propose_roi_btn.setToolTip(tr("Generate candidate ROIs from the current session and load them into Batch_ROI"))
         
         h_roi_io.addWidget(btn_save_roi)
         h_roi_io.addWidget(btn_load_roi)
+        h_roi_io.addWidget(self.auto_propose_roi_btn)
         batch_layout.addLayout(h_roi_io)
         
         # === [新增] PNG/TIFF 快速导入按钮 ===
@@ -2230,6 +2238,397 @@ class GeometryWidget(QWidget):
             print(f"Error adding layer '{name}' to viewer: {e}")
             # 如果出错，给用户一个非阻塞的提示（可选）
             self.status_label.setText(f"❌ Failed to add layer: {name}")
+
+    def _auto_crop_scripts_root(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "scripts"
+
+    def _auto_crop_workspace_root(self, session_root: Path) -> Path:
+        root = session_root / "_auto_crop_assist"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _auto_crop_source_layer(self):
+        layer_name = self.batch_view_combo.currentData() or self.batch_data_combo.currentData()
+        if not layer_name:
+            active_layer = self.viewer.layers.selection.active
+            if (
+                active_layer is not None
+                and hasattr(active_layer, "data")
+                and isinstance(active_layer.data, np.ndarray)
+                and active_layer.data.ndim == 3
+            ):
+                layer_name = active_layer.name
+
+        if not layer_name:
+            raise RuntimeError(tr("No 3D enhanced/view layer is available for auto proposal."))
+
+        try:
+            layer = self.viewer.layers[layer_name]
+        except Exception as exc:
+            raise RuntimeError(tr("Could not access the selected auto-crop source layer.")) from exc
+
+        stack = np.asarray(layer.data)
+        if stack.ndim != 3:
+            raise RuntimeError(
+                tr("Auto proposal currently requires a 3D stack layer, but the selected layer is not 3D.")
+            )
+        return layer, str(layer_name), stack
+
+    def _normalize_auto_crop_export_stack(self, stack: np.ndarray) -> np.ndarray:
+        stack = np.asarray(stack)
+        if stack.ndim != 3:
+            raise ValueError("Auto-crop export stack must be 3D.")
+        if stack.dtype == np.uint8:
+            return np.ascontiguousarray(stack)
+
+        stack_f = stack.astype(np.float32, copy=False)
+        finite_mask = np.isfinite(stack_f)
+        if not np.any(finite_mask):
+            return np.zeros(stack.shape, dtype=np.uint8)
+
+        sample = stack_f[finite_mask]
+        lo = float(np.percentile(sample, 0.5))
+        hi = float(np.percentile(sample, 99.5))
+        if hi <= lo:
+            lo = float(sample.min())
+            hi = float(sample.max())
+
+        normalized = np.zeros(stack.shape, dtype=np.float32)
+        if hi > lo:
+            normalized[finite_mask] = (stack_f[finite_mask] - lo) / (hi - lo)
+        normalized = np.clip(normalized * 255.0, 0.0, 255.0)
+        return normalized.astype(np.uint8)
+
+    def _export_auto_crop_runtime_sequence(self, session_root: Path):
+        _, layer_name, stack = self._auto_crop_source_layer()
+        exported_root = session_root / "Exported_Sequences"
+        exported_root.mkdir(parents=True, exist_ok=True)
+
+        safe_layer_name = "".join(
+            char if (char.isalnum() or char in ("-", "_")) else "_"
+            for char in layer_name
+        ).strip("_")
+        if not safe_layer_name:
+            safe_layer_name = "CurrentLayer"
+        sequence_dir = exported_root / f"Enh_AutoPropose_runtime_{safe_layer_name}"
+        sequence_dir.mkdir(parents=True, exist_ok=True)
+
+        for stale_file in sequence_dir.glob("frame_*.png"):
+            try:
+                stale_file.unlink()
+            except OSError:
+                pass
+
+        export_stack = self._normalize_auto_crop_export_stack(stack)
+        progress = QProgressDialog(
+            tr("Preparing a temporary enhanced sequence for auto proposal..."),
+            tr("Cancel"),
+            0,
+            int(export_stack.shape[0]),
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        try:
+            for index, frame in enumerate(export_stack):
+                if progress.wasCanceled():
+                    raise RuntimeError(tr("Auto proposal canceled while exporting the current enhanced stack."))
+
+                save_path = sequence_dir / f"frame_{index:04d}.png"
+                if not cv2.imwrite(str(save_path), frame):
+                    raise RuntimeError(tr("Failed to write auto-crop runtime frame: %s") % save_path.name)
+                progress.setValue(index + 1)
+                QApplication.processEvents()
+        finally:
+            progress.close()
+
+        meta_path = sequence_dir / "_auto_crop_runtime_meta.json"
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "source_layer_name": layer_name,
+                    "frame_count": int(export_stack.shape[0]),
+                    "height": int(export_stack.shape[1]),
+                    "width": int(export_stack.shape[2]),
+                    "source_dtype": str(stack.dtype),
+                    "export_dtype": "uint8",
+                    "session_root": str(session_root),
+                    "generated_at": str(datetime.datetime.now()),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return sequence_dir, layer_name, int(export_stack.shape[0])
+
+    def _auto_crop_frame_index(self) -> int:
+        frame_text = self.overview_frame_edit.text().strip()
+        if frame_text.isdigit():
+            return int(frame_text)
+        try:
+            return int(self.viewer.dims.current_step[0])
+        except Exception:
+            return 0
+
+    def _run_auto_crop_subprocess(self, command_args, progress_text: str, show_progress: bool = True) -> str:
+        self.status_label.setText(progress_text)
+        QApplication.processEvents()
+
+        progress = None
+        if show_progress:
+            progress = QProgressDialog(progress_text, "", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setCancelButton(None)
+            progress.show()
+            QApplication.processEvents()
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = subprocess.run(
+                command_args,
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                check=False,
+            )
+        finally:
+            if progress is not None:
+                progress.close()
+
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            stdout = (completed.stdout or "").strip()
+            message = stderr or stdout or "Unknown error"
+            raise RuntimeError(message)
+
+        return (completed.stdout or "").strip()
+
+    def _resolve_auto_crop_session_root(self) -> Path | None:
+        session_root = find_current_session_root(viewer=self.viewer)
+        if session_root and (session_root / "processing_log.json").exists():
+            return session_root
+
+        start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
+        picked = QFileDialog.getExistingDirectory(
+            self,
+            tr("Select Session Root"),
+            start_dir,
+        )
+        if not picked:
+            return None
+
+        picked_path = Path(picked)
+        if not (picked_path / "processing_log.json").exists():
+            QMessageBox.warning(
+                self,
+                tr("Invalid Session"),
+                tr("Selected folder does not contain processing_log.json."),
+            )
+            return None
+        return picked_path
+
+    def _sync_auto_crop_review_json(
+        self,
+        review_json: Path,
+        session_root: Path,
+        sequence_dir: Path,
+        frame_index: int,
+    ) -> None:
+        frame_path = sequence_dir / f"frame_{frame_index:04d}.png"
+        if not frame_path.exists():
+            raise FileNotFoundError(f"Frame not found in auto-crop sequence: {frame_path}")
+
+        with open(review_json, "r", encoding="utf-8") as handle:
+            review_data = json.load(handle)
+
+        review_data["image_id"] = f"{session_root.name}__frame_{frame_index:04d}"
+        review_data["source_image"] = str(frame_path)
+        review_data["frame_index"] = int(frame_index)
+        review_data["sequence_dir"] = str(sequence_dir)
+        review_data["session_root"] = str(session_root)
+        review_data["source_processing_log"] = str(session_root / "processing_log.json")
+
+        with open(review_json, "w", encoding="utf-8") as handle:
+            json.dump(review_data, handle, indent=2, ensure_ascii=False)
+
+    def _ensure_auto_crop_review_json(
+        self,
+        session_root: Path,
+        frame_index: int,
+        sequence_dir: Path,
+    ) -> Path:
+        review_dir = self._auto_crop_workspace_root(session_root) / "review_templates"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        review_json = review_dir / f"{session_root.name}__frame_{frame_index:04d}.json"
+        if not review_json.exists():
+            bootstrap_script = self._auto_crop_scripts_root() / "bootstrap_auto_crop_review.py"
+            self._run_auto_crop_subprocess(
+                [
+                    sys.executable,
+                    str(bootstrap_script),
+                    "--session-root",
+                    str(session_root),
+                    "--frame-index",
+                    str(frame_index),
+                    "--output-dir",
+                    str(review_dir),
+                    "--sequence-dir",
+                    str(sequence_dir),
+                ],
+                progress_text=tr("Creating auto-crop review template..."),
+            )
+
+        self._sync_auto_crop_review_json(
+            review_json=review_json,
+            session_root=session_root,
+            sequence_dir=sequence_dir,
+            frame_index=frame_index,
+        )
+        return review_json
+
+    def _maybe_edit_auto_crop_focus(self, review_json: Path) -> bool:
+        with open(review_json, "r", encoding="utf-8") as handle:
+            review_data = json.load(handle)
+        has_focus = bool(review_data.get("focus_regions"))
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(tr("Auto Propose ROI"))
+        if has_focus:
+            msg_box.setText(tr("Focus regions already exist for this frame."))
+            btn_reuse = msg_box.addButton(tr("Reuse Focus"), QMessageBox.AcceptRole)
+            btn_edit = msg_box.addButton(tr("Edit Focus"), QMessageBox.ActionRole)
+        else:
+            msg_box.setText(tr("No focus region exists for this frame yet."))
+            btn_reuse = msg_box.addButton(tr("Skip Focus"), QMessageBox.AcceptRole)
+            btn_edit = msg_box.addButton(tr("Draw Focus"), QMessageBox.ActionRole)
+        btn_cancel = msg_box.addButton(tr("Cancel"), QMessageBox.RejectRole)
+        msg_box.setInformativeText(tr("Focus regions help proposals concentrate on the regions that matter."))
+        msg_box.exec_()
+        clicked = msg_box.clickedButton()
+
+        if clicked == btn_cancel:
+            return False
+        if clicked != btn_edit:
+            return True
+
+        annotate_script = self._auto_crop_scripts_root() / "annotate_auto_crop_regions.py"
+        self._run_auto_crop_subprocess(
+            [
+                sys.executable,
+                str(annotate_script),
+                "--review-json",
+                str(review_json),
+            ],
+            progress_text=tr("Waiting for focus-region editor to close..."),
+            show_progress=False,
+        )
+        return True
+
+    def _load_magicimagej_roi_json(self, roi_json: Path) -> int:
+        with open(roi_json, "r", encoding="utf-8") as handle:
+            data_dump = json.load(handle)
+        self._restore_rois_to_layer(data_dump)
+        return len(data_dump.get("rois", []))
+
+    def _auto_propose_roi(self):
+        try:
+            session_root = self._resolve_auto_crop_session_root()
+            if session_root is None:
+                return
+
+            frame_index = self._auto_crop_frame_index()
+            sequence_dir, source_layer_name, frame_count = self._export_auto_crop_runtime_sequence(session_root)
+            if frame_index < 0 or frame_index >= frame_count:
+                raise RuntimeError(
+                    tr("Selected overview frame %s is outside the current enhanced stack (0-%s).")
+                    % (frame_index, max(frame_count - 1, 0))
+                )
+
+            review_json = self._ensure_auto_crop_review_json(
+                session_root,
+                frame_index,
+                sequence_dir,
+            )
+            if not self._maybe_edit_auto_crop_focus(review_json):
+                self.status_label.setText(f"⚠️ {tr('Auto propose canceled.')}")
+                return
+
+            workspace_root = self._auto_crop_workspace_root(session_root)
+            proposal_dir = workspace_root / f"frame_{frame_index:04d}_v35"
+            proposal_dir.mkdir(parents=True, exist_ok=True)
+
+            propose_script = self._auto_crop_scripts_root() / "propose_auto_crop_candidates.py"
+            self._run_auto_crop_subprocess(
+                [
+                    sys.executable,
+                    str(propose_script),
+                    "--session-root",
+                    str(session_root),
+                    "--sequence-dir",
+                    str(sequence_dir),
+                    "--output-dir",
+                    str(proposal_dir),
+                    "--review-json",
+                    str(review_json),
+                    "--temporal-rerank",
+                ],
+                progress_text=tr("Generating candidate ROIs from the current session..."),
+            )
+
+            proposal_json = proposal_dir / f"frame_{frame_index:04d}_candidates.json"
+            roi_json = proposal_dir / f"frame_{frame_index:04d}_candidates_top40_magicimagej.json"
+            export_script = self._auto_crop_scripts_root() / "export_proposals_to_magicimagej_roi.py"
+            self._run_auto_crop_subprocess(
+                [
+                    sys.executable,
+                    str(export_script),
+                    "--proposal-json",
+                    str(proposal_json),
+                    "--output-json",
+                    str(roi_json),
+                    "--top-k",
+                    "40",
+                ],
+                progress_text=tr("Converting proposals into Batch_ROI format..."),
+            )
+
+            roi_count = self._load_magicimagej_roi_json(roi_json)
+            get_logger().log_action(
+                "geometry",
+                "auto_propose_roi",
+                {
+                    "session_root": str(session_root),
+                    "sequence_dir": str(sequence_dir),
+                    "source_layer_name": source_layer_name,
+                    "frame_index": int(frame_index),
+                    "review_json": str(review_json),
+                    "proposal_json": str(proposal_json),
+                    "roi_json": str(roi_json),
+                    "temporal_rerank": True,
+                    "proposal_count": int(roi_count),
+                    "python_executable": sys.executable,
+                },
+            )
+            self.status_label.setText(f"✅ {tr('Loaded %s auto-proposed ROIs.') % roi_count}")
+            QMessageBox.information(
+                self,
+                tr("Auto Propose ROI"),
+                tr("Loaded %s proposed ROIs into Batch_ROI.\n\nSession: %s\nFrame: %s") % (
+                    roi_count,
+                    session_root.name,
+                    frame_index,
+                ),
+            )
+        except Exception as e:
+            self.status_label.setText(f"❌ {tr('Auto propose failed:')} {e}")
+            QMessageBox.critical(self, tr("Auto Propose ROI Error"), str(e))
 
     def restore_from_processing_log(self, log_path):
         """

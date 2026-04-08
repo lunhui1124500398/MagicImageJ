@@ -17,7 +17,10 @@ import signal
 import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from qtpy.QtCore import QSettings
+try:
+    from qtpy.QtCore import QSettings
+except ImportError:
+    from PyQt6.QtCore import QSettings
 
 # --- Numpy JSON Encoder ---
 class NumpyEncoder(json.JSONEncoder):
