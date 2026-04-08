@@ -98,11 +98,12 @@ class LoaderThread(QThread):
     progress = Signal(int, int)
     finished = Signal(np.ndarray, dict)
     error = Signal(str)
-    def __init__(self, folder_path, bit_depth, max_workers):
+    def __init__(self, folder_path, bit_depth, max_workers, frame_indices=None):
         super().__init__()
         self.folder_path = folder_path
         self.bit_depth = bit_depth
         self.max_workers = max_workers
+        self.frame_indices = frame_indices
     def run(self):
         try:
             def callback(current, total):
@@ -114,11 +115,11 @@ class LoaderThread(QThread):
             
             if has_dm4:
                 image_stack, metadata = read_dm4_sequence(
-                    self.folder_path, self.bit_depth, self.max_workers, callback
+                    self.folder_path, self.bit_depth, self.max_workers, callback, self.frame_indices
                 )
             elif has_dm3:
                 image_stack, metadata = read_dm3_sequence(
-                    self.folder_path, self.bit_depth, self.max_workers, callback
+                    self.folder_path, self.bit_depth, self.max_workers, callback, self.frame_indices
                 )
             else:
                  raise ValueError("No DM4 or DM3 files found in folder.")
@@ -403,6 +404,94 @@ class ImportWidget(QWidget):
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
             self.pick_file_btn.setEnabled(True)
+            self._update_frame_range_hint()
+
+    def _list_import_sequence_files(self):
+        if not self.current_folder:
+            return []
+
+        folder = Path(self.current_folder)
+        files_dm4 = sorted(list(folder.rglob("*.dm4")), key=natural_sort_key)
+        if files_dm4:
+            return files_dm4
+
+        files_dm3 = sorted(list(folder.rglob("*.dm3")), key=natural_sort_key)
+        return files_dm3
+
+    def _compress_frame_indices(self, indices):
+        if not indices:
+            return []
+
+        ranges = []
+        start = indices[0]
+        end = indices[0]
+        for idx in indices[1:]:
+            if idx == end + 1:
+                end = idx
+                continue
+            ranges.append((start, end))
+            start = idx
+            end = idx
+        ranges.append((start, end))
+        return ranges
+
+    def _format_frame_ranges(self, frame_ranges):
+        if not frame_ranges:
+            return "all"
+        parts = []
+        for start, end in frame_ranges:
+            parts.append(str(start) if start == end else f"{start}-{end}")
+        return ", ".join(parts)
+
+    def _parse_frame_indices(self, text, total_frames):
+        text = (text or "").strip()
+        if not text:
+            return None
+
+        indices = set()
+        try:
+            parts = [p.strip() for p in text.split(',')]
+            for part in parts:
+                if not part:
+                    continue
+                if '-' in part:
+                    start_text, end_text = [token.strip() for token in part.split('-', 1)]
+                    if not start_text or not end_text:
+                        return []
+                    start = int(start_text)
+                    end = int(end_text)
+                    start = max(0, start)
+                    end = min(total_frames - 1, end)
+                    if start > end:
+                        return []
+                    indices.update(range(start, end + 1))
+                else:
+                    idx = int(part)
+                    if 0 <= idx < total_frames:
+                        indices.add(idx)
+            return sorted(indices)
+        except ValueError:
+            return []
+
+    def _update_frame_range_hint(self):
+        if not hasattr(self, "frame_range_edit"):
+            return
+
+        files = self._list_import_sequence_files()
+        total_frames = len(files)
+        if total_frames <= 0:
+            self.frame_range_edit.setPlaceholderText("All (Default) or e.g. 0-99")
+            self.frame_range_edit.setToolTip("Supported syntax:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12")
+            self.dose_idx_spin.setRange(-1, 99999)
+            return
+
+        max_frame = total_frames - 1
+        self.frame_range_edit.setPlaceholderText(f"All (Default) or e.g. 0-{max_frame}")
+        self.frame_range_edit.setToolTip(
+            f"Valid frames: 0 to {max_frame}\n"
+            "Supported syntax:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12"
+        )
+        self.dose_idx_spin.setRange(-1, max_frame)
     
     def elide_text(self, text, max_len=60):
         """[Fix] 缩短过长的文本，保留首尾"""
@@ -595,6 +684,15 @@ class ImportWidget(QWidget):
                f"Note: Higher is not always faster (IO/RAM bottlenecks).")
         self.max_workers_spin.setToolTip(tip)
         h_params.addWidget(self.max_workers_spin); l_load.addLayout(h_params)
+
+        h_frame_range = QHBoxLayout()
+        h_frame_range.addWidget(QLabel(tr("Frame Range")))
+        self.frame_range_edit = QLineEdit()
+        self.frame_range_edit.setPlaceholderText("All (Default) or e.g. 0-99")
+        self.frame_range_edit.setToolTip("Supported syntax:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12")
+        h_frame_range.addWidget(self.frame_range_edit)
+        l_load.addLayout(h_frame_range)
+
         # Dynamic Warning Label
         self.lbl_memory_warning = QLabel("")
         self.lbl_memory_warning.setStyleSheet("color: #FF5252; font-size: 10px; font-weight: bold;")
@@ -651,6 +749,7 @@ class ImportWidget(QWidget):
             self.load_btn.setEnabled(True)
             self.calc_dose_btn.setEnabled(True)
             self.pick_file_btn.setEnabled(True)
+            self._update_frame_range_hint()
             
             # === [Req 0] Auto-detect Dataset ID ===
             path_obj = Path(f)
@@ -714,7 +813,7 @@ class ImportWidget(QWidget):
             self.status.setText(tr("Locating file index..."))
             try:
                 target_path = Path(f).resolve()
-                all_files = sorted(list(Path(self.current_folder).rglob("*.dm4")))
+                all_files = self._list_import_sequence_files()
                 found_idx = -1
                 for i, p in enumerate(all_files):
                     if p.resolve() == target_path:
@@ -936,6 +1035,17 @@ class ImportWidget(QWidget):
 
     def _load_data(self):
         if not self.current_folder: return
+        source_files = self._list_import_sequence_files()
+        if not source_files:
+            self.status.setText(f"❌ {tr('Error:')} No DM4 or DM3 files found in folder.")
+            return
+
+        frame_range_text = self.frame_range_edit.text().strip()
+        selected_indices = self._parse_frame_indices(frame_range_text, len(source_files))
+        if frame_range_text and not selected_indices:
+            self.status.setText(f"❌ {tr('Invalid frame range syntax')}")
+            return
+
         if len(self.viewer.layers) > 0:
             reply = QMessageBox.question(
                 self, tr("Confirm Load"), tr("Loading new data will CLEAR ALL current layers.\nContinue?"),
@@ -948,10 +1058,14 @@ class ImportWidget(QWidget):
         
         self.load_btn.setEnabled(False)
         self.progress.setVisible(True)
-        self.status.setText(tr("Loading..."))
+        if selected_indices is None:
+            self.status.setText(tr("Loading..."))
+        else:
+            selected_ranges = self._format_frame_ranges(self._compress_frame_indices(selected_indices))
+            self.status.setText(f"{tr('Loading...')} ({selected_ranges})")
         bit = int(self.bit_depth_combo.currentText())
         workers = self.max_workers_spin.value()
-        self.thread_load = LoaderThread(self.current_folder, bit, workers)
+        self.thread_load = LoaderThread(self.current_folder, bit, workers, frame_indices=selected_indices)
         self.thread_load.progress.connect(lambda c, t: (self.progress.setMaximum(t), self.progress.setValue(c)))
         self.thread_load.finished.connect(self._on_loaded)
         self.thread_load.error.connect(lambda e: (self.status.setText(f"{tr('Error:')} {e}"), self.load_btn.setEnabled(True)))
@@ -963,13 +1077,24 @@ class ImportWidget(QWidget):
         name = f"Original_{Path(self.current_folder).name}"
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         self.viewer.add_image(stack, name=name, metadata=meta, colormap='gray')
-        self.status.setText(tr("Loaded %s frames.") % len(stack))
+        source_total_frames = int(meta.get("source_num_frames", len(stack)))
+        selected_ranges = meta.get("selected_frame_ranges", [])
+        selection_text = self._format_frame_ranges(selected_ranges)
+        if meta.get("frame_selection_applied"):
+            self.status.setText(
+                f"{tr('Loaded %s frames.') % len(stack)} "
+                f"(source: {source_total_frames}, selected: {selection_text})"
+            )
+        else:
+            self.status.setText(tr("Loaded %s frames.") % len(stack))
         
         # === [SessionLogger] 记录 DM4 导入操作 ===
         try:
             get_logger().log_action("import", "load_dm4_sequence", {
                 "source_path": str(self.current_folder),
                 "frame_count": len(stack),
+                "source_total_frames": source_total_frames,
+                "frame_selection": selection_text,
                 "layer_name": name,
                 "bit_depth": int(self.bit_depth_combo.currentText())
             })

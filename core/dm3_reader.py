@@ -14,6 +14,34 @@ from utils.utils import natural_sort_key
 import datetime
 import traceback
 
+
+def _resolve_selected_frame_indices(total_count: int, frame_indices=None) -> list[int]:
+    if frame_indices is None:
+        return list(range(total_count))
+
+    selected = sorted({int(idx) for idx in frame_indices if 0 <= int(idx) < total_count})
+    if not selected:
+        raise ValueError("No valid DM3 frames were selected for import.")
+    return selected
+
+
+def _compress_frame_ranges(frame_indices: list[int]) -> list[list[int]]:
+    if not frame_indices:
+        return []
+
+    ranges = []
+    start = frame_indices[0]
+    end = frame_indices[0]
+    for idx in frame_indices[1:]:
+        if idx == end + 1:
+            end = idx
+            continue
+        ranges.append([start, end])
+        start = idx
+        end = idx
+    ranges.append([start, end])
+    return ranges
+
 # Try importing ncempy
 try:
     import ncempy.io.dm
@@ -175,17 +203,21 @@ def get_first_dm3_shape(filepath: str) -> Optional[Tuple[int, int]]:
 def read_dm3_sequence(folder_path: str, 
                       bit_depth: int = 8,
                       max_workers: int = 8,
-                      progress_callback=None) -> Tuple[np.ndarray, dict]:
+                      progress_callback=None,
+                      frame_indices=None) -> Tuple[np.ndarray, dict]:
     folder = Path(folder_path)
     dm3_files = sorted(folder.glob('**/*.dm3'), key=natural_sort_key)
     
     if not dm3_files:
         raise ValueError(f"No DM3 files found in {folder_path}")
     
-    count = len(dm3_files)
+    total_count = len(dm3_files)
+    selected_indices = _resolve_selected_frame_indices(total_count, frame_indices)
+    selected_files = [dm3_files[idx] for idx in selected_indices]
+    count = len(selected_files)
     
     # 1. Shape
-    shape = get_first_dm3_shape(str(dm3_files[0]))
+    shape = get_first_dm3_shape(str(selected_files[0]))
     if not shape:
         raise ValueError("Failed to read dimensions from first DM3 file")
     
@@ -200,7 +232,7 @@ def read_dm3_sequence(folder_path: str,
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(read_single_dm3_into_buffer, str(f), image_stack, i, bit_depth): i 
-            for i, f in enumerate(dm3_files)
+            for i, f in enumerate(selected_files)
         }
         
         completed = 0
@@ -216,11 +248,15 @@ def read_dm3_sequence(folder_path: str,
     metadata = {
         'source_folder': str(folder),
         'num_frames': count,
+        'source_num_frames': total_count,
         'bit_depth': bit_depth,
         'shape': full_shape,
         'dtype': str(dtype),
-        'memmap_path': temp_file
+        'memmap_path': temp_file,
+        'frame_selection_applied': count != total_count
     }
+    if count != total_count:
+        metadata['selected_frame_ranges'] = _compress_frame_ranges(selected_indices)
     
     return image_stack, metadata
 

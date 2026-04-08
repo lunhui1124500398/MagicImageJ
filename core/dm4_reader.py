@@ -14,6 +14,34 @@ from utils.utils import natural_sort_key
 import os
 import platform
 
+
+def _resolve_selected_frame_indices(total_count: int, frame_indices=None) -> list[int]:
+    if frame_indices is None:
+        return list(range(total_count))
+
+    selected = sorted({int(idx) for idx in frame_indices if 0 <= int(idx) < total_count})
+    if not selected:
+        raise ValueError("No valid DM4 frames were selected for import.")
+    return selected
+
+
+def _compress_frame_ranges(frame_indices: list[int]) -> list[list[int]]:
+    if not frame_indices:
+        return []
+
+    ranges = []
+    start = frame_indices[0]
+    end = frame_indices[0]
+    for idx in frame_indices[1:]:
+        if idx == end + 1:
+            end = idx
+            continue
+        ranges.append([start, end])
+        start = idx
+        end = idx
+    ranges.append([start, end])
+    return ranges
+
 def fix_long_path(path_str: str) -> str:
     """
     修复 Windows 长路径问题
@@ -113,7 +141,8 @@ def get_first_image_shape(filepath: str) -> Optional[Tuple[int, int]]:
 def read_dm4_sequence(folder_path: str, 
                       bit_depth: int = 8,
                       max_workers: int = 8,
-                      progress_callback=None) -> Tuple[np.ndarray, dict]:
+                      progress_callback=None,
+                      frame_indices=None) -> Tuple[np.ndarray, dict]:
     """
     读取文件夹中的DM4序列 (OOM Safe)
     """
@@ -123,11 +152,16 @@ def read_dm4_sequence(folder_path: str,
     if not dm4_files:
         raise ValueError(f"No DM4 files found in {folder_path}")
     
-    count = len(dm4_files)
-    print(f"Found {count} DM4 files")
+    total_count = len(dm4_files)
+    selected_indices = _resolve_selected_frame_indices(total_count, frame_indices)
+    selected_files = [dm4_files[idx] for idx in selected_indices]
+    count = len(selected_files)
+    print(f"Found {total_count} DM4 files")
+    if count != total_count:
+        print(f"Loading {count} selected DM4 frames")
     
     # 1. 预读取获取尺寸
-    shape = get_first_image_shape(str(dm4_files[0]))
+    shape = get_first_image_shape(str(selected_files[0]))
     if not shape:
         raise ValueError("Failed to read dimensions from first file")
     
@@ -143,7 +177,7 @@ def read_dm4_sequence(folder_path: str,
         # 提交任务：直接传入文件名、目标数组引用、目标索引
         futures = {
             executor.submit(read_single_dm4_into_buffer, str(f), image_stack, i, bit_depth): i 
-            for i, f in enumerate(dm4_files)
+            for i, f in enumerate(selected_files)
         }
         
         completed = 0
@@ -160,11 +194,15 @@ def read_dm4_sequence(folder_path: str,
     metadata = {
         'source_folder': str(folder),
         'num_frames': count,
+        'source_num_frames': total_count,
         'bit_depth': bit_depth,
         'shape': full_shape,
         'dtype': str(dtype),
-        'memmap_path': temp_file
+        'memmap_path': temp_file,
+        'frame_selection_applied': count != total_count
     }
+    if count != total_count:
+        metadata['selected_frame_ranges'] = _compress_frame_ranges(selected_indices)
     
     return image_stack, metadata
 
