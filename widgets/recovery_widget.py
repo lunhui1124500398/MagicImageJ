@@ -17,6 +17,314 @@ from pathlib import Path
 import json
 from widgets.settings_widget import GlobalConfig, tr
 import numpy as np
+import gc
+import hashlib
+import math
+from utils.memory_utils import trim_working_set
+from utils.session_logger import NumpyEncoder
+
+
+# ---------------------------------------------------------------------------
+# Param-edit validation (2026-05-29)
+# See discussions/2026-05-29_param_edit_validation_design.md
+#
+# Plan A (全锁): in ActionDetailDialog, lock value cells that are meaningless or
+# dangerous to hand-edit, so the user can't change them and be misled (the
+# original roi_count 2->3 confusion). Only scalar replay INPUTS stay editable
+# (template_frame / angle / kernel_size / bbox / roi_bbox / clip_limit / ...).
+# Plan C (范围+sanity): editable values are range/sanity-checked on save and a
+# violation hard-blocks the write. Note (finding 1): once roi_count is read-only
+# the doc's "roi_count == len(rois)" check is moot — replay reads `rois`, never
+# `roi_count`, and neither can be desynced now — so C is range/sanity on inputs.
+# ---------------------------------------------------------------------------
+# Derived metadata: computed from other fields; editing has no replay effect.
+_RO_DERIVED_KEYS = {"roi_count", "proposal_count", "frame_count", "n_frames",
+                    "total_frames", "total_source_frames", "source_total_frames"}
+# Measured OUTPUTS recorded for info (finding 2); replay re-measures, so a no-op.
+_RO_MEASURED_KEYS = {"max_shift", "max_shift_x", "max_shift_y"}
+# Layer NAME references; renaming here can make replay fail to find the layer.
+_RO_LAYER_KEYS = {"source_layer", "source_layer_name", "view_layer", "data_layer",
+                  "target_layer", "layer_name"}
+# Large structured objects; editing as raw JSON is error-prone.
+_RO_STRUCT_KEYS = {"rois", "frame_info", "frame_indices"}
+# Small structured values that ARE meaningful to hand-edit (kept editable).
+_EDITABLE_STRUCT_WHITELIST = {"bbox", "roi_bbox"}
+
+
+def _param_readonly_reason(key, value):
+    """Return a human reason string if this param key should be read-only in the
+    editor, else None. Centralized + Qt-free so it is unit-testable."""
+    if key in _EDITABLE_STRUCT_WHITELIST:
+        return None
+    if key in _RO_DERIVED_KEYS or key.endswith("_count"):
+        return tr("Derived from other fields (e.g. roi_count = len(rois)); "
+                  "editing it has no effect on recovery.")
+    if key in _RO_MEASURED_KEYS:
+        return tr("A measured output; recovery re-measures this value, "
+                  "so editing it has no effect.")
+    if key in _RO_LAYER_KEYS:
+        return tr("Layer reference; renaming it here can make recovery "
+                  "fail to find the source layer.")
+    if key in _RO_STRUCT_KEYS or isinstance(value, (list, dict)):
+        return tr("Structured data — edit it in its own panel, "
+                  "not as raw JSON here.")
+    return None
+
+
+def _validate_param_changes(changed, total_frames=None):
+    """Range / sanity check edited params (Plan C). Returns a list of error
+    strings; an empty list means OK. Pure (Qt-free) for unit testing.
+    total_frames=None skips the frame upper-bound check (still rejects < 0)."""
+
+    def _as_int(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float) and math.isfinite(v) and float(v).is_integer():
+            return int(v)
+        return None
+
+    def _is_num(v):
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(float(v)))
+
+    errs = []
+    for k, v in changed.items():
+        if k == "template_frame" or k.endswith("_frame"):
+            iv = _as_int(v)
+            if iv is None or iv < 0:
+                errs.append(tr("%s: must be a non-negative integer frame index (got %r)") % (k, v))
+            elif total_frames is not None and iv >= total_frames:
+                errs.append(tr("%s: frame %s is out of range [0, %s]") % (k, iv, total_frames - 1))
+        elif k in ("bbox", "roi_bbox"):
+            if (not isinstance(v, (list, tuple)) or len(v) != 4
+                    or not all(_is_num(x) for x in v)):
+                errs.append(tr("%s: must be 4 numbers [x1, y1, x2, y2] (got %r)") % (k, v))
+            else:
+                x1, y1, x2, y2 = v
+                if not (x2 > x1 and y2 > y1):
+                    errs.append(tr("%s: requires x2 > x1 and y2 > y1 (got %s)") % (k, list(v)))
+        elif k == "clip_limit":
+            if not _is_num(v) or float(v) <= 0:
+                errs.append(tr("%s: must be a positive finite number (got %r)") % (k, v))
+        elif k == "kernel_size":
+            iv = _as_int(v)
+            if iv is None or iv <= 0:
+                errs.append(tr("%s: must be a positive integer (got %r)") % (k, v))
+        elif k == "angle":
+            if not _is_num(v):
+                errs.append(tr("%s: must be a finite number (got %r)") % (k, v))
+    return errs
+
+
+def _action_display_class(action, undone_ids):
+    """Decide how the Recovery action list should treat an action w.r.t. undo.
+
+    Background (2026-05-30 bug): the drift "Apply → Ctrl+Z → retry another
+    kernel" loop logs an `undo` record per reverted preview. Replay already
+    excludes undone actions (session_logger.effective_actions_for_replay), but
+    `_populate_action_list` was *hiding* every undone action — so repeated drift
+    trials collapsed to just the last non-undone one and looked "overwritten".
+
+    A reverted **trial** is still exploration history the user wants to see (and
+    may deliberately re-select), so we keep it visible but dimmed + unchecked.
+    Non-trial undone actions (e.g. a reverted crop) stay hidden as before.
+
+    Returns: 'undone_trial' | 'hidden' | 'normal'.
+    """
+    if action.get("id") in undone_ids:
+        return "undone_trial" if action.get("state") == "trial" else "hidden"
+    return "normal"
+
+
+class ActionDetailDialog(QDialog):
+    """Issue #5: Session 操作详情对话框。
+
+    上半部只读：widget / action / 当前状态 / 受哪些 edit_records 影响 / 时间 / 结果。
+    下半部可编辑 params（键只读、值可改，按 JSON 解析）。点击 OK 仅返回相对原始
+    params 真正变化的键，由调用方写成非破坏性的 update_params edit_record——
+    不触碰原始 actions[]，因此不破坏会话校验和。
+    """
+
+    def __init__(self, action, session=None, parent=None):
+        super().__init__(parent)
+        from qtpy.QtWidgets import (QVBoxLayout, QFormLayout, QLabel, QTableWidget,
+                                    QTableWidgetItem, QDialogButtonBox, QHeaderView,
+                                    QGroupBox)
+        self._action = action if isinstance(action, dict) else {}
+        self._session = session if isinstance(session, dict) else {}
+        params = self._action.get("params", {})
+        self._orig_params = params if isinstance(params, dict) else {}
+
+        self.setWindowTitle(tr("Action Details"))
+        self.resize(560, 580)
+        root = QVBoxLayout(self)
+
+        # --- 只读概要 ---
+        info_box = QGroupBox(tr("Overview (read-only)"))
+        form = QFormLayout()
+
+        def _ro(v):
+            lab = QLabel("" if v is None else str(v))
+            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lab.setWordWrap(True)
+            return lab
+
+        form.addRow(tr("Widget:"), _ro(self._action.get("widget", "")))
+        form.addRow(tr("Action:"), _ro(self._action.get("action", "")))
+        form.addRow(tr("State:"), _ro(self._action.get("state", "current")))
+        form.addRow(tr("Action ID:"), _ro(self._action.get("id", "")))
+        form.addRow(tr("Timestamp:"), _ro(self._action.get("timestamp", "")))
+        my_id = self._action.get("id")
+        affecting = [er.get("edit_type", "?") for er in self._session.get("edit_records", [])
+                     if er.get("target_action_id") == my_id]
+        if affecting:
+            form.addRow(tr("Edits applied:"), _ro(", ".join(affecting)))
+        result = self._action.get("result")
+        if result not in (None, ""):
+            form.addRow(tr("Result:"), _ro(result))
+        info_box.setLayout(form)
+        root.addWidget(info_box)
+
+        # --- 可编辑参数 ---
+        edit_box = QGroupBox(tr("Parameters (editable — saved as a non-destructive edit)"))
+        from qtpy.QtWidgets import QVBoxLayout as _VBox
+        ebl = _VBox()
+        hint = QLabel(tr("Gray rows are read-only (derived / measured / structured / "
+                         "layer refs). Edit an editable value then click OK; values "
+                         "are parsed as JSON (e.g. 12, 1.5, true, [1,2], \"text\")."))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        ebl.addWidget(hint)
+
+        from qtpy.QtGui import QColor, QBrush
+        self._row_keys = list(self._orig_params.keys())
+        self._editable_keys = []     # keys whose value cell stays editable (Plan A)
+        self._table = QTableWidget(len(self._row_keys), 2)
+        self._table.setHorizontalHeaderLabels([tr("Key"), tr("Value")])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        for r, k in enumerate(self._row_keys):
+            val = self._orig_params[k]
+            key_item = QTableWidgetItem(str(k))
+            key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)  # 键不可改
+            self._table.setItem(r, 0, key_item)
+            val_item = QTableWidgetItem(self._value_to_text(val))
+            reason = _param_readonly_reason(k, val)
+            if reason is not None:
+                # Plan A: 派生/测量/结构化/层名引用 → 只读 + 灰显 + tooltip 说明原因
+                val_item.setFlags(val_item.flags() & ~Qt.ItemIsEditable)
+                gray = QBrush(QColor("#888888"))
+                val_item.setForeground(gray)
+                key_item.setForeground(gray)
+                val_item.setToolTip(reason)
+                key_item.setToolTip(reason)
+            else:
+                self._editable_keys.append(k)
+            self._table.setItem(r, 1, val_item)
+        ebl.addWidget(self._table)
+        if not self._row_keys:
+            none_lab = QLabel(tr("(This action has no editable parameters.)"))
+            none_lab.setStyleSheet("color: #888;")
+            ebl.addWidget(none_lab)
+        edit_box.setLayout(ebl)
+        root.addWidget(edit_box)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    @staticmethod
+    def _value_to_text(v):
+        if isinstance(v, str):
+            return v
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+
+    @staticmethod
+    def _parse_text(text, original):
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            # 解析失败：原值本是字符串就按文本保存，否则也退回原始文本
+            return text
+
+    def accept(self):
+        # [Issue #5] 用户点 OK 或按 Enter 时, 正在编辑的单元格可能还没提交,
+        # item.text() 仍是旧值 → get_changed_params() 误判为"无改动"。先把焦点移出
+        # 表格触发 delegate 提交, 再接受对话框。
+        try:
+            self._table.setFocus(Qt.OtherFocusReason)
+        except Exception:
+            pass
+        # Plan C: 提交前做范围/sanity 校验; 不通过则弹窗+保持对话框打开(保留用户已输入),
+        # 不写 edit_record。校验在对话框内完成, 故 exec_() 返回 Accepted 即保证合法。
+        changed = self.get_changed_params()
+        errs = self._validate_changes(changed) if changed else []
+        if errs:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, tr("Invalid Parameter Edit"),
+                tr("These edits were NOT saved. Fix the values and click OK again:")
+                + "\n\n• " + "\n• ".join(errs)
+            )
+            return  # keep dialog open, edits intact
+        super().accept()
+
+    def get_changed_params(self):
+        """返回相对原始 params 真正发生变化的键值（仅这些键写入 update_params）。
+        只读(派生/测量/结构化/层名)键不在 _editable_keys 中, 不参与改动检测。"""
+        changed = {}
+        for r, k in enumerate(self._row_keys):
+            if k not in self._editable_keys:
+                continue
+            item = self._table.item(r, 1)
+            if item is None:
+                continue
+            new_val = self._parse_text(item.text(), self._orig_params.get(k))
+            if new_val != self._orig_params.get(k):
+                changed[k] = new_val
+        return changed
+
+    def _resolve_total_frames(self):
+        """Best-effort frame count for range-checking frame indices: the nearest
+        PRECEDING import action's total_frames, else the max found in the session.
+        Returns None if no import action recorded a frame count."""
+        actions = self._session.get("actions", []) if isinstance(self._session, dict) else []
+
+        def frames_of(a):
+            p = a.get("params", {}) or {}
+            for kk in ("total_frames", "total_source_frames", "source_total_frames",
+                       "frame_count", "n_frames"):
+                vv = p.get(kk)
+                if isinstance(vv, (int, float)) and not isinstance(vv, bool) and vv > 0:
+                    return int(vv)
+            return None
+
+        my_id = self._action.get("id")
+        my_idx = next((i for i, a in enumerate(actions) if a.get("id") == my_id), None)
+        if my_idx is not None:
+            for j in range(my_idx, -1, -1):
+                a = actions[j]
+                if a.get("widget") == "import" or str(a.get("action", "")).startswith("load_"):
+                    f = frames_of(a)
+                    if f:
+                        return f
+        best = None
+        for a in actions:
+            f = frames_of(a)
+            if f is not None and (best is None or f > best):
+                best = f
+        return best
+
+    def _validate_changes(self, changed):
+        """Plan C: range/sanity check the edited (editable) params before saving."""
+        return _validate_param_changes(changed, self._resolve_total_frames())
 
 
 class RecoveryWidget(QWidget):
@@ -39,15 +347,21 @@ class RecoveryWidget(QWidget):
         self.data_sources = []  # 当前会话的数据源
         self.manual_log_path = None  # 手动选择的日志路径
         self._manual_mode_active = False  # 手动模式激活标志
+        self._last_sessions_mtime = 0  # 上次检测到的 session 目录/文件 mtime (含文件级以捕获 in-place 编辑)
+        self._last_sessions_count = 0  # 上次检测到的文件数
+        # Phase 2 (2026-05-29): chapter selection state
+        self._session_chapters_sorted = []     # sorted chapter list for current session
+        self._included_chapter_ids = None      # set of chapter ids replay will include; None = no chapters
+        self._chapter_checkboxes = []          # list of (chapter_id, QCheckBox)
         self._setup_ui()
         self._refresh_sessions()
         self._setup_shortcuts()
-        
-        # 实时刷新定时器 (5秒)
+
+        # 定时器仅做 dirty-check，不全量刷新
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.timeout.connect(self._refresh_sessions)
+        self._refresh_timer.timeout.connect(self._check_sessions_dirty)
         self._refresh_timer.start(5000)
-        
+
         # 首次使用时检测 Everything
         QTimer.singleShot(1000, self._check_everything_hint)
     
@@ -236,11 +550,42 @@ class RecoveryWidget(QWidget):
             # 显示详情
             self._show_session_details()
     
-    def _refresh_sessions(self):
+    def _check_sessions_dirty(self):
+        """定时检查 session 目录是否有变化, 仅在变化时才刷新列表。
+
+        Phase 2 fix: 用 max(file.stat().st_mtime for file in *.json) 而不是目录 mtime —
+        在 Windows 上目录 mtime 不会因目录内文件 in-place 编辑 (save_async 写回) 而变化,
+        导致同一文件 starred/label 修改后, 列表无法自动刷新。
+        """
+        from utils.session_logger import SessionLogger
+        search_dirs = SessionLogger._get_search_dirs()
+        combined_mtime = 0.0
+        combined_count = 0
+        for d in search_dirs:
+            try:
+                # Include directory mtime (catches add/remove)
+                combined_mtime = max(combined_mtime, d.stat().st_mtime)
+                for f in d.glob("*_session.json"):
+                    combined_count += 1
+                    try:
+                        combined_mtime = max(combined_mtime, f.stat().st_mtime)
+                    except OSError:
+                        pass
+            except OSError:
+                continue
+        if combined_mtime != self._last_sessions_mtime or combined_count != self._last_sessions_count:
+            self._last_sessions_mtime = combined_mtime
+            self._last_sessions_count = combined_count
+            self._refresh_sessions(preserve_details=True)
+
+    def _refresh_sessions(self, preserve_details=False):
         """刷新会话列表 - 支持筛选、归档优先排序、实时刷新"""
         from utils.session_logger import SessionLogger
-        
-        # 保存当前选中项以便恢复
+
+        # 保存当前选中的 session_id 以便恢复
+        current_session_id = None
+        if self.current_session:
+            current_session_id = self.current_session.get("session_id")
         current_idx = None
         if self.session_list.currentItem():
             current_idx = self.session_list.currentItem().data(Qt.UserRole)
@@ -315,9 +660,23 @@ class RecoveryWidget(QWidget):
             self.session_list.addItem(item)
         
         # 恢复选中项 (手动模式时跳过，避免覆盖手动选择的会话)
-        if not self._manual_mode_active and current_idx is not None and current_idx < self.session_list.count():
-            self.session_list.setCurrentRow(current_idx)
-        
+        if not self._manual_mode_active and current_session_id:
+            # 按 session_id 恢复，而非 row index
+            self.session_list.blockSignals(True)
+            restored = False
+            for i in range(self.session_list.count()):
+                idx = self.session_list.item(i).data(Qt.UserRole)
+                if idx is not None and idx < len(self.sessions):
+                    if self.sessions[idx].get("session_id") == current_session_id:
+                        self.session_list.setCurrentRow(i)
+                        restored = True
+                        break
+            self.session_list.blockSignals(False)
+            if not restored and not preserve_details:
+                self._show_session_details()
+        elif not self._manual_mode_active and not preserve_details:
+            pass  # 无之前选中，不做动作
+
         # 显示空状态如果没有会话
         if self.session_list.count() == 0:
             self._show_empty_state()
@@ -424,35 +783,73 @@ class RecoveryWidget(QWidget):
             
             g_data.setLayout(d_layout)
             self.details_layout.addWidget(g_data)
-        
+
+        # === 2.5. Chapter 选择 (Phase 2 - 2026-05-29) ===
+        # Surface chapter segmentation so users can choose to include historical loads.
+        # Default: only "current" chapters are checked. Replay obeys the active set.
+        actions_raw = session.get("actions", [])
+        chapters_raw = session.get("chapters", [])
+        if not chapters_raw and actions_raw:
+            # Backward compat: legacy session — wrap as single current chapter
+            chapters_raw = [{
+                "id": "_legacy",
+                "start_action_index": 0,
+                "label": "(legacy session)",
+                "status": "current",
+            }]
+        self._session_chapters_sorted = sorted(
+            chapters_raw, key=lambda c: c.get("start_action_index", 0)
+        )
+        self._included_chapter_ids = {
+            ch["id"] for ch in self._session_chapters_sorted
+            if ch.get("status") == "current"
+        }
+        self._chapter_checkboxes = []
+
+        if len(self._session_chapters_sorted) > 1:
+            g_chapters = QGroupBox(tr("Chapters (toggle to include historical loads)"))
+            ch_layout = QVBoxLayout()
+            hint = QLabel(
+                f"<i style='color:#888;'>{tr('Each load_dm4 / load_png / load_tiff starts a new chapter. By default only the current chapter is replayed.')}</i>"
+            )
+            hint.setWordWrap(True)
+            ch_layout.addWidget(hint)
+            for ch in self._session_chapters_sorted:
+                cb = QCheckBox(self._format_chapter_label(ch, actions_raw))
+                is_current = ch.get("status") == "current"
+                cb.setChecked(is_current)
+                if not is_current:
+                    cb.setStyleSheet("color: #888;")
+                cb.toggled.connect(
+                    lambda v, cid=ch["id"]: self._on_chapter_toggled(cid, v)
+                )
+                ch_layout.addWidget(cb)
+                self._chapter_checkboxes.append((ch["id"], cb))
+            g_chapters.setLayout(ch_layout)
+            self.details_layout.addWidget(g_chapters)
+
         # === 3. 可恢复操作列表 ===
         g_actions = QGroupBox(tr("Recoverable Actions"))
         a_layout = QVBoxLayout()
-        
+
         self.action_list = QListWidget()
         self.action_list.setSelectionMode(QListWidget.MultiSelection)
         self.action_list.setMaximumHeight(200)
-        
-        effective_actions = self._get_effective_actions(session)
-        
-        if effective_actions:
-            for action in effective_actions:
-                widget_name = action.get("widget", "unknown")
-                action_name = action.get("action", "unknown")
-                timestamp = action.get("timestamp", "")[:19]
-                
-                display_text = f"[{widget_name}] {action_name} - {timestamp}"
-                
-                item = QListWidgetItem(display_text)
-                item.setData(Qt.UserRole, action)
-                item.setSelected(True)
-                self.action_list.addItem(item)
-        else:
-            self.action_list.addItem(QListWidgetItem("(No recoverable actions)"))
-        
+        # Phase 6 (2026-05-29): right-click menu for edit_records (disable/enable/delete)
+        self.action_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.action_list.customContextMenuRequested.connect(self._on_action_context_menu)
+        # Issue #5: 双击操作 → 打开详情/参数编辑对话框
+        self.action_list.itemDoubleClicked.connect(self._on_action_double_clicked)
+
+        # Phase 6: Apply existing edit_records to the in-memory session before render
+        # so visuals reflect prior user decisions immediately.
+        self._apply_edit_records_inplace(session)
+
+        self._populate_action_list(session)
+
         a_layout.addWidget(self.action_list)
         
-        # 全选/取消全选
+        # 全选/取消全选 + Phase 5: Commit selected trials
         h_select = QHBoxLayout()
         btn_select_all = QPushButton(tr("Select All"))
         btn_select_all.clicked.connect(lambda: self._select_all_actions(True))
@@ -461,6 +858,14 @@ class RecoveryWidget(QWidget):
         h_select.addWidget(btn_select_all)
         h_select.addWidget(btn_deselect_all)
         h_select.addStretch()
+        # Phase 5 (2026-05-29): Commit selected trials to committed
+        btn_commit = QPushButton(f"✅ {tr('Commit Selected Trials')}")
+        btn_commit.setToolTip(tr(
+            "Promote selected trial actions to committed (persists to session JSON). "
+            "Committed actions are always replayed."
+        ))
+        btn_commit.clicked.connect(self._commit_selected_trials)
+        h_select.addWidget(btn_commit)
         a_layout.addLayout(h_select)
         
         g_actions.setLayout(a_layout)
@@ -492,13 +897,19 @@ class RecoveryWidget(QWidget):
         btn_abandon = QPushButton(f"🗑️ {tr('Abandon Session')}")
         btn_abandon.setStyleSheet("background-color: #8B0000;")
         btn_abandon.clicked.connect(self._abandon_session)
-        
+
+        btn_continue = QPushButton(f"▶️ {tr('Continue Session')}")
+        btn_continue.setStyleSheet("background-color: #1565C0; font-weight: bold; padding: 8px 16px;")
+        btn_continue.setToolTip(tr("Resume recording to this session (append new actions)"))
+        btn_continue.clicked.connect(self._continue_session)
+
         btn_recover = QPushButton(f"✅ {tr('Start Recovery')}")
         btn_recover.setStyleSheet("background-color: #2E7D32; font-weight: bold; padding: 8px 16px;")
         btn_recover.clicked.connect(self._recover_selected)
-        
+
         h_btns.addWidget(btn_abandon)
         h_btns.addStretch()
+        h_btns.addWidget(btn_continue)
         h_btns.addWidget(btn_recover)
         
         self.details_layout.addLayout(h_btns)
@@ -603,31 +1014,536 @@ class RecoveryWidget(QWidget):
         return sources
     
     def _get_effective_actions(self, session_data):
-        """获取有效操作 (排除 undo 和 system)"""
+        """获取有效操作 (排除 undo 和 system, 按 chapter 过滤 - Phase 2)。
+
+        chapter 过滤规则:
+        - 如果 session 有 chapters 字段: 只返回 self._included_chapter_ids 集合内的 action
+        - 如果 session 没有 chapters 字段 (旧 session): 视为全部 current, 全部返回
+        - 如果 self._included_chapter_ids 未初始化 (调用 _get_data_sources 等场景): 不做 chapter 过滤
+        """
         actions = session_data.get("actions", [])
-        
+        chapters = session_data.get("chapters", [])
+
+        # Backward compat: legacy session with actions but no chapters
+        if not chapters and actions:
+            chapters = [{
+                "id": "_legacy",
+                "start_action_index": 0,
+                "status": "current",
+            }]
+
+        # Use the user-toggleable inclusion set if available; else default to current
+        included = None
+        if hasattr(self, '_included_chapter_ids') and self._included_chapter_ids is not None:
+            included = self._included_chapter_ids
+        elif chapters:
+            included = {ch["id"] for ch in chapters if ch.get("status") == "current"}
+
+        sorted_chs = sorted(chapters, key=lambda c: c.get("start_action_index", 0))
+
+        def find_chapter_id(action_idx):
+            cur = None
+            for ch in sorted_chs:
+                if ch.get("start_action_index", 0) <= action_idx:
+                    cur = ch["id"]
+                else:
+                    break
+            return cur
+
         undone_ids = set()
         for action in actions:
             if action.get("action") == "undo":
                 target = action.get("params", {}).get("target")
                 if target:
                     undone_ids.add(target)
-        
+
         effective = []
-        for action in actions:
+        for i, action in enumerate(actions):
             action_id = action.get("id", "")
             action_type = action.get("action", "")
             widget = action.get("widget", "")
-            
+
             if action_type == "undo" or widget == "system":
                 continue
-            
             if action_id in undone_ids:
                 continue
-            
+            if included is not None and find_chapter_id(i) not in included:
+                continue
+
             effective.append(action)
-        
+
         return effective
+
+    # ------------------------------------------------------------------
+    # Phase 2 (2026-05-29): Chapter UI helpers
+    # ------------------------------------------------------------------
+    def _format_chapter_label(self, ch, actions):
+        """Build the display label for a chapter checkbox."""
+        label = ch.get("label", "(no label)")
+        status = ch.get("status", "current")
+        start = ch.get("start_action_index", 0)
+        # Find end of chapter (start of next chapter or len(actions))
+        idx_in_sorted = next(
+            (i for i, c in enumerate(self._session_chapters_sorted) if c["id"] == ch["id"]),
+            -1
+        )
+        if 0 <= idx_in_sorted < len(self._session_chapters_sorted) - 1:
+            end = self._session_chapters_sorted[idx_in_sorted + 1].get(
+                "start_action_index", len(actions)
+            )
+        else:
+            end = len(actions)
+        n_actions = max(0, end - start)
+        status_text = tr("current") if status == "current" else tr("historical")
+        return f"[{status_text}] {label} — {n_actions} {tr('actions')}"
+
+    def _on_chapter_toggled(self, chapter_id, included):
+        if not hasattr(self, '_included_chapter_ids') or self._included_chapter_ids is None:
+            self._included_chapter_ids = set()
+        if included:
+            self._included_chapter_ids.add(chapter_id)
+        else:
+            self._included_chapter_ids.discard(chapter_id)
+        # Refresh the action list to reflect new chapter inclusion
+        if self.current_session is not None:
+            self._populate_action_list(self.current_session)
+
+    def _populate_action_list(self, session):
+        """Fill (or refill) self.action_list based on chapter inclusion + action state.
+
+        Phase 3 (2026-05-29): render per-action state:
+          - current   → normal text, selected by default (replay)
+          - historical→ gray text, NOT selected (user can manually select)
+          - disabled  → red strikethrough, NOT selected (Phase 6 will use; we render now)
+        Selection state is transient; we do NOT mutate the session JSON here.
+        """
+        from qtpy.QtGui import QFont, QColor, QBrush
+
+        if not hasattr(self, 'action_list') or self.action_list is None:
+            return
+        self.action_list.clear()
+        # Phase 3: bypass chapter filter for state-only rendering. We want to show
+        # historical chapter actions too so the user can see and selectively
+        # include them. The _get_effective_actions chapter filter is honored only
+        # at "Start Recovery" time (which reads action_list selection).
+        all_actions = session.get("actions", [])
+
+        # [Issue #5] 哪些 action 被 update_params 编辑过 → 列表项加 ✏️ 标记, 让"改了参数"看得见
+        edited_ids = {er.get("target_action_id") for er in session.get("edit_records", [])
+                      if er.get("edit_type") == "update_params"}
+
+        # undone filter
+        undone_ids = set()
+        for a in all_actions:
+            if a.get("action") == "undo":
+                tgt = a.get("params", {}).get("target")
+                if tgt:
+                    undone_ids.add(tgt)
+
+        # Chapter id lookup helper (for highlighting chapters in title)
+        chapters = session.get("chapters", [])
+        sorted_chs = sorted(chapters, key=lambda c: c.get("start_action_index", 0))
+        def find_chapter_id(action_idx):
+            cur = None
+            for ch in sorted_chs:
+                if ch.get("start_action_index", 0) <= action_idx:
+                    cur = ch["id"]
+                else:
+                    break
+            return cur
+
+        included = self._included_chapter_ids if self._included_chapter_ids is not None else None
+
+        shown = 0
+        for i, action in enumerate(all_actions):
+            widget_name = action.get("widget", "unknown")
+            action_name = action.get("action", "unknown")
+            if widget_name == "system" or action_name == "undo":
+                continue
+            disp_class = _action_display_class(action, undone_ids)
+            if disp_class == "hidden":
+                continue
+            is_undone_trial = (disp_class == "undone_trial")
+            # Skip if outside selected chapters (chapter checkbox controls this)
+            if included is not None and find_chapter_id(i) not in included:
+                continue
+
+            timestamp = action.get("timestamp", "")[:19]
+            state = action.get("state", "current")
+
+            # Phase 5/6 (2026-05-29): also render trial / committed / _deleted visual classes
+            prefix = ""
+            if state == "historical":
+                prefix = "📜 "
+            elif state == "disabled":
+                prefix = "🚫 "
+            elif state == "_deleted":
+                prefix = "🗑️ "
+            elif state == "trial":
+                prefix = "🧪 "
+            elif state == "committed":
+                prefix = "✅ "
+            edit_marker = " ✏️" if action.get("id") in edited_ids else ""
+            undone_marker = " ↩️" if is_undone_trial else ""
+            display_text = f"{prefix}[{widget_name}] {action_name} - {timestamp}{edit_marker}{undone_marker}"
+
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, action)
+            if edit_marker:
+                item.setToolTip(tr("Parameters edited (double-click to view/edit)."))
+
+            if state == "historical":
+                item.setForeground(QBrush(QColor("#888888")))
+                item.setSelected(False)
+            elif state == "disabled":
+                font = QFont()
+                font.setStrikeOut(True)
+                item.setFont(font)
+                item.setForeground(QBrush(QColor("#D32F2F")))
+                item.setSelected(False)
+            elif state == "_deleted":
+                font = QFont()
+                font.setStrikeOut(True)
+                item.setFont(font)
+                item.setForeground(QBrush(QColor("#B71C1C")))
+                item.setSelected(False)
+            elif state == "trial":
+                if is_undone_trial:
+                    # Reverted (Ctrl+Z) trial kept as exploration history: dim + italic,
+                    # never auto-selected (replay excludes undone). Still selectable so
+                    # the user can deliberately re-include it.
+                    f = QFont()
+                    f.setItalic(True)
+                    item.setFont(f)
+                    item.setForeground(QBrush(QColor("#9E9E9E")))
+                    item.setSelected(False)
+                    item.setToolTip(tr("Reverted with Ctrl+Z (kept as history); "
+                                       "not replayed unless you select it."))
+                else:
+                    # Light gray + selected only if last NON-undone trial of this key
+                    item.setForeground(QBrush(QColor("#AAAAAA")))
+                    item.setSelected(self._is_last_trial_of_key(all_actions, i, undone_ids))
+            elif state == "committed":
+                # Slight emphasis but readable
+                item.setForeground(QBrush(QColor("#4CAF50")))
+                item.setSelected(True)
+            else:  # current (legacy/default)
+                item.setSelected(True)
+
+            self.action_list.addItem(item)
+            shown += 1
+
+        if shown == 0:
+            self.action_list.addItem(
+                QListWidgetItem(tr("(No actions in selected chapters)"))
+            )
+
+    # Phase 6 (2026-05-29): right-click action menu for edit_records.
+    def _on_action_context_menu(self, pos):
+        from qtpy.QtWidgets import QMenu
+        item = self.action_list.itemAt(pos)
+        if item is None:
+            return
+        payload = item.data(Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        menu = QMenu(self.action_list)
+        act_detail = menu.addAction(f"🔍 {tr('View / Edit Details')}")
+        menu.addSeparator()
+        act_enable = menu.addAction(f"✅ {tr('Enable (clear disable/delete)')}")
+        act_disable = menu.addAction(f"🚫 {tr('Disable')}")
+        # Issue #6: 回到原始(章节自动判定)状态——唯一能让操作重新回到 historical(羊皮纸) 的入口
+        act_reset = menu.addAction(f"🔄 {tr('Reset to original state')}")
+        menu.addSeparator()
+        act_delete = menu.addAction(f"🗑️ {tr('Delete')}")
+        chosen = menu.exec_(self.action_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_detail:
+            self._open_action_detail(payload)
+        elif chosen == act_enable:
+            self._add_edit_record_to_session("enable", payload.get("id"))
+        elif chosen == act_disable:
+            self._add_edit_record_to_session("disable", payload.get("id"))
+        elif chosen == act_reset:
+            self._add_edit_record_to_session("reset", payload.get("id"))
+        elif chosen == act_delete:
+            self._add_edit_record_to_session("delete", payload.get("id"))
+
+    def _on_action_double_clicked(self, item):
+        """Issue #5: 双击一条操作 → 打开详情/参数编辑对话框。"""
+        if item is None:
+            return
+        payload = item.data(Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        self._open_action_detail(payload)
+
+    def _open_action_detail(self, action):
+        """Issue #5: 详情对话框——上半只读(widget/action/state/时间/结果)，下半可编辑参数。
+        参数改动写成非破坏性的 update_params edit_record，不触碰原始 actions[] 与校验和。"""
+        if not isinstance(action, dict):
+            return
+        dlg = ActionDetailDialog(action, session=self.current_session, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            changed = dlg.get_changed_params()
+            if changed:
+                self._add_edit_record_to_session(
+                    "update_params", action.get("id"), new_params=changed
+                )
+                # [Issue #5] 明确反馈, 否则用户"看不出改了什么"
+                summary = ", ".join(f"{k}={v}" for k, v in changed.items())
+                QMessageBox.information(
+                    self, tr("Parameter Edit"),
+                    tr("Saved %d change(s): %s\n\nThe action now shows ✏️ in the list; "
+                       "recovery will replay with the new parameters.") % (len(changed), summary)
+                )
+            else:
+                QMessageBox.information(
+                    self, tr("Parameter Edit"), tr("No parameter changes detected.")
+                )
+
+    def _add_edit_record_to_session(self, edit_type, target_action_id, new_params=None):
+        """Append an edit_record to the session JSON and refresh UI.
+
+        Edit_records do NOT mutate actions[], so checksum stays valid.
+        new_params: 仅 edit_type=='update_params' 时使用（被编辑的参数键值）。
+        """
+        import uuid as _uuid
+
+        if not self.current_session or not target_action_id:
+            return
+
+        # [Issue #5] 若编辑的是当前活动(正在记录)的会话, 直接写文件会被实时 logger 的下次保存覆盖
+        # (这正是 edit_records 落盘后又变空的原因)。这种情况改走 logger.add_edit_record 持久化。
+        # 用 _instance 而非 get_logger(), 避免在 recovery 里误创建一个新 logger。
+        try:
+            from utils.session_logger import SessionLogger
+            live = SessionLogger._instance
+        except Exception:
+            live = None
+        if (live is not None and getattr(live, 'session_id', None)
+                and live.session_id == self.current_session.get('session_id')):
+            try:
+                if edit_type == "update_params":
+                    live.add_edit_record(edit_type, target_action_id, new_params=new_params or {})
+                else:
+                    live.add_edit_record(edit_type, target_action_id)
+            except Exception as e:
+                QMessageBox.critical(self, tr("Edit Record"), str(e))
+                return
+            self.current_session["edit_records"] = list(getattr(live, 'edit_records', []))
+            self._apply_edit_records_inplace(self.current_session)
+            self._populate_action_list(self.current_session)
+            try:
+                self.action_list.viewport().update()
+            except Exception:
+                pass
+            return
+
+        log_path_str = self.current_session.get("_log_path", "")
+        if not log_path_str:
+            return
+        log_path = Path(log_path_str)
+        if not log_path.exists():
+            QMessageBox.warning(self, tr("Edit Record"), tr("Session file not found."))
+            return
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, tr("Edit Record"), str(e))
+            return
+        recs = data.get("edit_records", [])
+        rec = {
+            "id": f"edit_{_uuid.uuid4().hex[:8]}",
+            "edit_type": edit_type,
+            "target_action_id": target_action_id,
+            "timestamp": __import__("datetime").datetime.now().isoformat(),
+        }
+        if edit_type == "update_params":
+            rec["new_params"] = new_params or {}
+        recs.append(rec)
+        data["edit_records"] = recs
+        try:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, tr("Edit Record"), str(e))
+            return
+        # Apply same change to in-memory session
+        self.current_session["edit_records"] = recs
+        # Visual update: re-derive effective state by applying edit_records locally
+        self._apply_edit_records_inplace(self.current_session)
+        self._populate_action_list(self.current_session)
+        self.action_list.viewport().update()
+
+    def _apply_edit_records_inplace(self, session_data):
+        """For UI rendering: mutate a COPY of actions' state field according to edit_records.
+
+        This does NOT touch session JSON's actions array on disk (we only write edit_records).
+        It only updates the in-memory dicts used by _populate_action_list so the
+        right styling appears immediately after the user right-clicks.
+        """
+        actions = session_data.get("actions", [])
+        # Issue #6: 捕获一次原始状态/参数（首次应用前 actions[] 即磁盘上的章节原始态），
+        # 供 reset 回退使用；这些 _orig_* 键只存在于内存，不会写回磁盘。
+        for a in actions:
+            if "_orig_state" not in a:
+                a["_orig_state"] = a.get("state", "current")
+            if "_orig_params" not in a and isinstance(a.get("params"), dict):
+                a["_orig_params"] = dict(a["params"])
+        # 每次都先复位到原始再按序重放全部 edit_records，避免多次调用时状态/参数累积串味
+        for a in actions:
+            a["state"] = a.get("_orig_state", a.get("state", "current"))
+            if "_orig_params" in a:
+                a["params"] = dict(a["_orig_params"])
+
+        recs = session_data.get("edit_records", [])
+        if not recs:
+            return
+        # Index actions for fast lookup
+        actions_by_id = {a.get("id"): a for a in actions}
+        for er in recs:
+            tgt = er.get("target_action_id")
+            a = actions_by_id.get(tgt)
+            if a is None:
+                continue
+            etype = er.get("edit_type")
+            if etype == "disable":
+                a["state"] = "disabled"
+            elif etype == "enable":
+                a["state"] = "current"
+            elif etype == "delete":
+                a["state"] = "_deleted"
+            elif etype == "reset":
+                # Issue #6: 回到原始状态(含 historical)并还原参数
+                a["state"] = a.get("_orig_state", "current")
+                if "_orig_params" in a:
+                    a["params"] = dict(a["_orig_params"])
+            elif etype == "update_params":
+                # Issue #5: 把编辑后的参数并入显示，使详情对话框再次打开时反映改动
+                if isinstance(a.get("params"), dict):
+                    a["params"] = {**a["params"], **er.get("new_params", {})}
+                else:
+                    a["params"] = dict(er.get("new_params", {}))
+
+    # Phase 5 (2026-05-29): Commit selected trial actions to "committed" in JSON.
+    def _commit_selected_trials(self):
+        """Walk action_list. For each selected item whose state is 'trial', flip to
+        'committed' and write back to the session JSON file in place."""
+        if not self.current_session:
+            return
+        log_path_str = self.current_session.get("_log_path", "")
+        if not log_path_str:
+            QMessageBox.warning(self, tr("Commit Trials"), tr("Session log path missing."))
+            return
+        log_path = Path(log_path_str)
+        if not log_path.exists():
+            QMessageBox.warning(self, tr("Commit Trials"), tr("Session file not found."))
+            return
+
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, tr("Commit Trials"), str(e))
+            return
+
+        targets = set()
+        for i in range(self.action_list.count()):
+            item = self.action_list.item(i)
+            if item is None or not item.isSelected():
+                continue
+            payload = item.data(Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("state") == "trial":
+                aid = payload.get("id")
+                if aid:
+                    targets.add(aid)
+
+        if not targets:
+            QMessageBox.information(
+                self, tr("Commit Trials"),
+                tr("No trial actions selected. Select trial rows in the list first.")
+            )
+            return
+
+        changed = 0
+        for a in data.get("actions", []):
+            if a.get("id") in targets and a.get("state") == "trial":
+                a["state"] = "committed"
+                changed += 1
+
+        if changed == 0:
+            QMessageBox.information(self, tr("Commit Trials"), tr("Nothing to commit."))
+            return
+
+        try:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, tr("Commit Trials"), str(e))
+            return
+
+        # Refresh detail view (re-load session_data via _refresh_sessions)
+        QMessageBox.information(
+            self, tr("Commit Trials"),
+            tr("Committed %d trial action(s).") % changed
+        )
+        # Update in-memory current_session
+        for a in self.current_session.get("actions", []):
+            if a.get("id") in targets and a.get("state") == "trial":
+                a["state"] = "committed"
+        self._populate_action_list(self.current_session)
+
+    # Phase 5 (2026-05-29): trial-dedup helper for UI selection
+    def _is_last_trial_of_key(self, all_actions, action_idx, undone_ids=None):
+        """Return True if the action at action_idx is the last trial of its
+        (chapter, widget, action_type) group AND no committed/current supersedes it.
+
+        Mirrors session_logger.effective_actions_for_replay logic so the UI
+        selection matches what replay will actually execute. undone_ids (2026-05-30):
+        trials reverted with Ctrl+Z are excluded from "last trial" selection, exactly
+        as replay excludes them — so the auto-checked trial is the last NON-undone one.
+        """
+        undone_ids = undone_ids or set()
+        action = all_actions[action_idx]
+        if action.get("state") != "trial":
+            return False
+        if action.get("id") in undone_ids:
+            return False
+        widget = action.get("widget")
+        action_type = action.get("action")
+
+        # Find chapter membership for action_idx via session_data chapters
+        if not hasattr(self, '_session_chapters_sorted') or not self._session_chapters_sorted:
+            return True
+        def find_ch(i):
+            cur = None
+            for ch in self._session_chapters_sorted:
+                if ch.get("start_action_index", 0) <= i:
+                    cur = ch.get("id")
+                else:
+                    break
+            return cur
+        my_ch = find_ch(action_idx)
+
+        # Look across all actions of the same key in the same chapter
+        last_trial_idx = -1
+        has_committed_or_current = False
+        for i, a in enumerate(all_actions):
+            if a.get("widget") == widget and a.get("action") == action_type:
+                if find_ch(i) == my_ch:
+                    st = a.get("state", "current")
+                    if st in ("committed", "current"):
+                        has_committed_or_current = True
+                    elif st == "trial" and a.get("id") not in undone_ids:
+                        last_trial_idx = i
+        if has_committed_or_current:
+            return False
+        return last_trial_idx == action_idx
     
     def _select_all_actions(self, select: bool):
         """全选/取消全选操作"""
@@ -731,25 +1647,31 @@ class RecoveryWidget(QWidget):
         
         if not frames:
             raise ValueError("Could not read any valid images")
-        
-        stack = np.array(frames)
+
+        # Phase 7 (2026-05-29): preallocated stack (memmap-safe)
+        from utils.memory_utils import stack_frames_preallocated
+        stack = stack_frames_preallocated(frames)
         name = f"Recovered_PNG_{folder.name}"
         self.viewer.add_image(stack, name=name, colormap='gray')
-    
+        gc.collect()
+        trim_working_set()
+
     def _load_tiff_stack(self, file_path: str):
         """加载 TIFF Stack"""
         import tifffile
         import numpy as np
-        
+
         stack = tifffile.imread(file_path)
         if stack.ndim == 2:
             stack = stack[np.newaxis, ...]
         elif stack.ndim == 4:
             stack = stack[..., 0]
-        
+
         name = f"Recovered_TIFF_{Path(file_path).stem}"
         self.viewer.add_image(stack, name=name, colormap='gray')
-    
+        gc.collect()
+        trim_working_set()
+
     def _auto_detect_and_import_sources(self) -> str:
         """
         自动检测并导入数据源
@@ -790,7 +1712,9 @@ class RecoveryWidget(QWidget):
                     detected_sources.append({
                         "type": "DM4 Sequence",
                         "path": source_path,
-                        "exists": Path(source_path).exists()
+                        "exists": Path(source_path).exists(),
+                        # [Issue] 记下导入时的选帧, 恢复时按原样复现 (否则会加载全部帧)
+                        "frame_selection": params.get("frame_selection", ""),
                     })
             elif action_type == "load_png_sequence":
                 source_path = params.get("source_path", "")
@@ -856,8 +1780,8 @@ class RecoveryWidget(QWidget):
                         self._load_tiff_stack(src["path"])
                         return "success"
                     elif src["type"] in ("DM4 Archive", "DM4 Sequence"):
-                        # 直接加载 DM4 序列
-                        self._load_dm4_sequence(src["path"])
+                        # 直接加载 DM4 序列 (带上导入时的选帧, 复现 0-20 这类范围)
+                        self._load_dm4_sequence(src["path"], src.get("frame_selection", ""))
                         return "success"
                 except Exception as e:
                     QMessageBox.critical(self, tr("Error"), f"Import failed: {e}")
@@ -966,7 +1890,8 @@ class RecoveryWidget(QWidget):
             if choice == btn_dm4:
                 folder = QFileDialog.getExistingDirectory(self, tr("Select DM4 Folder"), start_path)
                 if folder:
-                    self._load_dm4_sequence(folder)
+                    # 即便手动选目录, 也复现日志里的选帧 (如 0-20)
+                    self._load_dm4_sequence(folder, self._logged_dm4_frame_selection())
                     return "success"
             elif choice == btn_png:
                 folder = QFileDialog.getExistingDirectory(self, tr("Select PNG Sequence Folder"), start_path)
@@ -1045,7 +1970,8 @@ class RecoveryWidget(QWidget):
             return
         
         # === 智能数据源检测 ===
-        image_layers = [l for l in self.viewer.layers if hasattr(l, 'data') and l.data is not None]
+        # 用类型守卫排除 Shapes/Points（list 型 .data），避免误判为图像源
+        image_layers = [l for l in self.viewer.layers if self._is_image_layer_data(l)]
         
         if not image_layers:
             # 没有图层，尝试自动检测数据源
@@ -1190,22 +2116,40 @@ class RecoveryWidget(QWidget):
         log_path = Path(self.current_session.get("_log_path", ""))
         if log_path.exists():
             self._mark_session_status(log_path, "recovered")
-        
-        # === 将恢复事件记录到当前会话日志 ===
-        # 这样用户后续的操作会和恢复的上下文一起保存
-        try:
-            from utils.session_logger import get_logger
-            recovered_session_id = self.current_session.get("session_id", "unknown")
-            get_logger().log_action("recovery", "session_restored", {
-                "source_session_id": recovered_session_id,
-                "source_log_path": str(log_path),
-                "success_count": success_count,
-                "skipped_count": len(skipped_actions),
-                "failed_count": len(failed_actions),
-                "recovered_widgets": list(set(a.get("widget", "") for a in selected_actions))
-            })
-        except Exception as e:
-            print(f"[RecoveryWidget] Failed to log recovery event: {e}")
+
+        # === Auto-continuation: 恢复后自动续写到原 session ===
+        auto_continued = False
+        if GlobalConfig.get("session_auto_continue_after_recovery") and log_path.exists() and success_count > 0:
+            try:
+                from utils.session_logger import SessionLogger
+                logger = SessionLogger.resume_from_file(log_path)
+                auto_continued = True
+                logger.log_action("recovery", "session_restored", {
+                    "source_session_id": self.current_session.get("session_id", "unknown"),
+                    "source_log_path": str(log_path),
+                    "success_count": success_count,
+                    "skipped_count": len(skipped_actions),
+                    "failed_count": len(failed_actions),
+                    "recovered_widgets": list(set(a.get("widget", "") for a in selected_actions))
+                })
+            except Exception as e:
+                print(f"[RecoveryWidget] Auto-continue failed: {e}")
+
+        if not auto_continued:
+            # 回退：记录到当前活跃的 session（如果有）
+            try:
+                from utils.session_logger import get_logger
+                recovered_session_id = self.current_session.get("session_id", "unknown")
+                get_logger().log_action("recovery", "session_restored", {
+                    "source_session_id": recovered_session_id,
+                    "source_log_path": str(log_path),
+                    "success_count": success_count,
+                    "skipped_count": len(skipped_actions),
+                    "failed_count": len(failed_actions),
+                    "recovered_widgets": list(set(a.get("widget", "") for a in selected_actions))
+                })
+            except Exception as e:
+                print(f"[RecoveryWidget] Failed to log recovery event: {e}")
         
         # 设置激活图层并同步给 Geometry 面板
         if last_result_layer and last_result_layer in self.viewer.layers:
@@ -1242,13 +2186,16 @@ class RecoveryWidget(QWidget):
             except Exception as e:
                 print(f"[RecoveryWidget] Failed to sync geometry widget: {e}")
 
+        if auto_continued:
+            report_lines.append(f"\n▶️ 已自动续写到原 session（后续操作将追加记录）")
+
         # 显示恢复结果 (原为 QMessageBox, 现在改用 QDialog 解决信息太长截断的问题)
         from qtpy.QtWidgets import QDialog, QTextEdit, QVBoxLayout, QPushButton
         dialog = QDialog(self)
         dialog.setWindowTitle(tr("Session Recovery Report"))
         dialog.resize(600, 400)
         dialog_layout = QVBoxLayout(dialog)
-        
+
         text_edit = QTextEdit()
         text_edit.setReadOnly(True)
         text_edit.setPlainText("\n".join(report_lines))
@@ -1341,28 +2288,61 @@ class RecoveryWidget(QWidget):
         
         return ("skipped", None)
         
+    @staticmethod
+    def _is_image_layer_data(layer) -> bool:
+        """仅当图层持有 >=2D 的数组型图像时返回 True。
+
+        排除 Shapes/Points 等图层（其 .data 是 Python list，没有 .ndim），
+        这些图层此前会让匹配器在 `l.data.ndim` 处抛出
+        'list' object has no attribute 'ndim'。
+        """
+        data = getattr(layer, 'data', None)
+        return data is not None and hasattr(data, 'ndim') and data.ndim >= 2
+
     def _find_best_matching_layer(self, target_name: str, last_result_layer: str) -> 'napari.layers.Layer':
         """
         智能图层匹配：在重放时找到最合适的源图层。
         优先顺序：
         1. 链式首选：上一步产生的 last_result_layer
         2. 全名精确匹配（目标名在画布中存在）
+        2.5. Layer alias 匹配（session 中记录的 Original→PNG 映射）
         3. 前缀特征模糊匹配（去除 _recovered 干扰）
         4. 后备：第一个有效的图像图层
+
+        注意：每一条按名字命中的捷径都必须再次校验类型——画布里可能存在
+        一个与目标同名/同别名的 Shapes 图层（如 Batch_ROI），若直接返回会在
+        后续 .data.ndim 处崩溃。命中但类型不符时继续向下一策略回退。
         """
-        image_layers = [l for l in self.viewer.layers 
-                        if hasattr(l, 'data') and l.data is not None and l.data.ndim >= 2]
+        image_layers = [l for l in self.viewer.layers if self._is_image_layer_data(l)]
         if not image_layers:
             return None
 
         # 1. 如果有链式的上一步结果，优先使用
         if last_result_layer and last_result_layer in self.viewer.layers:
-            return self.viewer.layers[last_result_layer]
-            
+            cand = self.viewer.layers[last_result_layer]
+            if self._is_image_layer_data(cand):
+                return cand
+
         # 2. 精确匹配
         if target_name and target_name in self.viewer.layers:
-            return self.viewer.layers[target_name]
-            
+            cand = self.viewer.layers[target_name]
+            if self._is_image_layer_data(cand):
+                return cand
+
+        # 2.5. Alias 匹配
+        if target_name and self.current_session:
+            aliases = self.current_session.get("layer_aliases", {})
+            aliased_name = aliases.get(target_name, "")
+            if aliased_name and aliased_name in self.viewer.layers:
+                cand = self.viewer.layers[aliased_name]
+                if self._is_image_layer_data(cand):
+                    return cand
+            for orig, mapped in aliases.items():
+                if mapped and mapped in self.viewer.layers and orig == target_name:
+                    cand = self.viewer.layers[mapped]
+                    if self._is_image_layer_data(cand):
+                        return cand
+
         # 3. 模糊特征匹配
         if target_name:
             import re
@@ -1410,8 +2390,8 @@ class RecoveryWidget(QWidget):
             if not source_layer:
                 return ("failed", None)
             
-            image_stack = np.array(source_layer.data)
-            
+            image_stack = source_layer.data
+
             # === 旋转 ===
             if action_type == "rotate":
                 angle = params.get("angle", 0)
@@ -1451,14 +2431,16 @@ class RecoveryWidget(QWidget):
                 
                 new_name = f"{source_layer.name}_recovered_rotated"
                 self.viewer.add_image(rotated, name=new_name, colormap='gray')
-                
+                gc.collect()
+                trim_working_set()
+
                 # 隐藏源图层
                 source_layer.visible = False
-                
+
                 if recovery_mode == "review":
-                    QMessageBox.information(self, tr("Session Recovery"), 
+                    QMessageBox.information(self, tr("Session Recovery"),
                         f"✅ 旋转重放成功\nAngle: {angle}°\nResult: {new_name}")
-                
+
                 return ("success", new_name)
             
             # === 翻转 ===
@@ -1485,14 +2467,16 @@ class RecoveryWidget(QWidget):
                 suffix = "FlipH" if direction == 'horizontal' else "FlipV"
                 new_name = f"{source_layer.name}_recovered_{suffix}"
                 self.viewer.add_image(flipped, name=new_name, colormap='gray')
-                
+                gc.collect()
+                trim_working_set()
+
                 # 隐藏源图层
                 source_layer.visible = False
-                
+
                 if recovery_mode == "review":
-                    QMessageBox.information(self, tr("Session Recovery"), 
+                    QMessageBox.information(self, tr("Session Recovery"),
                         f"✅ 翻转重放成功\nDirection: {direction}\nResult: {new_name}")
-                
+
                 return ("success", new_name)
             
             # === 裁剪 ===
@@ -1520,14 +2504,16 @@ class RecoveryWidget(QWidget):
                 
                 new_name = f"{source_layer.name}_recovered_cropped"
                 self.viewer.add_image(cropped, name=new_name, colormap='gray')
-                
+                gc.collect()
+                trim_working_set()
+
                 # 隐藏源图层
                 source_layer.visible = False
-                
+
                 if recovery_mode == "review":
-                    QMessageBox.information(self, tr("Session Recovery"), 
+                    QMessageBox.information(self, tr("Session Recovery"),
                         f"✅ 裁剪重放成功\nBbox: {bbox}\nResult: {new_name}")
-                
+
                 return ("success", new_name)
             
             # === 批量 ROI 恢复 ===
@@ -1640,11 +2626,11 @@ class RecoveryWidget(QWidget):
             if not source_layer or not hasattr(source_layer, 'data') or source_layer.data.ndim < 3:
                 return ("failed", None)
             
-            image_stack = np.array(source_layer.data)
-            
+            image_stack = source_layer.data
+
             if image_stack.ndim != 3:
                 return ("failed", None)
-            
+
             # Review 模式：先询问用户
             if recovery_mode == "review":
                 confirm = self._ask_recovery_confirm(
@@ -1689,7 +2675,10 @@ class RecoveryWidget(QWidget):
                     kernel_size=kernel_size,
                     progress_callback=progress_cb
                 )
-                
+
+                gc.collect()
+                trim_working_set()
+
                 # Step 2: 应用漂移矫正
                 progress.setLabelText("Applying drift correction...")
                 
@@ -1712,12 +2701,14 @@ class RecoveryWidget(QWidget):
                 # 添加结果图层
                 new_name = f"{source_layer.name}_recovered_corrected"
                 new_layer = self.viewer.add_image(
-                    corrected, 
-                    name=new_name, 
+                    corrected,
+                    name=new_name,
                     colormap='gray',
                     metadata=source_layer.metadata.copy() if hasattr(source_layer, 'metadata') else {}
                 )
-                
+                gc.collect()
+                trim_working_set()
+
                 # Review 模式：显示结果确认
                 if recovery_mode == "review":
                     max_drift = np.max(np.abs(drifts), axis=0)
@@ -1763,8 +2754,8 @@ class RecoveryWidget(QWidget):
             if not source_layer:
                 return ("failed", None)
             
-            data = np.array(source_layer.data)
-            
+            data = source_layer.data
+
             # Review 模式：先询问用户
             if recovery_mode == "review":
                 title_str = "Filter Enhancement" if action_type == "filter_enhancement" else "Enhancement"
@@ -1822,10 +2813,11 @@ class RecoveryWidget(QWidget):
                     # 添加新图层
                     new_name = f"Enh_{source_layer.name}"
                     self.viewer.add_image(result, name=new_name, colormap='gray')
-                    
-                    # 隐藏源图层
+                    gc.collect()
+                    trim_working_set()
+
                     source_layer.visible = False
-                    
+
                     return ("success", new_name)
                     
                 finally:
@@ -1839,7 +2831,7 @@ class RecoveryWidget(QWidget):
                 # 如果有指定源图层且存在，使用它
                 if source_from_log and source_from_log in self.viewer.layers:
                     source_layer = self.viewer.layers[source_from_log]
-                    data = np.array(source_layer.data)
+                    data = source_layer.data
                 
                 c_min = params.get("min", 0)
                 c_max = params.get("max", 255)
@@ -1856,49 +2848,41 @@ class RecoveryWidget(QWidget):
                 QApplication.processEvents()
                 
                 try:
-                    # 执行对比度调整 - 和 ContrastBurnThread 相同的逻辑
-                    progress.setLabelText(tr("Converting data type..."))
-                    progress.setValue(10)
-                    QApplication.processEvents()
-                    
-                    data_f = data.astype(np.float32)
-                    
-                    progress.setLabelText(tr("Normalizing..."))
-                    progress.setValue(30)
-                    QApplication.processEvents()
-                    
+                    from utils.memory_utils import create_huge_array, release_memmap_pages
+
                     range_width = c_max - c_min
                     if range_width < 1e-9:
                         range_width = 1e-9
-                    
-                    # 归一化到 [0, 1]
-                    normalized = (data_f - c_min) / range_width
-                    
-                    progress.setLabelText(tr("Clipping values..."))
-                    progress.setValue(60)
-                    QApplication.processEvents()
-                    
-                    normalized = np.clip(normalized, 0, 1)
-                    
-                    progress.setLabelText(tr("Mapping to uint8..."))
-                    progress.setValue(80)
-                    QApplication.processEvents()
-                    
-                    # 映射到 uint8
-                    result = (normalized * 255).astype(np.uint8)
-                    
+
+                    if data.ndim == 3:
+                        n = data.shape[0]
+                        result, _ = create_huge_array(data.shape, np.uint8)
+                        for i in range(n):
+                            frame_f = data[i].astype(np.float32)
+                            frame_f = np.clip((frame_f - c_min) / range_width, 0, 1)
+                            result[i] = (frame_f * 255).astype(np.uint8)
+                            if i % 50 == 0:
+                                progress.setValue(10 + int(i / n * 85))
+                                QApplication.processEvents()
+                        release_memmap_pages(result)
+                    else:
+                        data_f = data.astype(np.float32)
+                        normalized = np.clip((data_f - c_min) / range_width, 0, 1)
+                        result = (normalized * 255).astype(np.uint8)
+
                     progress.setLabelText(tr("Rendering result..."))
                     progress.setValue(95)
                     QApplication.processEvents()
-                    
+
                     new_name = f"Contrast_{source_layer.name}"
                     self.viewer.add_image(result, name=new_name, colormap='gray')
-                    
-                    # 隐藏源图层
+                    gc.collect()
+                    trim_working_set()
+
                     source_layer.visible = False
-                    
+
                     progress.setValue(100)
-                    
+
                     return ("success", new_name)
                     
                 finally:
@@ -2147,40 +3131,120 @@ class RecoveryWidget(QWidget):
         if log_path.exists():
             self._mark_session_status(log_path, "abandoned")
         
-        QMessageBox.information(self, tr("Session Recovery"), 
+        QMessageBox.information(self, tr("Session Recovery"),
             f"🗑️ {tr('Session abandoned')}")
-        
+
         self._refresh_sessions()
-    
+
+    def _continue_session(self):
+        """断点续写：从已有 session 恢复并继续记录新操作"""
+        from utils.session_logger import SessionLogger
+
+        if not self.current_session:
+            return
+
+        log_path = Path(self.current_session.get("_log_path", ""))
+        if not log_path.exists():
+            QMessageBox.warning(self, tr("Continue Session"),
+                tr("Session file not found on disk."))
+            return
+
+        session_id = self.current_session.get("session_id", "?")
+        action_count = len(self.current_session.get("actions", []))
+        reply = QMessageBox.question(
+            self, tr("Continue Session"),
+            f"{tr('Resume recording to session')} [{session_id}]?\n\n"
+            f"{tr('Existing actions')}: {action_count}\n"
+            f"{tr('New actions will be appended to this session.')}\n\n"
+            f"{tr('The current active session (if any) will be closed.')}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            logger = SessionLogger.resume_from_file(log_path)
+            QMessageBox.information(self, tr("Continue Session"),
+                f"▶️ {tr('Session resumed')}: [{logger.session_id}]\n"
+                f"{tr('Total actions')}: {len(logger.actions)}\n\n"
+                f"{tr('All subsequent operations will be recorded to this session.')}")
+            self._refresh_sessions()
+        except Exception as e:
+            QMessageBox.critical(self, tr("Continue Session"),
+                f"{tr('Failed to resume session')}:\n{e}")
+
     def _mark_session_status(self, log_path: Path, status: str):
-        """更新会话状态"""
+        """更新会话状态并重算 checksum"""
         try:
             with open(log_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data["status"] = status
+            actions_str = json.dumps(data.get("actions", []), sort_keys=True, cls=NumpyEncoder)
+            data["checksum"] = hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
             with open(log_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, indent=2, cls=NumpyEncoder)
         except Exception as e:
             print(f"Error updating session status: {e}")
     
     # === 数据加载方法 ===
     
-    def _load_dm4_sequence(self, folder_path: str):
-        """加载 DM4 序列文件夹"""
+    def _logged_dm4_frame_selection(self) -> str:
+        """从当前 session 的 load_dm4_sequence 动作取导入选帧字符串(没有则返回空)。"""
+        try:
+            for a in (self.current_session or {}).get("actions", []):
+                if a.get("action") == "load_dm4_sequence":
+                    return a.get("params", {}).get("frame_selection", "") or ""
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _parse_frame_selection(text):
+        """把 '0-20' / '0-30,50' 解析成有序索引列表; 空/all/global → None(=全部帧)。
+        用于恢复 DM4 导入时复现用户当初选的帧范围。"""
+        if not text or str(text).strip().lower() in ("", "all", "global"):
+            return None
+        out = set()
+        for part in str(text).split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '-' in part.lstrip('-'):  # 避免负号干扰; 帧号非负
+                try:
+                    a, b = part.split('-', 1)
+                    a, b = int(a.strip()), int(b.strip())
+                    if a > b:
+                        a, b = b, a
+                    out.update(range(a, b + 1))
+                except Exception:
+                    continue
+            else:
+                try:
+                    out.add(int(part))
+                except Exception:
+                    continue
+        return sorted(out) if out else None
+
+    def _load_dm4_sequence(self, folder_path: str, frame_selection: str = ""):
+        """加载 DM4 序列文件夹。frame_selection 非空时只加载这些帧(复现导入时的选帧)。"""
         from core.dm4_reader import read_dm4_sequence
         from qtpy.QtWidgets import QProgressDialog
         from qtpy.QtCore import Qt
-        
+
+        # [Issue] 恢复时复现导入选帧: 解析日志里的 frame_selection (如 '0-20') → frame_indices
+        frame_indices = self._parse_frame_selection(frame_selection)
+
         progress = QProgressDialog(tr("Loading DM4 sequence..."), None, 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.show()
-        
+
         def callback(current, total):
             progress.setValue(int(current / total * 100))
-        
+
         try:
-            stack, metadata = read_dm4_sequence(folder_path, bit_depth=8, max_workers=8, progress_callback=callback)
+            stack, metadata = read_dm4_sequence(folder_path, bit_depth=8, max_workers=8,
+                                                progress_callback=callback, frame_indices=frame_indices)
             progress.close()
             
             name = f"Original_{Path(folder_path).name}"
@@ -2188,10 +3252,12 @@ class RecoveryWidget(QWidget):
                 name = name[:15] + "..." + name[-10:]
             
             self.viewer.add_image(stack, name=name, metadata=metadata, colormap='gray')
+            gc.collect()
+            trim_working_set()
         except Exception as e:
             progress.close()
             raise e
-    
+
     def _load_png_sequence(self, folder_path: str):
         """加载 PNG 序列文件夹"""
         import cv2
@@ -2223,17 +3289,21 @@ class RecoveryWidget(QWidget):
             
             if not frames:
                 raise ValueError("Could not read any valid images.")
-            
-            stack = np.array(frames)
+
+            # Phase 7 (2026-05-29): preallocated stack (memmap-safe)
+            from utils.memory_utils import stack_frames_preallocated
+            stack = stack_frames_preallocated(frames)
             name = f"PNG_{folder.name}"
             if len(name) > 30:
                 name = name[:15] + "..." + name[-10:]
             
             self.viewer.add_image(stack, name=name, colormap='gray')
+            gc.collect()
+            trim_working_set()
         except Exception as e:
             progress.close()
             raise e
-    
+
     def _load_tiff_stack(self, file_path: str):
         """加载 TIFF Stack 文件"""
         import tifffile
@@ -2251,7 +3321,9 @@ class RecoveryWidget(QWidget):
             name = name[:15] + "..." + name[-10:]
         
         self.viewer.add_image(stack, name=name, colormap='gray')
-    
+        gc.collect()
+        trim_working_set()
+
     def _show_path_manager(self):
         """显示搜索路径管理器对话框"""
         from utils.session_logger import SessionLogger
@@ -2457,13 +3529,18 @@ class RecoveryWidget(QWidget):
         action_label.triggered.connect(lambda: self._edit_session_label(session))
         menu.addAction(action_label)
         
+        # 合并到其他 session
+        action_merge = QAction(f"🔗 {tr('Merge into...')}", self)
+        action_merge.triggered.connect(lambda: self._merge_session(session))
+        menu.addAction(action_merge)
+
         menu.addSeparator()
-        
+
         # 删除会话
         action_delete = QAction(f"🗑️ {tr('Delete Session')}", self)
         action_delete.triggered.connect(lambda: self._delete_session(session))
         menu.addAction(action_delete)
-        
+
         menu.exec_(self.session_list.mapToGlobal(pos))
     
     def _open_in_explorer(self, log_path):
@@ -2564,12 +3641,12 @@ class RecoveryWidget(QWidget):
     def _switch_to_import_tab(self):
         """切换到 Import 标签页"""
         from qtpy.QtWidgets import QTabWidget
-        
+
         try:
             # 方法1: 向上查找 QTabWidget 父组件
             parent = self.parent()
             tab_widget = None
-            
+
             while parent is not None:
                 if isinstance(parent, QTabWidget):
                     tab_widget = parent
@@ -2582,7 +3659,7 @@ class RecoveryWidget(QWidget):
                 if tab_widget:
                     break
                 parent = parent.parent()
-            
+
             if tab_widget:
                 # 查找 Import 标签页
                 for i in range(tab_widget.count()):
@@ -2591,10 +3668,133 @@ class RecoveryWidget(QWidget):
                         tab_widget.setCurrentIndex(i)
                         print(f"[Recovery] Switched to Import tab (index {i})")
                         return True
-            
+
             print("[Recovery] Could not find tab widget")
             return False
-            
+
         except Exception as e:
             print(f"[Recovery] Tab switch error: {e}")
             return False
+
+    # =========================================================================
+    # Session Merge
+    # =========================================================================
+
+    def _merge_session(self, source_session):
+        """将 source_session (B) 合并到用户选择的 target_session (A) 中。"""
+        from qtpy.QtWidgets import QInputDialog
+        from utils.session_logger import SessionLogger
+
+        source_id = source_session.get("session_id", "?")
+        source_path = Path(source_session.get("_log_path", ""))
+        if not source_path.exists():
+            QMessageBox.warning(self, tr("Merge"), tr("Source session file not found."))
+            return
+
+        # 选择目标 session
+        candidates = []
+        candidate_map = {}
+        for s in self.sessions:
+            sid = s.get("session_id", "")
+            if sid == source_id:
+                continue
+            meta = s.get("metadata", {})
+            label = s.get("label", "") or s.get("_auto_label", "")
+            display = f"[{sid}] {label} ({meta.get('substance', '')} / {meta.get('dataset_id', '')})"
+            candidates.append(display)
+            candidate_map[display] = s
+
+        if not candidates:
+            QMessageBox.information(self, tr("Merge"), tr("No other sessions available for merge."))
+            return
+
+        chosen, ok = QInputDialog.getItem(self, tr("Merge into..."),
+            f"{tr('Select target session to merge into')}:\n"
+            f"(Source: [{source_id}])",
+            candidates, 0, False)
+        if not ok or chosen not in candidate_map:
+            return
+
+        target_session = candidate_map[chosen]
+        target_path = Path(target_session.get("_log_path", ""))
+        if not target_path.exists():
+            QMessageBox.warning(self, tr("Merge"), tr("Target session file not found."))
+            return
+
+        # 确认
+        source_actions = source_session.get("actions", [])
+        target_actions = target_session.get("actions", [])
+        reply = QMessageBox.question(self, tr("Confirm Merge"),
+            f"{tr('Merge session')} [{source_id}] ({len(source_actions)} actions)\n"
+            f"{tr('into session')} [{target_session.get('session_id', '?')}] ({len(target_actions)} actions)?\n\n"
+            f"{tr('The source session will be marked as merged.')}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # 执行合并
+        try:
+            self._execute_merge(source_path, target_path)
+            QMessageBox.information(self, tr("Merge"), tr("Sessions merged successfully."))
+            self._refresh_sessions()
+        except Exception as e:
+            QMessageBox.critical(self, tr("Merge"), f"{tr('Merge failed')}: {e}")
+
+    def _execute_merge(self, source_path: Path, target_path: Path):
+        """执行合并: B 的 actions rebase 并按时间戳排序插入 A."""
+        with open(source_path, 'r', encoding='utf-8') as f:
+            source_data = json.load(f)
+        with open(target_path, 'r', encoding='utf-8') as f:
+            target_data = json.load(f)
+
+        # 计算 target 的 max action counter
+        max_counter = 0
+        for a in target_data.get("actions", []):
+            parts = a.get("id", "").rsplit("_", 1)
+            if len(parts) == 2:
+                try:
+                    max_counter = max(max_counter, int(parts[-1]))
+                except ValueError:
+                    pass
+
+        # Rebase source actions: 更新 action_id，重映射 undo target 引用
+        id_map = {}
+        rebased_actions = []
+        for a in source_data.get("actions", []):
+            old_id = a.get("id", "")
+            max_counter += 1
+            new_id = f"{target_data.get('session_id', 'merged')}_{max_counter:04d}"
+            id_map[old_id] = new_id
+            a["id"] = new_id
+            # Rebase undo target references
+            if a.get("action") == "undo":
+                old_target = a.get("params", {}).get("target", "")
+                if old_target in id_map:
+                    a["params"]["target"] = id_map[old_target]
+            rebased_actions.append(a)
+
+        # 合并: 按时间戳排序
+        all_actions = target_data.get("actions", []) + rebased_actions
+        all_actions.sort(key=lambda a: a.get("timestamp", ""))
+        target_data["actions"] = all_actions
+
+        # 合并 layer_aliases
+        source_aliases = source_data.get("layer_aliases", {})
+        if source_aliases:
+            target_aliases = target_data.get("layer_aliases", {})
+            target_aliases.update(source_aliases)
+            target_data["layer_aliases"] = target_aliases
+
+        # 重算 checksum
+        actions_str = json.dumps(target_data["actions"], sort_keys=True, cls=NumpyEncoder)
+        target_data["checksum"] = hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
+
+        # 保存 target
+        with open(target_path, 'w', encoding='utf-8') as f:
+            json.dump(target_data, f, indent=2, cls=NumpyEncoder)
+
+        # 标记 source 为 merged
+        source_data["status"] = "merged"
+        source_data["merged_into"] = target_data.get("session_id", "")
+        with open(source_path, 'w', encoding='utf-8') as f:
+            json.dump(source_data, f, indent=2, cls=NumpyEncoder)

@@ -28,6 +28,7 @@ import ctypes
 from widgets.settings_widget import tr
 from utils.session_logger import get_logger
 from utils.utils import elide_text, natural_sort_key
+from utils.memory_utils import trim_working_set
 from utils.ui_utils import setup_safe_scroll_all
 
 # 尝试导入 psutil 获取更准确的内存信息，如果没有则使用 ctypes (Windows) 或 os (Linux)
@@ -480,7 +481,7 @@ class ImportWidget(QWidget):
         files = self._list_import_sequence_files()
         total_frames = len(files)
         if total_frames <= 0:
-            self.frame_range_edit.setPlaceholderText("All (Default) or e.g. 0-99")
+            self.frame_range_edit.setPlaceholderText(tr("All (Default) or e.g. 0-99"))
             self.frame_range_edit.setToolTip("Supported syntax:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12")
             self.dose_idx_spin.setRange(-1, 99999)
             return
@@ -688,7 +689,7 @@ class ImportWidget(QWidget):
         h_frame_range = QHBoxLayout()
         h_frame_range.addWidget(QLabel(tr("Frame Range")))
         self.frame_range_edit = QLineEdit()
-        self.frame_range_edit.setPlaceholderText("All (Default) or e.g. 0-99")
+        self.frame_range_edit.setPlaceholderText(tr("All (Default) or e.g. 0-99"))
         self.frame_range_edit.setToolTip("Supported syntax:\n- Range: 0-10\n- Single: 5\n- Mixed: 0-5, 8, 10-12")
         h_frame_range.addWidget(self.frame_range_edit)
         l_load.addLayout(h_frame_range)
@@ -726,10 +727,10 @@ class ImportWidget(QWidget):
         if val > self.recommended_workers:
             diff = val - self.recommended_workers
             if est_usage > self.total_ram_gb:
-                self.lbl_memory_warning.setText(f"❌ DANGER! {val} workers may crash your PC (Est: {est_usage:.1f}GB > {self.total_ram_gb:.1f}GB)")
+                self.lbl_memory_warning.setText(f"❌ {tr('DANGER! %d workers may crash your PC') % val} (Est: {est_usage:.1f}GB > {self.total_ram_gb:.1f}GB)")
                 self.lbl_memory_warning.setVisible(True)
             else:
-                self.lbl_memory_warning.setText(f"⚠️ Warning: {val} exceeds recommended ({self.recommended_workers}). Watch RAM.")
+                self.lbl_memory_warning.setText(f"⚠️ {tr('Warning: %d exceeds recommended (%d). Watch RAM.') % (val, self.recommended_workers)}")
                 self.lbl_memory_warning.setVisible(True)
         else:
             self.lbl_memory_warning.setVisible(False)
@@ -741,7 +742,7 @@ class ImportWidget(QWidget):
         # self.folder_label.setCursorPosition(len(path))
 
     def _browse_folder(self):
-        f = QFileDialog.getExistingDirectory(self, "Select Data Folder", self.settings.value("last_folder", ""))
+        f = QFileDialog.getExistingDirectory(self, tr("Select Data Folder"), self.settings.value("last_folder", ""))
         if f:
             self.current_folder = f
             self.settings.setValue("last_folder", f)
@@ -853,7 +854,7 @@ class ImportWidget(QWidget):
         self.ref_path_edit.setToolTip(fname)
         self.ref_path_edit.setCursorPosition(0) # Show start of path
         
-        self.meta_info_label.setText(f"Date: {info.get('date_fmt', 'N/A')}, Exp: {info.get('exposure', 0)}s\nPixel: {info.get('pixel_A', 0):.2f} Å, Mean: {info.get('mean', 0):.1f}")
+        self.meta_info_label.setText(f"{tr('Date: %s, Exp: %ss') % (info.get('date_fmt', 'N/A'), info.get('exposure', 0))}\n{tr('Pixel: %.2f Å, Mean: %.1f') % (info.get('pixel_A', 0), info.get('mean', 0))}")
         self._update_preview()
         self.create_archive_btn.setEnabled(True)
 
@@ -1053,9 +1054,16 @@ class ImportWidget(QWidget):
             )
             if reply == QMessageBox.No: return
             print("Cleaning up existing layers...")
-            self.viewer.layers.clear() 
+            self.viewer.layers.clear()
+            try:
+                from utils.session_logger import SessionLogger
+                SessionLogger.reset_instance()
+                print("Session logger reset for new dataset.")
+            except Exception as e:
+                print(f"Warning: session logger reset failed: {e}")
             gc.collect()
-        
+            trim_working_set()
+
         self.load_btn.setEnabled(False)
         self.progress.setVisible(True)
         if selected_indices is None:
@@ -1077,6 +1085,8 @@ class ImportWidget(QWidget):
         name = f"Original_{Path(self.current_folder).name}"
         if len(name) > 30: name = name[:15] + "..." + name[-10:]
         self.viewer.add_image(stack, name=name, metadata=meta, colormap='gray')
+        gc.collect()
+        trim_working_set()
         source_total_frames = int(meta.get("source_num_frames", len(stack)))
         selected_ranges = meta.get("selected_frame_ranges", [])
         selection_text = self._format_frame_ranges(selected_ranges)
@@ -1144,8 +1154,11 @@ class ImportWidget(QWidget):
             if not frames:
                 QMessageBox.warning(self, tr("Error"), tr("Could not read any valid images."))
                 return
-                
-            stack = np.array(frames)
+
+            # Phase 7 (2026-05-29): use preallocated stack to avoid the doubled
+            # allocation np.array(frames) triggers on memmap / lazy sources.
+            from utils.memory_utils import stack_frames_preallocated
+            stack = stack_frames_preallocated(frames)
             name = f"PNG_{folder_path.name}"
             if len(name) > 30:
                 name = name[:15] + "..." + name[-10:]
@@ -1161,11 +1174,44 @@ class ImportWidget(QWidget):
                     "layer_name": name
                 })
             except: pass
+
+            # Layer alias detection: PNG re-import 后建立与原 session layer 的映射
+            self._detect_layer_alias(name, folder_path)
             
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, tr("Error"), str(e))
             self.status.setText(f"❌ {tr('Error:')} {e}")
+
+    def _detect_layer_alias(self, new_layer_name: str, folder_path: Path):
+        """Detect if this PNG import corresponds to a prior session's layer and create alias."""
+        try:
+            from utils.session_logger import get_logger
+            logger = get_logger()
+            if not logger.actions:
+                return
+            folder_name = folder_path.name.lower()
+            for action in logger.actions:
+                if action.get("widget") == "import" and action.get("action") != "load_png_sequence":
+                    params = action.get("params", {})
+                    old_layer = params.get("layer_name", "")
+                    if not old_layer:
+                        continue
+                    old_lower = old_layer.lower().replace("original_", "").replace("png_", "")
+                    if old_lower and (old_lower in folder_name or folder_name in old_lower):
+                        logger.add_layer_alias(old_layer, new_layer_name)
+                        return
+            existing_layers = [l.name for l in self.viewer.layers]
+            for existing in existing_layers:
+                if existing == new_layer_name:
+                    continue
+                existing_lower = existing.lower().replace("original_", "").replace("png_", "")
+                new_lower = new_layer_name.lower().replace("png_", "")
+                if existing_lower and new_lower and (existing_lower in new_lower or new_lower in existing_lower):
+                    logger.add_layer_alias(existing, new_layer_name)
+                    return
+        except Exception:
+            pass
 
     # === [新增] TIFF Stack 导入 ===
     def _load_tiff_stack(self):

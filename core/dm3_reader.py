@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 import concurrent.futures
 from tqdm import tqdm
-from utils.memory_utils import create_huge_array
+from utils.memory_utils import create_huge_array, release_memmap_pages
 from utils.utils import natural_sort_key
 import datetime
 import traceback
@@ -242,8 +242,7 @@ def read_dm3_sequence(folder_path: str,
             if progress_callback:
                 progress_callback(completed, count)
                 
-    if hasattr(image_stack, 'flush'):
-        image_stack.flush()
+    release_memmap_pages(image_stack)
         
     metadata = {
         'source_folder': str(folder),

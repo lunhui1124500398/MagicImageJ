@@ -177,7 +177,7 @@ TRANS_CN = {
     "Gen Denoise Folders": "生成去噪文件夹",
     "Creates empty folders with Main Suffix + Configured Suffix (e.g. _contrasted_lrtem)": "创建带有主后缀 + 配置后缀的空文件夹 (例如 _contrasted_lrtem)",
     "Gen Refine Folder": "生成精修文件夹",
-    "Creates empty folder with Main Suffix + Configured Suffix (e.g. _contrasted_mask_new)": "创建带有主后缀 + 配置后缀的空文件夹 (例如 _contrasted_mask_new)",
+    "Creates empty mask + refined-mask folders (e.g. _contrasted_mask + _contrasted_mask_refined)": "创建空的掩膜 + 精修掩膜文件夹 (例如 _contrasted_mask + _contrasted_mask_refined)",
     "Frame Filter:": "帧过滤器:",
     "All (Default) or 0-10, 15...": "所有 (默认) 或 0-10, 15...",
     "Leave empty for All frames.\nOr use: 0-10, 15, 20-25": "留空表示所有帧。\n或者使用: 0-10, 15, 20-25",
@@ -545,6 +545,38 @@ TRANS_CN = {
     "Exporting...": "正在导出...",
     "Invalid frame range syntax": "无效的帧范围语法",
     "Done: %s": "完成: %s",
+    # -- v2: FPS / Duration / Sampling --
+    "Manual FPS": "手动帧率",
+    "Target Duration": "目标时长",
+    "Duration (sec):": "时长 (秒):",
+    "Frame Sampling": "帧抽样",
+    "FPS too high for most players": "帧率过高, 多数播放器无法正常播放",
+    "Sampling: export %d of %d frames @ %dfps": "抽帧: 导出 %d / %d 帧 @ %d fps",
+    "Every %d frames, duration %.1fs": "每 %d 帧取 1 帧, 时长 %.1f 秒",
+    "frames": "帧",
+    "Playback duration": "播放时长",
+    # -- v2: Encoding --
+    "Encoder:": "编码器:",
+    "Quality (CRF):": "画质 (CRF):",
+    "18=best quality  28=smaller file": "18=最佳画质  28=较小文件",
+    "Encoding Speed:": "编码速度:",
+    "Slower = better compression": "越慢 = 压缩率越高",
+    "FFmpeg available": "FFmpeg 可用",
+    "FFmpeg not available, using OpenCV": "FFmpeg 不可用, 使用 OpenCV 编码",
+    # -- v2: Smart hints --
+    "Recommended: H.264 + Target Duration": "推荐: H.264 视频 + 目标时长模式",
+    "Recommended: Video (H.264)": "推荐: 视频 (H.264)",
+    "Small data, GIF or Video both work": "数据量较小, GIF 或视频均可",
+    # -- v2: Post-export compression --
+    "Large File Detected": "检测到大文件",
+    "Exported file is %.1f MB.\n\nCompress with FFmpeg H.264?\n(Typically 50-80%% smaller)": "导出文件为 %.1f MB。\n\n是否使用 FFmpeg H.264 压缩？\n(通常可缩小 50-80%%)",
+    "Compressing...": "正在压缩...",
+    "Compression failed": "压缩失败",
+    "Compression Complete": "压缩完成",
+    "Compressed: %.1f MB → %.1f MB (%.0f%% saved)\n\nReplace original file?": "已压缩: %.1f MB → %.1f MB (节省 %.0f%%)\n\n是否替换原文件？",
+    "Compressed: %.1f MB → %.1f MB": "已压缩: %.1f MB → %.1f MB",
+    "Replace failed:": "替换失败:",
+    "Compressed saved as:": "压缩文件已保存为:",
     
     # === Annotation Widget ===
     "Ready.": "就绪。",
@@ -559,7 +591,7 @@ TRANS_CN = {
     "LR Suffix:": "LR 后缀:",
     "HR Suffix:": "HR 后缀:",
     "Mask Suffix:": "Mask 后缀:",
-    "New Mask Suffix:": "新 Mask 后缀:",
+    "Refined Mask Suffix:": "精修 Mask 后缀:",
     
     "Measure Tool": "测量工具",
     "Line Color:": "线条颜色:",
@@ -715,7 +747,7 @@ TRANS_CN = {
     "LR Suffix:": "LR 后缀:",
     "HR Suffix:": "HR 后缀:",
     "Mask Suffix:": "Mask 后缀:",
-    "New Mask Suffix:": "新 Mask 后缀:",
+    "Refined Mask Suffix:": "精修 Mask 后缀:",
     "RAM vs Disk Limit:": "RAM 与磁盘限制:",
     "Disk Space Warning:": "磁盘空间警告:",
     "Move vs Copy Limit:": "移动与复制限制:",
@@ -917,6 +949,7 @@ TRANS_CN = {
     # === ROI & Overview Toggle ===
     "Hide ROI Labels": "隐藏 ROI 标注",
     "Overview Uses View Layer": "概览图使用视图层数据",
+    "Set Frame Range (Selected ROI)": "设置帧范围(选中 ROI)",
 
     # === Missing Translations Checked (2026-03-07) ===
     "0 = infinite loop": "0 = 无限循环",
@@ -953,7 +986,289 @@ TRANS_CN = {
     "Select Image for Dose Calculation": "选择用于剂量计算的图像",
     "Select data source type:": "选择数据源类型:",
     "Warning": "警告",
-    "You are exporting a video WITHOUT Scale Bar or Timestamp.\n\nAre you sure?": "您正在导出一个缺少比例尺或时间戳的视频。\n\n是否确定？"
+    "You are exporting a video WITHOUT Scale Bar or Timestamp.\n\nAre you sure?": "您正在导出一个缺少比例尺或时间戳的视频。\n\n是否确定？",
+
+    # --- Session 3 additions (2026-05-13) ---
+    "Success": "成功",
+    "Error": "错误",
+    "Select Output Directory": "选择输出目录",
+    "Select Data Folder": "选择数据文件夹",
+    "Cache Dir": "缓存目录",
+    "Select Color": "选择颜色",
+    "Hold to temporarily show Data Layer to check alignment": "按住临时显示数据层以检查对齐",
+    "e.g. _origin": "例如 _origin",
+    "Save ROI JSON": "保存 ROI JSON",
+    "Load ROI JSON": "加载 ROI JSON",
+    "JSON Load Error": "JSON 加载错误",
+    "Export already in progress.": "导出任务进行中。",
+    "No ROIs to preview.": "没有需要预览的 ROI。",
+    "No previous ROI size for stamp.": "没有上一个 ROI 尺寸可用于标记。",
+    "Select a view layer first.": "请先选择视图图层。",
+    "1×1 grid has no lines.": "1×1 网格没有线条。",
+    "Crop applied. Press '%s' to Undo.": "裁剪已应用。按 '%s' 撤销。",
+    "Loaded %d ROIs.": "已加载 %d 个 ROI。",
+    "Stamped ROI #%d (%s)": "标记 ROI #%d (%s)",
+    "Cloned ROI #%d → #%d": "克隆 ROI #%d → #%d",
+    "Cloned & Dragging ROI #%d": "克隆并拖动 ROI #%d",
+    "Grid %d×%d enabled. Right-click cell to zoom.": "网格 %d×%d 已启用。右键点击单元格缩放。",
+    "Zoomed to cell. Press Esc to zoom out.": "已缩放至单元格。按 Esc 缩小。",
+    "Restored global view.": "已恢复全局视图。",
+    "Failed to add layer: %s": "无法添加图层: %s",
+    "Date: %s, Exp: %ss": "日期: %s, 曝光: %ss",
+    "Pixel: %.2f Å, Mean: %.1f": "像素: %.2f Å, 均值: %.1f",
+    "DANGER! %d workers may crash your PC": "危险！%d 个线程可能导致崩溃",
+    "Warning: %d exceeds recommended (%d). Watch RAM.": "警告: %d 超出推荐值 (%d)。请关注内存。",
+    "Supported formats:": "支持的格式:",
+    "Range: 0-10": "范围: 0-10",
+    "Single: 5": "单帧: 5",
+    "Mixed: 0-5, 8, 10-12": "混合: 0-5, 8, 10-12",
+    "e.g. 0-10, 15, 20-25": "例如 0-10, 15, 20-25",
+    "e.g. CRY2, BSA": "例如 CRY2, BSA",
+    "e.g. ds1, ds2": "例如 ds1, ds2",
+    "All (Default) or e.g. 0-99": "全部 (默认) 或例如 0-99",
+    # Liquid Cell Mask
+    "Auto-detect Mask": "自动检测液层边界",
+    "Detect liquid cell boundary from temporal variance. Used by Auto-suggest and YOLO.": "根据时间维度方差自动检测液层边界。Auto-suggest 和 YOLO 共用。",
+    "Edit Mask": "编辑 Mask",
+    "Switch to mask layer for manual editing (paint=1, erase=0)": "切换到 Mask 图层手动编辑（绘制=1, 擦除=0）",
+    "Clear Mask": "清除 Mask",
+    "Mask": "液层蒙版",
+    "Mask detected.": "液层边界已检测。",
+    "Edit Mask to refine.": "可编辑 Mask 微调。",
+    "Please auto-detect or load a data layer first.": "请先自动检测或加载数据图层。",
+    "Painting mask. Use paint (label=1) and erase (label=0).": "正在绘制 Mask。绘制(label=1), 擦除(label=0)。",
+    "Mask cleared.": "Mask 已清除。",
+    "Detecting liquid cell boundary...": "正在检测液层边界...",
+    # YOLO
+    "Auto-detect (YOLO)": "自动检测 (YOLO)",
+    "Run trained YOLO model to detect particles within the mask": "在液层蒙版内运行 YOLO 模型检测粒子",
+    "YOLO model not yet trained. Accumulate 300+ ROIs first.": "YOLO 模型尚未训练。请先积累 300+ 个 ROI。",
+    "Running YOLO detection...": "正在运行 YOLO 检测...",
+    "candidates detected": "个候选粒子检出",
+    # ROI Preview
+    "Preview ROI": "预览 ROI",
+    "Open cropped animation of selected ROI with auto-contrast": "打开选中 ROI 的裁剪动画（自动增强对比度）",
+    "Preview": "预览",
+    "Please select an ROI first (click on a rectangle).": "请先选中一个 ROI（点击矩形框）。",
+    "Selected ROI has zero area.": "所选 ROI 面积为零。",
+    "Preview opened:": "预览已打开:",
+    "Export current layer": "导出当前图层",
+    "Select export folder": "选择导出文件夹",
+    "Export Enhanced (CLAHE)": "导出增强版 (CLAHE)",
+    "Export CLAHE-enhanced crops alongside originals (local contrast adjustment)": "在原始裁剪旁导出 CLAHE 局部增强版（方便对比和后续处理）",
+    # ROI Video Export (Session 13)
+    "Export ROI Videos": "导出 ROI 视频",
+    "Export each ROI as a small region video with per-ROI auto contrast": "为每个 ROI 单独生成局域对比度小视频",
+    "No ROIs defined. Please draw or load ROIs first.": "尚未定义 ROI。请先绘制或载入 ROI。",
+    "Please select a Data Layer first.": "请先选择数据图层。",
+    "Source": "源数据",
+    "Data Layer (Crop Source):": "数据图层（裁剪源）：",
+    "View Layer (info only):": "视图图层（仅参考）：",
+    "Refresh ROI List": "刷新 ROI 列表",
+    "ROIs (uncheck to skip)": "ROI 列表（取消勾选跳过）",
+    "Export": "导出",
+    "Label": "名称",
+    "Contrast Min": "对比度下限",
+    "Contrast Max": "对比度上限",
+    "Frame Range": "帧范围",
+    "Per-ROI Actions": "单 ROI 操作",
+    "Select All": "全选",
+    "Select None": "全不选",
+    "Only Napari-Selected": "仅 Napari 选中",
+    "Match the ROIs currently selected in the napari Batch_ROI layer": "匹配 napari Batch_ROI 图层当前选中的 ROI",
+    "Auto Contrast All Enabled": "对所有已勾选 ROI 重算对比度",
+    "Auto": "自动",
+    "Recompute auto contrast from this ROI's data": "从当前 ROI 的数据重算自动对比度",
+    "Open this ROI in a new napari viewer with current contrast": "在新的 napari 窗口中预览当前 ROI（应用当前对比度）",
+    "Video Parameters": "视频参数",
+    "Target Duration (s):": "目标时长（秒）：",
+    "Auto-compute FPS from frame count and target duration": "根据帧数与目标时长自动计算 FPS",
+    "Codec:": "编码器：",
+    "Quality (CRF, lower=better):": "画质（CRF，越低越好）：",
+    "18=best, 23=default, 28=smaller (FFmpeg only)": "18=最佳，23=默认，28=较小（仅 FFmpeg 支持）",
+    "Encoding Preset:": "编码速度：",
+    "Output": "输出",
+    "Output Directory:": "输出目录：",
+    "Browse...": "选择...",
+    "Computed FPS:": "已计算 FPS：",
+    "frames": "帧",
+    "Computing auto-contrast for each ROI...": "正在为每个 ROI 计算自动对比度...",
+    "FFmpeg not detected — will use OpenCV fallback.": "未检测到 FFmpeg — 将使用 OpenCV 回退方案。",
+    "No Batch_ROI layer found. Please draw ROIs first.": "未找到 Batch_ROI 图层。请先绘制 ROI。",
+    "Data layer not found in viewer.": "在查看器中未找到数据图层。",
+    "No ROIs drawn.": "尚未绘制 ROI。",
+    "No codec available.": "没有可用的编码器。",
+    "Selection": "选择",
+    "No ROI is currently selected in napari.": "napari 中当前未选中任何 ROI。",
+    "Auto contrast recomputed for all enabled ROIs.": "已为所有勾选 ROI 重算对比度。",
+    "Nothing to export": "无可导出项",
+    "No ROI is enabled for export.": "没有勾选任何 ROI。",
+    "Please choose an output directory.": "请选择输出目录。",
+    "Invalid contrast": "对比度无效",
+    "Codec": "编码器",
+    "Cancelling...": "正在取消...",
+    "Confirm": "确认",
+    "Export in progress. Cancel and close?": "正在导出。取消并关闭吗？",
+    "Export Videos": "导出视频",
+    "Export complete": "导出完成",
+    "All ROI videos exported.": "全部 ROI 视频已导出。",
+    "All exports failed.": "全部导出失败。",
+    "Cancelled.": "已取消。",
+    "succeeded": "成功",
+    "failed": "失败",
+    "Output:": "输出：",
+    "Export error": "导出错误",
+    "all": "全部",
+    # Phase 0 (2026-05-29): missing keys from ROI video export dialog
+    "Actions": "操作",
+    "ROIs (uncheck to skip, click row to preview)": "ROI 列表（取消勾选跳过，点击行预览）",
+    "Click a row to preview": "点击某一行以查看预览",
+    "Preview frame:": "预览帧：",
+    "FPS:": "FPS：",
+    "CRF:": "CRF：",
+    "Preset:": "速度预设：",
+    "Directory:": "输出目录：",
+    "Export Mode": "导出模式",
+    "Adjusted only (one file per ROI)": "仅调整后（每个 ROI 一个文件）",
+    "Original auto-contrast only": "仅原始自动对比度",
+    "Both (adjusted + original)": "两者都导出（调整后 + 原始）",
+    "Adjusted: use the values you tuned per ROI.\nOriginal: use the initial auto-contrast.\nBoth: emit two files per ROI (_adjusted.mp4 + _original.mp4).": "调整后：使用每个 ROI 手动调节的值。\n原始：使用初始自动对比度。\n两者都：每个 ROI 生成两个文件（_adjusted.mp4 + _original.mp4）。",
+    "(empty or invalid ROI)": "（ROI 为空或无效）",
+    "Select Output Directory": "选择输出目录",
+    "Exporting": "正在导出",
+    "file(s)": "个文件",
+    "Reset to the initial auto-contrast value": "重置为初始自动对比度值",
+    "ROIs loaded.": "个 ROI 已载入。",
+    "Crop error:": "裁剪错误：",
+    "frame": "帧",
+    "contrast adjusted=": "调整后对比度=",
+    "original=": "原始=",
+    "Auto contrast failed:": "自动对比度失败：",
+    "reset to original": "已重置为原始值",
+
+    # Phase 1 (2026-05-29): batch export confirm dialog
+    "Confirm Batch Export": "确认批量导出",
+    "Select ROIs to export": "选择要导出的 ROI",
+    "BBox (y1,x1,y2,x2)": "BBox (y1,x1,y2,x2)",
+    "Frames": "帧范围",
+    "Magnifier Preview": "Magnifier 预览",
+    "Loading preview...": "加载预览中...",
+    "Preview (napari current frame)": "预览（napari 当前帧）",
+    "(none — uses napari default)": "（无 — 使用 napari 默认对比度）",
+    "Apply Magnifier preview contrast (ROIs that have it)": "应用 Magnifier preview 对比度（仅对已设置的 ROI 生效）",
+    "TIFF output: contrast is burned in (grayscale), LUT is dropped (TIFF stack stays single-channel).":
+        "TIFF 输出：灰度对比度直接烧入，LUT 被丢弃（TIFF 堆栈保持单通道）。",
+    "PNG output: contrast burned in; non-Gray LUT produces RGB PNG.":
+        "PNG 输出：对比度烧入；非 Gray LUT 生成 RGB PNG。",
+    "No ROI has Magnifier-saved preview values. Open Magnifier, tune contrast and Apply first.":
+        "没有 ROI 保存了 Magnifier preview 值。请先打开 Magnifier 调整对比度并 Apply。",
+    "Also generate overview map (overview.png)": "同时生成概览图 (overview.png)",
+    "Overview map uses napari's current display contrast (not Magnifier preview).":
+        "概览图使用 napari 当前显示对比度（不是 Magnifier preview）。",
+    "Invert": "反选",
+    "Options": "选项",
+    "No ROI selected.": "未选择任何 ROI。",
+    "No ROI selected for export.": "未选择要导出的 ROI。",
+    "ROI(s)": "个 ROI",
+    "frames": "帧",
+    "files, ~": "个文件, ~",
+    "estimate": "估算",
+    "Frame": "帧",
+    "source": "源",
+    "ROIs marked for export": "已标记导出",
+    "Preview unavailable:": "预览不可用：",
+    "all": "全部",
+
+    # Phase 2 (2026-05-29): Recovery chapter UI
+    "Chapters (toggle to include historical loads)": "章节（勾选以包含历史载入）",
+    "Each load_dm4 / load_png / load_tiff starts a new chapter. By default only the current chapter is replayed.":
+        "每次 load_dm4 / load_png / load_tiff 都会开启新章节。默认只回放当前章节。",
+    "current": "当前",
+    "historical": "历史",
+    "actions": "个操作",
+    "(No actions in selected chapters)": "（所选章节中无操作）",
+
+    # Phase 5 (2026-05-29): trial/committed UI
+    "Commit Selected Trials": "提交所选试探",
+    "Promote selected trial actions to committed (persists to session JSON). Committed actions are always replayed.":
+        "把所选 trial 操作升级为 committed (写入 session JSON)。Committed 总是回放。",
+    "Commit Trials": "提交试探",
+    "Session log path missing.": "Session 日志路径缺失。",
+    "Session file not found.": "Session 文件未找到。",
+    "No trial actions selected. Select trial rows in the list first.":
+        "未选择任何 trial 操作。请先在列表中选中 🧪 行。",
+    "Nothing to commit.": "没有需要提交的操作。",
+    "Committed %d trial action(s).": "已提交 %d 个 trial 操作。",
+
+    # Phase 6 (2026-05-29): edit_records right-click menu
+    "Enable (clear disable/delete)": "启用（清除禁用/删除）",
+    "Disable": "禁用",
+    "Delete": "删除",
+    "Edit Record": "编辑记录",
+    "View / Edit Details": "查看 / 编辑详情",
+    "Reset to original state": "重置到原始状态",
+
+    # Issue #5 (2026-05-29): action detail / param-edit dialog
+    "Action Details": "操作详情",
+    "Overview (read-only)": "概要（只读）",
+    "Widget:": "组件:",
+    "Action:": "操作:",
+    "State:": "状态:",
+    "Action ID:": "操作 ID:",
+    "Timestamp:": "时间:",
+    "Edits applied:": "已应用的编辑:",
+    "Result:": "结果:",
+    "Parameters (editable — saved as a non-destructive edit)": "参数（可编辑 — 以非破坏性编辑保存）",
+    "Key": "键",
+    "Value": "值",
+    "(This action has no editable parameters.)": "（此操作没有可编辑的参数。）",
+    "Parameter Edit": "参数编辑",
+    "Saved %d change(s): %s\n\nThe action now shows ✏️ in the list; "
+    "recovery will replay with the new parameters.":
+        "已保存 %d 处改动: %s\n\n该操作现在列表中显示 ✏️ 标记; 恢复时将以新参数回放。",
+    "No parameter changes detected.": "未检测到参数改动。",
+    "Parameters edited (double-click to view/edit).": "参数已被编辑（双击查看/修改）。",
+
+    # Param-edit validation (2026-05-29): read-only reasons + Plan C messages
+    "Gray rows are read-only (derived / measured / structured / "
+    "layer refs). Edit an editable value then click OK; values "
+    "are parsed as JSON (e.g. 12, 1.5, true, [1,2], \"text\").":
+        "灰色行为只读（派生 / 测量 / 结构化 / 图层引用）。编辑可编辑的值后点 OK; "
+        "值按 JSON 解析（如 12, 1.5, true, [1,2], \"text\"）。",
+    "Derived from other fields (e.g. roi_count = len(rois)); "
+    "editing it has no effect on recovery.":
+        "派生自其它字段（如 roi_count = len(rois)）; 单独改它对恢复无影响。",
+    "A measured output; recovery re-measures this value, "
+    "so editing it has no effect.":
+        "这是测量输出; 恢复时会重新测量该值, 改它无影响。",
+    "Layer reference; renaming it here can make recovery "
+    "fail to find the source layer.":
+        "图层引用; 在此改名可能导致恢复时找不到源图层。",
+    "Structured data — edit it in its own panel, "
+    "not as raw JSON here.":
+        "结构化数据 — 请在其对应面板里编辑, 不要在此改原始 JSON。",
+    "Invalid Parameter Edit": "参数编辑无效",
+    "These edits were NOT saved. Fix the values and click OK again:":
+        "以下修改未保存。请修正后再次点 OK:",
+    "%s: must be a non-negative integer frame index (got %r)":
+        "%s: 必须是非负整数帧号（得到 %r）",
+    "%s: frame %s is out of range [0, %s]":
+        "%s: 帧号 %s 超出范围 [0, %s]",
+    "%s: must be 4 numbers [x1, y1, x2, y2] (got %r)":
+        "%s: 必须是 4 个数 [x1, y1, x2, y2]（得到 %r）",
+    "%s: requires x2 > x1 and y2 > y1 (got %s)":
+        "%s: 需满足 x2 > x1 且 y2 > y1（得到 %s）",
+    "%s: must be a positive finite number (got %r)":
+        "%s: 必须是正的有限数值（得到 %r）",
+    "%s: must be a positive integer (got %r)":
+        "%s: 必须是正整数（得到 %r）",
+    "%s: must be a finite number (got %r)":
+        "%s: 必须是有限数值（得到 %r）",
+
+    # Recovery (2026-05-30): reverted (Ctrl+Z) drift trials kept as history
+    "Reverted with Ctrl+Z (kept as history); "
+    "not replayed unless you select it.":
+        "已用 Ctrl+Z 撤销（保留为历史记录）; 除非手动勾选, 否则不会回放。",
 }
 
 def tr(text):
@@ -982,6 +1297,7 @@ class GlobalConfig:
         "shortcut_switch_mode": "M",
         "shortcut_hide_roi": "K",      # [New] 隐藏 ROI 标注
         "shortcut_toggle_overview": "V",  # [New] 切换概览图独立源
+        "shortcut_set_range": "R",     # [New] 为选中 ROI 设置帧范围
         "shortcut_delete_session": "Delete",  # 删除会话快捷键
         
         # Drift Defaults
@@ -1019,7 +1335,7 @@ class GlobalConfig:
         "geo_suffix_lrtem": "_lrtem",
         "geo_suffix_hrtem": "_hrtem",
         "geo_suffix_mask": "_mask",
-        "geo_suffix_mask_new": "_mask_new",
+        "geo_suffix_mask_refined": "_mask_refined",  # 精修掩膜后缀 (与 Finetuning 标准化输出一致; 旧默认 _mask_new 已标准化)
 
         # Enhance Defaults
         "enh_use_gaussian": False, # [New]
@@ -1065,6 +1381,7 @@ class GlobalConfig:
         "session_recovery_mode": "review",  # 恢复模式: "auto"(全自动) 或 "review"(每步确认)
         "session_auto_detect_source": True,  # 恢复前自动检测数据源
         "session_confirm_export": True,  # 导出操作前询问用户
+        "session_auto_continue_after_recovery": True,  # recovery 后自动续写
         
         # Session Protection (新增)
         "session_starred_reminder_threshold": 20,  # 收藏超过此数量时显示提醒
@@ -1233,7 +1550,7 @@ class SettingsDialog(QDialog):
         f_cache = QFormLayout()
         self.cache_dir_edit = QLineEdit(str(GlobalConfig.get("cache_dir")))
         btn_browse = QPushButton("📂")
-        btn_browse.clicked.connect(lambda: self.cache_dir_edit.setText(QFileDialog.getExistingDirectory(self, "Cache Dir")))
+        btn_browse.clicked.connect(lambda: self.cache_dir_edit.setText(QFileDialog.getExistingDirectory(self, tr("Cache Dir"))))
         h = QHBoxLayout(); h.addWidget(self.cache_dir_edit); h.addWidget(btn_browse)
         f_cache.addRow(tr("Path:"), h)
         g_cache.setLayout(f_cache); l.addWidget(g_cache)
@@ -1358,12 +1675,12 @@ class SettingsDialog(QDialog):
         self.suff_lr = QLineEdit(str(GlobalConfig.get("geo_suffix_lrtem")))
         self.suff_hr = QLineEdit(str(GlobalConfig.get("geo_suffix_hrtem")))
         self.suff_mask = QLineEdit(str(GlobalConfig.get("geo_suffix_mask")))
-        self.suff_new = QLineEdit(str(GlobalConfig.get("geo_suffix_mask_new")))
+        self.suff_refined = QLineEdit(str(GlobalConfig.get("geo_suffix_mask_refined")))
         f_geo.addRow(tr("Main Suffix:"), self.suff_main)
         f_geo.addRow(tr("LR Suffix:"), self.suff_lr)
         f_geo.addRow(tr("HR Suffix:"), self.suff_hr)
         f_geo.addRow(tr("Mask Suffix:"), self.suff_mask)
-        f_geo.addRow(tr("New Mask Suffix:"), self.suff_new)
+        f_geo.addRow(tr("Refined Mask Suffix:"), self.suff_refined)
         g_geo.setLayout(f_geo); l.addWidget(g_geo)
 
         l.addStretch(); w.setLayout(l)
@@ -1390,7 +1707,7 @@ class SettingsDialog(QDialog):
             btn.setStyleSheet(f"background-color: {curr_col}; border: 1px solid #555;")
             
             def pick():
-                c = QColorDialog.getColor(QColor(line.text()), self, "Select Color")
+                c = QColorDialog.getColor(QColor(line.text()), self, tr("Select Color"))
                 if c.isValid():
                     hex_c = c.name()
                     line.setText(hex_c)
@@ -1663,12 +1980,12 @@ class SettingsDialog(QDialog):
         
         # 默认物质名
         self.session_substance = QLineEdit(str(GlobalConfig.get("session_substance_default")))
-        self.session_substance.setPlaceholderText("e.g. CRY2, BSA")
+        self.session_substance.setPlaceholderText(tr("e.g. CRY2, BSA"))
         f_log.addRow(tr("Default Substance:"), self.session_substance)
         
         # 默认 Dataset ID
         self.session_dataset = QLineEdit(str(GlobalConfig.get("session_dataset_default")))
-        self.session_dataset.setPlaceholderText("e.g. ds1, ds2")
+        self.session_dataset.setPlaceholderText(tr("e.g. ds1, ds2"))
         f_log.addRow(tr("Default Dataset ID:"), self.session_dataset)
         
         g_log.setLayout(f_log)
@@ -1972,6 +2289,7 @@ class SettingsDialog(QDialog):
             "shortcut_switch_mode": tr("Switch Draw/Select Mode"),
             "shortcut_hide_roi": tr("Hide ROI Labels"),
             "shortcut_toggle_overview": tr("Overview Uses View Layer"),
+            "shortcut_set_range": tr("Set Frame Range (Selected ROI)"),
             "shortcut_session_star": tr("Star / Unstar Session"),
             "shortcut_session_label": tr("Edit Session Label"),
             "shortcut_delete_session": tr("Delete Session")
@@ -2029,7 +2347,7 @@ class SettingsDialog(QDialog):
         GlobalConfig.set("geo_suffix_lrtem", self.suff_lr.text(), emit_signal=False)
         GlobalConfig.set("geo_suffix_hrtem", self.suff_hr.text(), emit_signal=False)
         GlobalConfig.set("geo_suffix_mask", self.suff_mask.text(), emit_signal=False)
-        GlobalConfig.set("geo_suffix_mask_new", self.suff_new.text(), emit_signal=False)
+        GlobalConfig.set("geo_suffix_mask_refined", self.suff_refined.text(), emit_signal=False)
 
         # Save Styles
         GlobalConfig.set("style_measure_color", self.style_meas_col.text(), emit_signal=False)

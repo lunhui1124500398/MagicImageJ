@@ -28,6 +28,8 @@ from PIL import Image, ImageDraw, ImageFont
 import os
 from widgets.settings_widget import tr
 from utils.session_logger import get_logger
+import gc
+from utils.memory_utils import trim_working_set
 
 
 class AnnotationWidget(QWidget):
@@ -436,16 +438,17 @@ class AnnotationWidget(QWidget):
         QApplication.setOverrideCursor(Qt.WaitCursor)
 
         try:
-            # 1. Create Empty Overlay
-            # 注意：对于非常大的 stack，np.zeros 可能会耗内存，但通常这是最快的方法
-            overlay_data = np.zeros((n_frames, H, W, 4), dtype=np.uint8)
-            
-            if 'Preview_Overlay' in self.viewer.layers: 
+            # 1. Create 2D Overlay (only current frame rendered lazily)
+            overlay_data = np.zeros((H, W, 4), dtype=np.uint8)
+
+            if 'Preview_Overlay' in self.viewer.layers:
                 self.viewer.layers.remove('Preview_Overlay')
-            
+
+            src_scale = list(self.current_source_layer.scale)
+            src_translate = list(self.current_source_layer.translate)
             self.preview_overlay_layer = self.viewer.add_image(
-                overlay_data, name='Preview_Overlay', blending='translucent_no_depth', 
-                scale=self.current_source_layer.scale, translate=self.current_source_layer.translate
+                overlay_data, name='Preview_Overlay', blending='translucent_no_depth',
+                scale=src_scale[-2:], translate=src_translate[-2:]
             )
             self.preview_overlay_layer.editable = False
             
@@ -467,21 +470,17 @@ class AnnotationWidget(QWidget):
         self._refresh_overlay_only()
 
     def _refresh_overlay_only(self):
-        """渲染当前帧的 Overlay"""
+        """渲染当前帧的 Overlay (2D lazy rendering)"""
         if not self.preview_overlay_layer: return
-        
-        current_step = self.viewer.dims.current_step[0]
-        # 检查索引是否越界 (针对不同长度的图层切换)
-        if current_step >= self.preview_overlay_layer.data.shape[0]: return
 
-        H, W = self.preview_overlay_layer.data.shape[1], self.preview_overlay_layer.data.shape[2]
-        
-        # Render On-the-fly
+        current_step = self.viewer.dims.current_step[0]
+
+        H, W = self.preview_overlay_layer.data.shape[0], self.preview_overlay_layer.data.shape[1]
+
         empty = np.zeros((H, W, 4), dtype=np.uint8)
         new_frame = self._render_single_frame_overlay(empty, current_step, H, W)
-        
-        # Update Data Slice
-        self.preview_overlay_layer.data[current_step] = new_frame
+
+        self.preview_overlay_layer.data[:] = new_frame
         self.preview_overlay_layer.refresh()
 
     def _render_single_frame_overlay(self, canvas_rgba, frame_idx, H, W):
@@ -820,9 +819,11 @@ class AnnotationWidget(QWidget):
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
-        out_frames = []
+        new_data = np.empty((n_frames, H, W, 3), dtype=np.uint8)
         for i in range(n_frames):
-            if progress.wasCanceled(): return
+            if progress.wasCanceled():
+                del new_data
+                return
             # --- 核心逻辑 ---
             frame = np.asarray(data[i])
             # === 核心修复：应用对比度映射 ===
@@ -878,35 +879,37 @@ class AnnotationWidget(QWidget):
             # frame_out = cv2.cvtColor(np.array(pil_out.convert("RGB")), cv2.COLOR_RGB2BGR)
             # 转回 Numpy (RGB) 供 Napari 显示
             frame_out = np.array(pil_out.convert("RGB"))
-            out_frames.append(frame_out)
+            new_data[i] = frame_out
 
             progress.setValue(i)
             QApplication.processEvents() 
             
         progress.setValue(n_frames)
-        new_data = np.stack(out_frames)
-        # self.viewer.add_image(new_data, name=f"Burned_{self.current_source_layer.name}")
         new_layer_name = f"Burned_{self.current_source_layer.name}"
-        # self.viewer.add_image(new_data, name=new_layer_name)
-        
-       # 添加新图层
+
+        # 保存源图层引用 — add_image 会触发 inserted 事件 → _refresh_layers
+        # → _on_layer_selected, 导致 self.current_source_layer 被覆盖为新图层
+        original_source = self.current_source_layer
+        original_source_name = original_source.name if original_source else ""
+
         new_layer = self.viewer.add_image(new_data, name=new_layer_name)
+        self._clear_preview()
+        gc.collect()
+        trim_working_set()
         self.status_label.setText(tr("Done."))
 
-        # === 修复：自动切换逻辑 ===
-        # 隐藏源图层 (Annotation 通常也是针对特定图层操作的)
-        if self.current_source_layer:
-            self.current_source_layer.visible = False
-        # 激活新图层 (这会自动触发其他 Widget 的联动刷新)
+        # 隐藏源图层，显示并激活新图层
+        if original_source is not None and original_source.name in self.viewer.layers:
+            original_source.visible = False
+        new_layer.visible = True
         self.viewer.layers.selection.active = new_layer
-        # 本地刷新
         self._refresh_layers()
         self.layer_combo.setCurrentText(new_layer_name)
 
         # === 烧录后记录 (Post-Burn Logging) ===
         try:
             burn_params = {
-                "source_layer": self.current_source_layer.name if self.current_source_layer else "",
+                "source_layer": original_source_name,
                 "result_layer": new_layer_name,
                 "frame_count": n_frames,
                 "params": self._get_params_dict()

@@ -14,6 +14,8 @@ from widgets.settings_widget import tr
 from utils.utils import elide_text
 from utils.ui_utils import setup_safe_scroll_all
 from utils.session_logger import get_logger
+import gc
+from utils.memory_utils import trim_working_set
 
 
 class FilterWidget(QWidget):
@@ -70,7 +72,7 @@ class FilterWidget(QWidget):
         
         l_range.addWidget(QLabel(tr("Enter frame indices to DROP:")))
         self.edit_drop_range = QLineEdit()
-        self.edit_drop_range.setPlaceholderText("e.g. 0-100, 500, 600-650")
+        self.edit_drop_range.setPlaceholderText(tr("e.g. 0-10, 15, 20-25"))
         self.edit_drop_range.setToolTip(
             tr("Supported formats:") + "\n" +
             "- " + tr("Range") + ": 0-10\n" +
@@ -292,7 +294,9 @@ class FilterWidget(QWidget):
             colormap='gray',
             metadata=new_metadata
         )
-        
+        gc.collect()
+        trim_working_set()
+
         # 5. 隐藏源图层，激活新图层
         layer.visible = False
         self.viewer.layers.selection.active = new_layer

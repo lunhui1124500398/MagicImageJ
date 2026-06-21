@@ -7,7 +7,7 @@
 import numpy as np
 import cv2
 from typing import Tuple, Optional
-from utils.memory_utils import create_huge_array
+from utils.memory_utils import create_huge_array, release_memmap_pages
 import os
 
 def calculate_rotation_angle(line_points: Tuple[Tuple[float, float], Tuple[float, float]]) -> float:
@@ -64,20 +64,27 @@ def rotate_image_stack(image_stack: np.ndarray,
             # 直接写入预分配数组
             # 使用 borderMode=cv2.BORDER_CONSTANT (黑色填充)
             result_stack[i] = cv2.warpAffine(frame, M, (dest_w, dest_h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            
-            if progress_callback and i % 5 == 0: 
-                progress_callback(i + 1, total)
-        
-        if progress_callback: 
+
+            # progress_callback 返回 False 表示用户取消, 终止并清理
+            if progress_callback and i % 5 == 0:
+                ret = progress_callback(i + 1, total)
+                if ret is False:
+                    raise InterruptedError("rotation cancelled by user")
+
+        if progress_callback:
             progress_callback(total, total)
-        
-        if hasattr(result_stack, 'flush'):
-            result_stack.flush()
-            
+
+        release_memmap_pages(result_stack)
         return result_stack
-        
-    except Exception as e:
-        print(f"Rotation Error: {e}")
+
+    except (InterruptedError, Exception) as e:
+        if not isinstance(e, InterruptedError):
+            print(f"Rotation Error: {e}")
+        # 清理 memmap 临时文件 (取消 / 失败都走这里)
+        try:
+            del result_stack
+        except Exception:
+            pass
         if temp_file and os.path.exists(temp_file):
             try: os.remove(temp_file)
             except: pass
@@ -91,6 +98,21 @@ def flip_image_stack(image_stack: np.ndarray, mode: str) -> np.ndarray:
     # image_stack shape: (T, Y, X)
     # axis 1 is Y (Vertical), axis 2 is X (Horizontal)
     axis = 2 if mode == 'horizontal' else 1
+    frame_axis = axis - 1
+
+    if isinstance(image_stack, np.memmap):
+        result, temp_file = create_huge_array(image_stack.shape, image_stack.dtype, fill_zeros=False)
+        try:
+            for i in range(len(image_stack)):
+                result[i] = np.ascontiguousarray(np.flip(image_stack[i], axis=frame_axis))
+            if hasattr(result, 'flush'):
+                result.flush()
+            return result
+        except Exception as e:
+            if temp_file and os.path.exists(temp_file):
+                try: os.remove(temp_file)
+                except: pass
+            raise e
     return np.ascontiguousarray(np.flip(image_stack, axis=axis))
 
 def crop_image_stack(image_stack: np.ndarray,
@@ -102,6 +124,21 @@ def crop_image_stack(image_stack: np.ndarray,
     x2 = max(0, min(x2, W))
     y1 = max(0, min(y1, H))
     y2 = max(0, min(y2, H))
+
+    if isinstance(image_stack, np.memmap):
+        new_shape = (T, y2 - y1, x2 - x1)
+        result, temp_file = create_huge_array(new_shape, image_stack.dtype, fill_zeros=False)
+        try:
+            for i in range(T):
+                result[i] = image_stack[i, y1:y2, x1:x2]
+            if hasattr(result, 'flush'):
+                result.flush()
+            return result
+        except Exception as e:
+            if temp_file and os.path.exists(temp_file):
+                try: os.remove(temp_file)
+                except: pass
+            raise e
     return np.ascontiguousarray(image_stack[:, y1:y2, x1:x2])
 
 def crop_multiple_rois(image_stack: np.ndarray, bboxes: list) -> list:

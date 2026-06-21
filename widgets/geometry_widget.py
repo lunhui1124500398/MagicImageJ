@@ -30,6 +30,8 @@ import subprocess
 import sys
 from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
+import gc
+from utils.memory_utils import trim_working_set
 from utils.auto_crop_session_locator import find_current_session_root
 from utils.utils import elide_text
 from core.geometry_helpers import (
@@ -38,6 +40,48 @@ from core.geometry_helpers import (
     compute_adaptive_font_size,
     generate_grid_lines, find_grid_cell_bounds
 )
+
+
+# ==========================================
+# Phase 1 (2026-05-29): LUT helper for batch export burn-in
+# 与 widgets/roi_video_export_dialog._build_lut_table 保持名称一致
+# ==========================================
+def _build_export_lut_table(lut_name):
+    """Return (256, 3) uint8 LUT. 'Gray' / unknown fall back to identity grayscale->RGB."""
+    if lut_name == 'Inverted':
+        return np.repeat((255 - np.arange(256))[:, None], 3, axis=1).astype(np.uint8)
+    _LUT_TO_MPL = {'Viridis': 'viridis', 'Inferno': 'inferno', 'Hot': 'hot', 'Cool': 'cool'}
+    try:
+        import matplotlib.cm as _cm
+        _has_mpl = True
+    except Exception:
+        _has_mpl = False
+    if lut_name == 'Gray' or not _has_mpl or lut_name not in _LUT_TO_MPL:
+        return np.repeat(np.arange(256)[:, None], 3, axis=1).astype(np.uint8)
+    cmap = _cm.get_cmap(_LUT_TO_MPL[lut_name])
+    return (cmap(np.arange(256) / 255.0)[..., :3] * 255).astype(np.uint8)
+
+
+def _apply_export_post_burn(u8, override):
+    """[Issue] 复刻 roi_magnifier._apply_post_burn: 先 CLAHE 再 gamma, 作用于 uint8 灰度帧。
+    在线性对比度烧入之后、LUT 之前调用, 使 _preview 导出与放大镜所见一致。"""
+    if override is None:
+        return u8
+    if override.get('clahe'):
+        try:
+            import cv2
+            clip = float(override.get('clahe_clip', 3.0) or 3.0)
+            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
+            u8 = clahe.apply(u8)
+        except Exception:
+            pass
+    try:
+        gamma = float(override.get('gamma', 1.0) or 1.0)
+    except Exception:
+        gamma = 1.0
+    if abs(gamma - 1.0) > 1e-6:
+        u8 = np.clip((u8.astype(np.float32) / 255.0) ** gamma * 255.0, 0, 255).astype(np.uint8)
+    return u8
 
 # ==========================================
 #  新增：后台图像读取线程 (防止界面卡死)
@@ -148,11 +192,22 @@ class BatchExportThread(QThread):
             # Flags
             create_denoise = self.p['create_denoise']
             create_refine = self.p['create_refine']
-            
+            create_enhanced = self.p.get('create_enhanced', False)
+
             is_tiff = self.p['is_tiff']
             keep_idx = self.p['keep_idx']
             pad = self.p['pad']
-            
+
+            # Phase 1 (2026-05-29): Magnifier preview contrast burn-in
+            apply_preview_contrast = self.p.get('apply_preview_contrast', False)
+            preview_overrides = self.p.get('preview_overrides', [])
+            # Phase 1: preserve original ROI 1-based ids for NP naming
+            # so users see NP2 / NP4 instead of being renumbered NP1 / NP2 after filtering.
+            roi_label_ids = self.p.get('roi_label_ids', None)
+
+            # [Tiered export] origin 级开关 (默认开)；关掉则不写 _origin 文件夹
+            export_origin = self.p.get('export_origin', True)
+
             total_frames = data_stack.shape[0]
             log_crops = []
             count = len(rois)
@@ -169,7 +224,9 @@ class BatchExportThread(QThread):
                 range_to_use = specific_range if specific_range else global_range_text
                 selected_indices = parse_indices_helper(range_to_use, total_frames)
                 
-                if not selected_indices: continue 
+                if not selected_indices:
+                    print(f"Warning: ROI #{i+1} skipped — empty frame range: '{range_to_use}'")
+                    continue
                     
                 # 3. 动态切片 & 裁剪
                 filtered_data_stack = np.asarray(data_stack[selected_indices])
@@ -178,12 +235,15 @@ class BatchExportThread(QThread):
                 # 4. 构建基础名称
                 # 格式: 20251104_Dataset3_CRY2_NP1 或者 20251104_CRY2_NP1
                 dataset_str = f"_{dataset_id}" if dataset_id else ""
-                base_name = f"{date_str}{dataset_str}_{sub_name}_NP{i+1}"
+                # Phase 1: use original 1-based id if provided (post-filter), else loop index
+                nid = roi_label_ids[i] if (roi_label_ids is not None and i < len(roi_label_ids)) else (i + 1)
+                base_name = f"{date_str}{dataset_str}_{sub_name}_NP{nid}"
                 
                 # 主数据文件夹 (加上 UI 输入的主后缀)
-                # e.g. ..._NP1_origin
+                # e.g. ..._NP1_origin —— [Tiered export] 仅在 origin 级开启时创建/写入
                 folder_main = output_dir / f"{base_name}{suffix_main}"
-                folder_main.mkdir(parents=True, exist_ok=True)
+                if export_origin:
+                    folder_main.mkdir(parents=True, exist_ok=True)
                 
                 # 同理准备视图层导出文件夹
                 folder_view = None
@@ -203,42 +263,115 @@ class BatchExportThread(QThread):
                 
                 if create_refine:
                     (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask']}").mkdir(exist_ok=True)
-                    (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask_new']}").mkdir(exist_ok=True)
+                    (output_dir / f"{base_name}{suffix_main}{aux_suffixes['mask_refined']}").mkdir(exist_ok=True)
+
+                folder_enhanced = None
+                if create_enhanced:
+                    folder_enhanced = output_dir / f"{base_name}{suffix_main}_enhanced_contrasted"
+                    folder_enhanced.mkdir(parents=True, exist_ok=True)
                 # ===============================================
 
-                # 5. 保存文件到 main 文件夹
+                # Phase 1: resolve per-ROI Magnifier preview override (may be None)
+                override = None
+                if apply_preview_contrast and i < len(preview_overrides):
+                    override = preview_overrides[i]
+                lut_table = None
+                if override is not None and override.get('lut', 'Gray') != 'Gray' and not is_tiff:
+                    lut_table = _build_export_lut_table(override['lut'])
+
+                # [Issue #1] Magnifier 预览(对比度[+LUT]) 不再覆盖 _origin —— origin 永远是原始数据。
+                # 有 override 时单独写入清晰命名的 _preview 文件夹, 用户一眼能找到调好的彩色/对比结果。
+                folder_preview = None
+                if override is not None:
+                    folder_preview = output_dir / f"{base_name}_preview"
+                    folder_preview.mkdir(parents=True, exist_ok=True)
+
+                # 5. 保存文件: _origin 永远原始(灰度), _preview 为 Magnifier 烧入版
                 if is_tiff:
-                    export_to_tiff_stack(crop, str(folder_main / f"{base_name}.tiff"))
+                    # origin 始终原始 (仅在 origin 级开启时写)
+                    if export_origin:
+                        export_to_tiff_stack(crop, str(folder_main / f"{base_name}.tiff"))
+                    if folder_preview is not None:
+                        # 预览 TIFF: 仅烧入对比度 (TIFF 不带 LUT, 与对话框提示一致)
+                        Tc = crop.shape[0]
+                        Hc, Wc = crop.shape[1], crop.shape[2]
+                        c_min_t = float(override['c_min'])
+                        c_max_t = float(override['c_max'])
+                        rng_t = max(c_max_t - c_min_t, 1e-8)
+                        burned = np.empty((Tc, Hc, Wc), dtype=np.uint8)
+                        for k in range(Tc):
+                            f = np.asarray(crop[k]).astype(np.float32)
+                            b = np.clip((f - c_min_t) / rng_t * 255, 0, 255).astype(np.uint8)
+                            burned[k] = _apply_export_post_burn(b, override)  # [Issue] CLAHE+gamma
+                        export_to_tiff_stack(burned, str(folder_preview / f"{base_name}.tiff"))
+                        del burned
                     if export_view and folder_view:
                         export_to_tiff_stack(crop_view, str(folder_view / f"{base_name}.tiff"))
                 else:
                     for k, img in enumerate(crop):
-                        # 归一化数据层
-                        if img.dtype in [np.float32, np.float64]:
-                            mn, mx = img.min(), img.max()
-                            if mx > mn: img = ((img - mn) / (mx - mn) * 255).astype(np.uint8)
-                            else: img = img.astype(np.uint8)
-                        
                         # 命名
                         file_idx = selected_indices[k] if keep_idx else k
                         file_name = f"{file_idx:0{pad}d}.png"
-                        save_path = str(folder_main / file_name)
 
-                        try:
-                            # 兼容中文路径
-                            is_success, im_buf = cv2.imencode(".png", img)
-                            if is_success: im_buf.tofile(save_path)
-                        except Exception as save_err:
-                            print(f"Save Error: {save_err}")
-                            
-                        # 保存视图层
+                        # [Issue #1] _origin 永远写原始(灰度归一化); [Tiered] 仅 origin 级开启时写
+                        if export_origin:
+                            if img.dtype in [np.float32, np.float64]:
+                                mn, mx = img.min(), img.max()
+                                if mx > mn:
+                                    img_origin = ((img - mn) / (mx - mn) * 255).astype(np.uint8)
+                                else:
+                                    img_origin = img.astype(np.uint8)
+                            else:
+                                img_origin = img
+                            try:
+                                # 兼容中文路径
+                                is_success, im_buf = cv2.imencode(".png", img_origin)
+                                if is_success: im_buf.tofile(str(folder_main / file_name))
+                            except Exception as save_err:
+                                print(f"Save Error: {save_err}")
+
+                        # [Issue #1] Magnifier 预览(对比度[+gamma/CLAHE][+LUT]) → _preview 文件夹
+                        if folder_preview is not None:
+                            c_min_p = float(override['c_min'])
+                            c_max_p = float(override['c_max'])
+                            rng_p = max(c_max_p - c_min_p, 1e-8)
+                            f_arr = np.asarray(img).astype(np.float32)
+                            img_burned = np.clip((f_arr - c_min_p) / rng_p * 255, 0, 255).astype(np.uint8)
+                            # [Issue] CLAHE + gamma 后处理(与放大镜一致), 在 LUT 之前
+                            img_burned = _apply_export_post_burn(img_burned, override)
+                            if lut_table is not None:
+                                img_save_p = lut_table[img_burned][..., ::-1]  # RGB→BGR for cv2
+                            else:
+                                img_save_p = img_burned
+                            try:
+                                ok_p, buf_p = cv2.imencode(".png", img_save_p)
+                                if ok_p: buf_p.tofile(str(folder_preview / file_name))
+                            except Exception as save_err:
+                                print(f"Preview Save Error: {save_err}")
+
+                        # 保存 CLAHE 增强版 — 总是基于原 img, 不与 preview burn 复合
+                        if create_enhanced and folder_enhanced is not None:
+                            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                            if img.dtype == np.uint8:
+                                img_u8_for_clahe = img
+                            else:
+                                mn2, mx2 = img.min(), img.max()
+                                img_u8_for_clahe = ((img - mn2) / (mx2 - mn2 + 1e-8) * 255).astype(np.uint8)
+                            enhanced_frame = clahe.apply(img_u8_for_clahe)
+                            try:
+                                ok_e, buf_e = cv2.imencode(".png", enhanced_frame)
+                                if ok_e: buf_e.tofile(str(folder_enhanced / file_name))
+                            except Exception as e_err:
+                                print(f"Enhanced Save Error: {e_err}")
+
+                        # 保存视图层 — 不应用 preview burn (视图层是用户独立的可视化路径)
                         if export_view and folder_view:
                             img_v = crop_view[k]
                             if img_v.dtype != np.uint8:
                                 mn_v, mx_v = img_v.min(), img_v.max()
                                 if mx_v > mn_v: img_v = ((img_v - mn_v) / (mx_v - mn_v) * 255).astype(np.uint8)
                                 else: img_v = img_v.astype(np.uint8)
-                                
+
                             save_path_v = str(folder_view / file_name)
                             try:
                                 is_success_v, im_buf_v = cv2.imencode(".png", img_v)
@@ -248,7 +381,8 @@ class BatchExportThread(QThread):
                 
                 # 6. 日志
                 log_crops.append({
-                    "id": i+1, "bbox": bbox, "folder": folder_main.name, 
+                    "id": nid, "bbox": bbox, "folder": folder_main.name,
+                    "preview_folder": folder_preview.name if folder_preview is not None else None,
                     "frame_range_used": range_to_use if range_to_use else "All"
                 })
                 self.progress.emit(i + 1)
@@ -274,7 +408,62 @@ class BatchExportThread(QThread):
                 "rois": log_crops
             }
             with open(json_path, 'w') as f: json.dump(log_data, f, indent=2)
-            
+
+            # --- manifest.json: cross-tool interface ---
+            manifest = {
+                "version": 1,
+                "type": "MagicImageJ_Export",
+                "created_at": datetime.datetime.now().isoformat(),
+                "dataset": {
+                    "date": date_str,
+                    "substance": sub_name,
+                    "dataset_id": dataset_id,
+                },
+                "export": {
+                    "format": "TIFF" if is_tiff else "PNG",
+                    "total_source_frames": int(total_frames),
+                    "suffix_main": suffix_main,
+                    "suffix_view": view_suffix_main if export_view else "",
+                    "has_origin": export_origin,
+                    "has_denoise_folders": create_denoise,
+                    "has_refine_folders": create_refine,
+                    "has_enhanced": create_enhanced,
+                    "has_magnifier_preview": any(e.get("preview_folder") for e in log_crops),
+                },
+                "particles": [],
+                "overview": {},
+            }
+            for entry in log_crops:
+                pid = entry["id"]
+                dataset_str_m = f"_{dataset_id}" if dataset_id else ""
+                base = f"{date_str}{dataset_str_m}_{sub_name}_NP{pid}"
+                paths = {}
+                if export_origin:
+                    paths["origin"] = f"{base}{suffix_main}"
+                if entry.get("preview_folder"):
+                    paths["preview"] = entry["preview_folder"]
+                if export_view:
+                    paths["contrasted"] = f"{base}{view_suffix_main}"
+                if create_enhanced:
+                    paths["enhanced_contrasted"] = f"{base}{suffix_main}_enhanced_contrasted"
+                if create_refine:
+                    paths["mask"] = f"{base}{suffix_main}{aux_suffixes['mask']}"
+                    paths["mask_refined"] = f"{base}{suffix_main}{aux_suffixes['mask_refined']}"
+                if create_denoise:
+                    paths["lrtem"] = f"{base}{suffix_main}{aux_suffixes['lrtem']}"
+                    paths["hrtem"] = f"{base}{suffix_main}{aux_suffixes['hrtem']}"
+                manifest["particles"].append({
+                    "id": pid,
+                    "label": f"NP{pid}",
+                    "bbox": list(entry["bbox"]),
+                    "frame_range": entry["frame_range_used"],
+                    "paths": paths,
+                    "quality": {"flag": "unchecked", "notes": ""},
+                })
+            manifest_path = output_dir / "manifest.json"
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+
             self.finished.emit(count, str(output_dir.name))
 
         except Exception as e:
@@ -305,19 +494,33 @@ class RotationThread(QThread):
     progress = Signal(int, int)
     finished = Signal(np.ndarray)
     error = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, stack, angle, expand):
         super().__init__()
         self.stack = stack
         self.angle = angle
         self.expand = expand
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
             def cb(c, t):
                 self.progress.emit(c, t)
+                # Returning False signals the core loop to abort.
+                if self._cancelled:
+                    return False
+                return True
             res = rotate_image_stack(self.stack, self.angle, expand=self.expand, progress_callback=cb)
+            if self._cancelled:
+                self.cancelled.emit()
+                return
             self.finished.emit(res)
+        except InterruptedError:
+            self.cancelled.emit()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -356,6 +559,14 @@ class GeometryWidget(QWidget):
         self._data_change_timer.setInterval(80)  # 80ms debounce
         self._data_change_timer.timeout.connect(self._do_batch_data_change)
 
+        # === [Issue #3] 绘制/缩放 ROI 期间的提交节流 ===
+        # _roi_drag_active: 鼠标拖拽绘制/调整 ROI 期间为 True，此时抑制重量级处理
+        #   （夹取最小尺寸、重写 layer.data、强制切模式、记 update_rois），改为释放后统一提交一次。
+        # _roi_drag_dirty: 本次拖拽期间 ROI 数据是否真的变过——只有变过才在释放时提交，
+        #   避免单纯点选（无数据变化）也刷一条 update_rois。
+        self._roi_drag_active = False
+        self._roi_drag_dirty = False
+
         self._setup_ui()
 
         # 初始化与热更新
@@ -376,6 +587,15 @@ class GeometryWidget(QWidget):
         self.viewer.bind_key(switch_key, self._on_shortcut_switch)
         self.viewer.bind_key(hide_roi_key, self._on_shortcut_hide_roi)
         self.viewer.bind_key(overview_key, self._on_shortcut_toggle_overview)
+
+        # [Issue 3b] Shortcut for "Set Frame Range (Selected ROI)" — saves clicking
+        # the 📌 button each time. overwrite=True guards a napari default collision.
+        set_range_key = GlobalConfig.get_napari_shortcut("shortcut_set_range")
+        if set_range_key:
+            try:
+                self.viewer.bind_key(set_range_key, self._on_shortcut_set_range, overwrite=True)
+            except Exception:
+                pass
 
     def _setup_ui(self):
         main_layout = QVBoxLayout()
@@ -436,6 +656,7 @@ class GeometryWidget(QWidget):
         apply_rotate_btn.clicked.connect(self._apply_rotation)
         rotate_layout.addWidget(apply_rotate_btn)
         rotate_group.setLayout(rotate_layout)
+        self._install_collapsible(rotate_group, start_collapsed=False)
         layout.addWidget(rotate_group)
 
         # ========== 2. 单次裁剪模块 ==========
@@ -455,6 +676,7 @@ class GeometryWidget(QWidget):
         apply_crop_btn.clicked.connect(self._apply_crop)
         crop_layout.addWidget(apply_crop_btn)
         crop_group.setLayout(crop_layout)
+        self._install_collapsible(crop_group, start_collapsed=False)
         layout.addWidget(crop_group)
 
         # ========== 3. 批量ROI提取 (增强版) ==========
@@ -483,7 +705,7 @@ class GeometryWidget(QWidget):
         h_sync.addWidget(self.sync_layers_btn)
 
         self.peek_btn = QPushButton(f"👁️ {tr('Peek Data (Hold)')}")
-        self.peek_btn.setToolTip("Hold to temporarily show Data Layer to check alignment")
+        self.peek_btn.setToolTip(tr("Hold to temporarily show Data Layer to check alignment"))
         self.peek_btn.pressed.connect(self._peek_data_layer_show)
         self.peek_btn.released.connect(self._peek_data_layer_hide)
         h_sync.addWidget(self.peek_btn)
@@ -526,7 +748,7 @@ class GeometryWidget(QWidget):
         # [Req 3] Suffix Input (Flexible)
         name_layout.addWidget(QLabel(tr("Suffix:")))
         self.suffix_edit = QLineEdit("_origin")
-        self.suffix_edit.setPlaceholderText("e.g. _origin")
+        self.suffix_edit.setPlaceholderText(tr("e.g. _origin"))
         self.suffix_edit.setMinimumWidth(80)
         name_layout.addWidget(self.suffix_edit, 1)
         batch_layout.addLayout(name_layout)
@@ -550,15 +772,19 @@ class GeometryWidget(QWidget):
         
 
         self.check_refine = QCheckBox(tr("Gen Refine Folder"))
-        self.check_refine.setToolTip(tr("Creates empty folder with Main Suffix + Configured Suffix (e.g. _contrasted_mask_new)"))
-        
+        self.check_refine.setToolTip(tr("Creates empty mask + refined-mask folders (e.g. _contrasted_mask + _contrasted_mask_refined)"))
+
+        self.check_enhanced = QCheckBox(tr("Export Enhanced (CLAHE)"))
+        self.check_enhanced.setToolTip(tr("Export CLAHE-enhanced crops alongside originals (local contrast adjustment)"))
 
         h_checks.addWidget(self.check_denoise)
         h_checks.addWidget(self.check_refine)
+        h_checks.addWidget(self.check_enhanced)
         batch_layout.addLayout(h_checks)
 
         self.check_denoise.stateChanged.connect(lambda v: GlobalConfig.set("geo_create_denoise", bool(v)))
         self.check_refine.stateChanged.connect(lambda v: GlobalConfig.set("geo_create_refine", bool(v)))
+        self.check_enhanced.stateChanged.connect(lambda v: GlobalConfig.set("geo_export_enhanced", bool(v)))
         self.export_view_check.stateChanged.connect(lambda v: GlobalConfig.set("geo_export_view", bool(v)))
         self.suffix_edit.editingFinished.connect(lambda: GlobalConfig.set("geo_suffix", self.suffix_edit.text()))
 
@@ -575,13 +801,17 @@ class GeometryWidget(QWidget):
         self.batch_frame_edit = QLineEdit()
         self.batch_frame_edit.setPlaceholderText(tr("All (Default) or 0-10, 15..."))
         self.batch_frame_edit.setToolTip(tr("Leave empty for All frames.\nOr use: 0-10, 15, 20-25"))
+        # [Issue 5] Cap width so the trailing "Set for Selected" button is never pushed
+        # off the right edge of a narrow dock.
+        self.batch_frame_edit.setMaximumWidth(120)
         frame_layout.addWidget(self.batch_frame_edit)
 
         self.btn_set_specific_range = QPushButton(f"📌 {tr('Set for Selected')}")
-        self.btn_set_specific_range.setToolTip(tr("Apply the text in the box to the CURRENTLY SELECTED ROI only."))
+        self.btn_set_specific_range.setToolTip(tr("Apply the text in the box to the CURRENTLY SELECTED ROI only.") + "  (R)")
         self.btn_set_specific_range.clicked.connect(self._set_range_for_selected_roi)
         self.btn_set_specific_range.setStyleSheet("background-color: #555; font-size: 10px; padding: 4px;")
         frame_layout.addWidget(self.btn_set_specific_range)
+        frame_layout.addStretch()
         batch_layout.addLayout(frame_layout)
 
         # === [Feature 2] Slider Range Lock UI ===
@@ -696,11 +926,61 @@ class GeometryWidget(QWidget):
         self.auto_propose_roi_btn = QPushButton(f"🤖 {tr('Auto Propose ROI')}")
         self.auto_propose_roi_btn.clicked.connect(self._auto_propose_roi)
         self.auto_propose_roi_btn.setToolTip(tr("Generate candidate ROIs from the current session and load them into Batch_ROI"))
-        
+
+        self.auto_suggest_temporal_btn = QPushButton(f"🔬 {tr('Auto-suggest (T+S)')}")
+        self.auto_suggest_temporal_btn.clicked.connect(self._auto_suggest_temporal_spatial)
+        self.auto_suggest_temporal_btn.setToolTip(tr("Temporal motion map + spatial DoG: auto-detect particles and suggest ROIs"))
+
+        self.preview_roi_btn = QPushButton(f"👁️ {tr('Preview ROI')}")
+        self.preview_roi_btn.setToolTip(tr("Open cropped animation of selected ROI with auto-contrast"))
+        self.preview_roi_btn.clicked.connect(self._preview_selected_roi)
+
+        self.export_roi_video_btn = QPushButton(f"🎬 {tr('Export ROI Videos')}")
+        self.export_roi_video_btn.setToolTip(tr("Export each ROI as a small region video with per-ROI auto contrast"))
+        self.export_roi_video_btn.clicked.connect(self._export_roi_videos)
+
+        self.magnifier_btn = QPushButton(f"🔍 {tr('Magnifier')}")
+        self.magnifier_btn.setToolTip(tr(
+            "Open a floating, always-on-top magnifier bound to the currently selected ROI. "
+            "Select another ROI and click again to open a SECOND window (one per ROI). "
+            "Tune Min/Max/LUT, then Apply to ROI metadata to feed the ROI Video dialog."
+        ))
+        self.magnifier_btn.clicked.connect(self._open_roi_magnifier)
+        self._magnifiers = {}             # key: roi_idx or '_follow' -> ROIMagnifierWindow
+        self._magnifier_count_baseline = 0  # last known len(Batch_ROI.data) for invalidation
+
         h_roi_io.addWidget(btn_save_roi)
         h_roi_io.addWidget(btn_load_roi)
+        h_roi_io.addWidget(self.preview_roi_btn)
+        h_roi_io.addWidget(self.magnifier_btn)
+        h_roi_io.addWidget(self.export_roi_video_btn)
         h_roi_io.addWidget(self.auto_propose_roi_btn)
+        h_roi_io.addWidget(self.auto_suggest_temporal_btn)
         batch_layout.addLayout(h_roi_io)
+
+        # === Liquid Cell Mask ===
+        h_mask = QHBoxLayout()
+        self.mask_auto_btn = QPushButton(f"🎯 {tr('Auto-detect Mask')}")
+        self.mask_auto_btn.setToolTip(tr("Detect liquid cell boundary from temporal variance. Used by Auto-suggest and YOLO."))
+        self.mask_auto_btn.clicked.connect(self._create_or_update_mask)
+        self.mask_edit_btn = QPushButton(f"✏️ {tr('Edit Mask')}")
+        self.mask_edit_btn.setToolTip(tr("Switch to mask layer for manual editing (paint=1, erase=0)"))
+        self.mask_edit_btn.clicked.connect(self._edit_mask)
+        self.mask_clear_btn = QPushButton(f"🗑️ {tr('Clear Mask')}")
+        self.mask_clear_btn.clicked.connect(self._clear_mask)
+        self.yolo_detect_btn = QPushButton(f"🧠 {tr('Auto-detect (YOLO)')}")
+        self.yolo_detect_btn.setToolTip(tr("Run trained YOLO model to detect particles within the mask"))
+        self.yolo_detect_btn.clicked.connect(self._yolo_detect)
+        yolo_model_path = Path(r"D:\Revolution_Sample_Claude\02_Data_analysis\yolo_roi_pool\best.pt")
+        self.yolo_detect_btn.setEnabled(yolo_model_path.exists())
+        if not yolo_model_path.exists():
+            self.yolo_detect_btn.setToolTip(tr("YOLO model not yet trained. Accumulate 300+ ROIs first."))
+
+        h_mask.addWidget(self.mask_auto_btn)
+        h_mask.addWidget(self.mask_edit_btn)
+        h_mask.addWidget(self.mask_clear_btn)
+        h_mask.addWidget(self.yolo_detect_btn)
+        batch_layout.addLayout(h_mask)
         
         # === [新增] PNG/TIFF 快速导入按钮 ===
         h_quick_import = QHBoxLayout()
@@ -785,6 +1065,8 @@ class GeometryWidget(QWidget):
         overview_layout.addWidget(self.preview_overview_btn)
         
         overview_group.setLayout(overview_layout)
+        # [Issue 5] Collapse this rarely-changed settings block by default to shorten the tab.
+        self._install_collapsible(overview_group, start_collapsed=True)
         batch_layout.addWidget(overview_group)
 
         self.export_batch_btn = QPushButton(f"💾 {tr('Export Crops & Map')}")
@@ -834,6 +1116,40 @@ class GeometryWidget(QWidget):
             self.angle_spin, self.padding_spin
         )
 
+    # ---------- [Issue 5] collapsible section helpers ----------
+
+    def _install_collapsible(self, group, start_collapsed=False):
+        """Make a QGroupBox collapsible: a checkbox appears in its title; unchecking
+        hides the contents to reclaim vertical space. Lets the user shorten the tab."""
+        try:
+            group.setCheckable(True)
+            group.setChecked(not start_collapsed)
+            group.toggled.connect(lambda on, g=group: self._set_group_children_visible(g, on))
+            if start_collapsed:
+                self._set_group_children_visible(group, False)
+        except Exception:
+            pass
+
+    def _set_group_children_visible(self, group, visible):
+        """Recursively show/hide every widget inside a group's layout."""
+        layout = group.layout()
+        if layout is None:
+            return
+
+        def _walk(lay):
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                if item is None:
+                    continue
+                w = item.widget()
+                if w is not None:
+                    w.setVisible(visible)
+                else:
+                    sub = item.layout()
+                    if sub is not None:
+                        _walk(sub)
+        _walk(layout)
+
     def _on_shortcut_apply(self, viewer):
         if "Batch_ROI" in self.viewer.layers and len(self.viewer.layers["Batch_ROI"].data) > 0:
             self._export_batch_crops()
@@ -880,6 +1196,15 @@ class GeometryWidget(QWidget):
             self._update_preview_image()
         self.status_label.setText(f"👁️ {tr('Overview uses:')} {tr('View Layer') if new_state else tr('Data Layer')}")
 
+    def _on_shortcut_set_range(self, viewer):
+        """[Issue 3b] Apply the Frame Filter text to the selected ROI(s) via shortcut."""
+        if "Batch_ROI" not in self.viewer.layers:
+            return
+        if not list(self.viewer.layers["Batch_ROI"].selected_data):
+            self.status_label.setText(f"⚠️ {tr('No ROI selected. Select a green box first.')}")
+            return
+        self._set_range_for_selected_roi()
+
     def _refresh_layers(self, event=None):
         layers = [
             l.name for l in self.viewer.layers 
@@ -924,6 +1249,19 @@ class GeometryWidget(QWidget):
         data_candidates = [l for l in layers if l.lower().startswith("cropped_rotated") or "cropped" in l.lower()]
         if not data_candidates:
              data_candidates = [l for l in layers if "rotated" in l.lower() and "enh" not in l.lower() and "contrast" not in l.lower() and "burned" not in l.lower()]
+        if not data_candidates:
+            # [Issue 4] No crop/rotate yet (plain import + enhance): fall back to the RAW
+            # import layer so the Crop Source is never silently the enhanced/view layer
+            # (which would write enhanced pixels into the "_origin" export). Matches the
+            # import prefixes for dm4 (Original_), PNG (PNG_) and TIFF (TIFF_).
+            raw = [l for l in layers if l.lower().startswith(("original_", "png_", "tiff_"))]
+            if raw:
+                data_candidates = [raw[0]]   # first = oldest import = the true origin
+            else:
+                _derived = ("enh", "contrast", "burned", "preview", "overview", "mask")
+                non_derived = [l for l in layers if not any(d in l.lower() for d in _derived)]
+                if non_derived:
+                    data_candidates = [non_derived[0]]
         if data_candidates:
             idx = self.batch_data_combo.findData(data_candidates[-1])
             if idx >= 0: self.batch_data_combo.setCurrentIndex(idx)
@@ -933,9 +1271,6 @@ class GeometryWidget(QWidget):
             view_candidates = [l for l in layers if l.lower().startswith("enh")]
         if view_candidates:
             idx = self.batch_view_combo.findData(view_candidates[-1])
-            if idx >= 0: self.batch_view_combo.setCurrentIndex(idx)
-        elif self.batch_data_combo.currentData():
-            idx = self.batch_view_combo.findData(self.batch_data_combo.currentData())
             if idx >= 0: self.batch_view_combo.setCurrentIndex(idx)
 
         self.batch_data_combo.blockSignals(False)
@@ -1004,7 +1339,7 @@ class GeometryWidget(QWidget):
         view_name = self.batch_view_combo.currentData()
         if not view_name or view_name not in self.viewer.layers: return
         try: self.viewer.layers.events.reordered.disconnect(self._enforce_view_visibility)
-        except: pass
+        except Exception: pass
         for layer in self.viewer.layers:
             if isinstance(layer, napari.layers.Image):
                 layer.visible = (layer.name == view_name)
@@ -1054,20 +1389,60 @@ class GeometryWidget(QWidget):
 
     def _apply_rotation(self):
         layer_name = self.rotate_layer_combo.currentData()
-        if not layer_name: return
+        if not layer_name:
+            # [Issue #2] combo 为空时此前直接静默 return → 用户看到"点 Apply 完全没反应"。
+            # 多半是加载数据后下拉框没刷新。先自动刷新一次再试。
+            self._refresh_layers()
+            layer_name = self.rotate_layer_combo.currentData()
+        if not layer_name:
+            # 仍为空：给出可操作的明确提示，区分"没有可旋转的 3D 堆栈"与"未选择图层"。
+            has_3d = any(
+                isinstance(getattr(l, 'data', None), np.ndarray) and getattr(l.data, 'ndim', 0) == 3
+                for l in self.viewer.layers
+            )
+            if has_3d:
+                self.status_label.setText(f"⚠️ {tr('Select a layer to rotate first.')}")
+            else:
+                self.status_label.setText(
+                    f"⚠️ {tr('No 3D stack to rotate. Load a stack (rotation needs a multi-frame layer).')}"
+                )
+            return
         angle = self.angle_spin.value()
+        # [Issue #2] 角度≈0 时 cv2 旋转是恒等变换，只会复制出一个看起来一模一样的 Rotated_ 图层，
+        # 让用户误以为"旋转功能失效"。这里改为提示先画水平线或输入角度，而不是静默生成无变化图层。
+        if abs(angle) < 0.01:
+            self.status_label.setText(
+                f"⚠️ {tr('Rotation angle is 0 deg. Draw a leveling line or type an angle first.')}"
+            )
+            return
         expand = self.enlarge_check.isChecked()
         image_stack = self.viewer.layers[layer_name].data
         self.status_label.setText(f"⏳ {tr('Rotating...')}")
-        self.rot_progress = QProgressDialog(tr("Rotating %.1f°...") % angle, "Cancel", 0, len(image_stack), self)
+        self.rot_progress = QProgressDialog(tr("Rotating %.1f°...") % angle, tr("Cancel"), 0, len(image_stack), self)
         self.rot_progress.setWindowModality(Qt.WindowModal)
+        self.rot_progress.setAutoClose(False)
+        self.rot_progress.setAutoReset(False)
         self.rot_progress.show()
-        
+
         self.rot_thread = RotationThread(image_stack, angle, expand)
         self.rot_thread.progress.connect(lambda c, t: self.rot_progress.setValue(c))
-        
+        # Wire up cancel: dialog X / Cancel / Esc all reach here
+        self.rot_progress.canceled.connect(self.rot_thread.cancel)
+
         def on_finished(rotated):
+            # [Issue #2] QProgressDialog.close() 内部会调用 cancel() 并发出 canceled() 信号，
+            # 它连到 rot_thread.cancel → 把 _cancelled 置 True。必须在 close() 之前先读取真实的
+            # 取消状态、并断开该信号，否则一次成功旋转会被误判为"已取消"而丢弃结果(无新图层)。
+            was_cancelled = self.rot_thread._cancelled
+            try:
+                self.rot_progress.canceled.disconnect(self.rot_thread.cancel)
+            except Exception:
+                pass
             self.rot_progress.close()
+            if was_cancelled:
+                # Defensive: ignore late results after a real cancel
+                self.status_label.setText(f"⏹ {tr('Rotation cancelled.')}")
+                return
             try:
                 new_name = f"Rotated_{layer_name}"
                 new_layer = self.viewer.add_image(rotated, name=new_name, colormap='gray', metadata={'source_layer': layer_name})
@@ -1089,7 +1464,7 @@ class GeometryWidget(QWidget):
                         "expand": expand
                     })
                     new_layer.metadata['action_id'] = action_id
-                except: pass
+                except Exception: pass
                 
                 @new_layer.bind_key(undo_key, overwrite=True)
                 def undo_rotation(layer):
@@ -1104,7 +1479,9 @@ class GeometryWidget(QWidget):
                     if aid:
                         try:
                             get_logger().log_undo(aid)
-                        except: pass
+                        except Exception: pass
+                gc.collect()
+                trim_working_set()
                 self.status_label.setText(f"✅ {tr('Rotated %.1f° (Expand=%s)') % (angle, expand)}")
             except Exception as e:
                 self.status_label.setText(f"{tr('Error showing result:')} {e}")
@@ -1113,8 +1490,18 @@ class GeometryWidget(QWidget):
             self.rot_progress.close()
             self.status_label.setText(f"❌ {tr('Rotation Error:')} {err}")
 
+        def on_cancelled():
+            self.rot_progress.close()
+            self.status_label.setText(f"⏹ {tr('Rotation cancelled.')}")
+            gc.collect()
+            try:
+                trim_working_set()
+            except Exception:
+                pass
+
         self.rot_thread.finished.connect(on_finished)
         self.rot_thread.error.connect(on_error)
+        self.rot_thread.cancelled.connect(on_cancelled)
         self.rot_thread.start()
 
     def _apply_flip(self, direction):
@@ -1132,15 +1519,17 @@ class GeometryWidget(QWidget):
             idx2 = self.simple_crop_combo.findData(new_name)
             if idx2 >= 0: self.simple_crop_combo.setCurrentIndex(idx2)
             self.viewer.layers.selection.active = self.viewer.layers[new_name]
+            gc.collect()
+            trim_working_set()
             self.status_label.setText(f"✅ {tr('Applied %s flip.') % direction}")
-            
+
             # === [日志记录] 翻转操作 ===
             try:
                 get_logger().log_action("geometry", "flip", {
                     "source_layer": layer_name,
                     "direction": direction
                 })
-            except: pass
+            except Exception: pass
         except Exception as e:
             self.status_label.setText(f"Error: {e}")
 
@@ -1180,6 +1569,8 @@ class GeometryWidget(QWidget):
         new_layer = self.viewer.add_image(cropped, name=new_name, colormap='gray')
         self._clear_residue(["Crop_ROI"])
         self.viewer.layers.selection.active = new_layer
+        gc.collect()
+        trim_working_set()
 
         for layer in self.viewer.layers:
             if isinstance(layer, napari.layers.Image) and layer.name != new_name:
@@ -1195,7 +1586,7 @@ class GeometryWidget(QWidget):
                 "bbox": list(bbox)  # [x1, y1, x2, y2]
             })
             new_layer.metadata['action_id'] = action_id
-        except: pass
+        except Exception: pass
         
         @new_layer.bind_key(undo_key, overwrite=True)
         def undo_crop(layer):
@@ -1211,7 +1602,7 @@ class GeometryWidget(QWidget):
             if aid:
                 try:
                     get_logger().log_undo(aid)
-                except: pass
+                except Exception: pass
 
         self.status_label.setText(f"""✅ {tr("Crop applied. Press '%s' to Undo.") % undo_key}""")
 
@@ -1489,6 +1880,28 @@ class GeometryWidget(QWidget):
         
         layer.mouse_drag_callbacks.append(intercept_right_click)
 
+        # [Issue #3] 绘制/调整提交点：把重量级处理推迟到鼠标释放。
+        # napari 在 add_rectangle 拖拽中会持续触发 events.data；若让 80ms 防抖在释放前触发，
+        # 会夹取半成品小框、重写 layer.data 打断手势、并反复刷 update_rois（用户报告的三个症状）。
+        # 生成器协议：按下时置 active 标志→拖拽中保持→释放后清标志，仅当期间真的有数据变化才提交一次。
+        def commit_on_release(layer, event):
+            self._roi_drag_active = True
+            self._roi_drag_dirty = False
+            try:
+                yield
+                while event.type == 'mouse_move':
+                    yield
+            finally:
+                # 即使中途异常或生成器被关闭也务必复位，避免 flag 卡死后再也不处理 ROI
+                self._roi_drag_active = False
+                if self._roi_drag_dirty:
+                    self._roi_drag_dirty = False
+                    try:
+                        self._data_change_timer.start()
+                    except Exception:
+                        pass
+        layer.mouse_drag_callbacks.append(commit_on_release)
+
         @layer.mouse_double_click_callbacks.append
         def on_double_click(layer, event):
             if layer.mode != 'select':
@@ -1571,7 +1984,7 @@ class GeometryWidget(QWidget):
     #     except:
     #         # 回退兼容
     #         try: val = layer.get_value(event.position, world=True)
-    #         except: pass
+    #         except Exception: pass
 
     #     # 5. 如果是背景 (None)，则【延迟】切换
     #     if val is None:
@@ -1618,12 +2031,22 @@ class GeometryWidget(QWidget):
                     ranges[idx] = str(range_str) 
                     infos[idx] = f"[{range_str}]"
         
-        layer.features = {
+        new_features = {
             'label': labels,
             'frame_range': ranges,
             'frame_info': infos
         }
-        
+        # [Issue #1/#3] 保留 Magnifier 的 preview_* 列(含 gamma/clahe)，避免设帧范围时被清空
+        for _col, _default in (('preview_min', np.nan), ('preview_max', np.nan), ('preview_lut', ''),
+                               ('preview_gamma', 1.0), ('preview_clahe', False),
+                               ('preview_clahe_clip', 3.0)):
+            if _col in current_features:
+                _vals = list(current_features[_col])
+                while len(_vals) < n_shapes:
+                    _vals.append(_default)
+                new_features[_col] = _vals[:n_shapes]
+        layer.features = new_features
+
         layer.refresh()
         self.status_label.setText(f"""✅ {tr("Set range '%s' for %s ROI(s).") % (range_str, len(selected_idxs))}""")
 
@@ -1636,11 +2059,20 @@ class GeometryWidget(QWidget):
         """[Fix 2] 防抖入口：启动/重启计时器，避免拖拽绘制时每次 mouse_move 都触发重量级处理"""
         if self._is_updating: return
         if "Batch_ROI" not in self.viewer.layers: return
+        # [Issue #3] 拖拽绘制/调整进行中：仅标脏，待鼠标释放后由 commit_on_release 统一提交一次，
+        # 避免在拖拽中途夹取半成品小框、重写 layer.data 打断手势、并反复记 update_rois。
+        if self._roi_drag_active:
+            self._roi_drag_dirty = True
+            return
         self._data_change_timer.start()  # restart 80ms countdown
 
     def _do_batch_data_change(self):
         """实际的数据变更处理（防抖后触发）"""
         if self._is_updating: return
+        # [Issue #3] 若新一轮拖拽已开始，推迟到该拖拽释放后再提交，避免落在手势中途
+        if self._roi_drag_active:
+            self._roi_drag_dirty = True
+            return
         if "Batch_ROI" not in self.viewer.layers: return
         
         # ===【增强】修改前保存状态到历史栈 ===
@@ -1649,10 +2081,13 @@ class GeometryWidget(QWidget):
         layer = self.viewer.layers["Batch_ROI"]
         current_count = len(layer.data)
 
+        # Invalidate magnifiers whose bound idx may have shifted/disappeared
+        self._invalidate_magnifiers_on_count_drop()
+
         # 🔄 先记录是否需要切换模式，但不立即执行
         should_switch_to_select = (
-            hasattr(self, '_last_shape_count') and 
-            current_count > self._last_shape_count and 
+            hasattr(self, '_last_shape_count') and
+            current_count > self._last_shape_count and
             layer.mode == 'add_rectangle'
         )
 
@@ -1696,9 +2131,17 @@ class GeometryWidget(QWidget):
 
         self._is_updating = True
         try:
+            # [Issue #1] 抓取 Magnifier 写入的 preview_* 列；下面重建 features 时按序保留，
+            # 否则每次拖动/改帧范围都会把它们清空，导致批量导出丢失对比度与 LUT。
+            _preview_cols = {}
+            _cur_feats = layer.features
+            for _col in ('preview_min', 'preview_max', 'preview_lut', 'preview_gamma', 'preview_clahe'):
+                if _col in _cur_feats:
+                    _preview_cols[_col] = list(_cur_feats[_col])
+
             new_data_list = []
             modified = False
-            
+
             for roi in layer.data:
                 ys, xs = roi[:, 0], roi[:, 1]
                 y1, y2 = np.min(ys), np.max(ys)
@@ -1706,8 +2149,15 @@ class GeometryWidget(QWidget):
                 
                 h, w = y2 - y1, x2 - x1
                 needs_reshape = False
-                
-                if self.force_square_check.isChecked() and abs(w - h) > 1.0:
+                MIN_ROI_PX = 20
+
+                if h < MIN_ROI_PX or w < MIN_ROI_PX:
+                    side = max(MIN_ROI_PX, max(h, w))
+                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    ny1, ny2 = cy - side / 2, cy + side / 2
+                    nx1, nx2 = cx - side / 2, cx + side / 2
+                    needs_reshape = True
+                elif self.force_square_check.isChecked() and abs(w - h) > 1.0:
                     side = int(max(w, h))
                     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                     ny1, ny2 = int(cy - side / 2), int(cy - side / 2) + side
@@ -1715,12 +2165,12 @@ class GeometryWidget(QWidget):
                     needs_reshape = True
                 else:
                     ny1, ny2, nx1, nx2 = y1, y2, x1, x2
-                
+
                 ny1 = max(0, min(ny1, IMG_H)); ny2 = max(0, min(ny2, IMG_H))
                 nx1 = max(0, min(nx1, IMG_W)); nx2 = max(0, min(nx2, IMG_W))
-                
+
                 if needs_reshape or (ny1 != y1 or ny2 != y2 or nx1 != x1 or nx2 != x2):
-                    new_rect = np.array([[ny1, nx1], [ny2, nx1], [ny2, nx2], [ny1, nx2]])
+                    new_rect = np.array([[ny1, nx1], [ny1, nx2], [ny2, nx2], [ny2, nx1]])
                     new_data_list.append(new_rect)
                     modified = True
                 else:
@@ -1751,12 +2201,21 @@ class GeometryWidget(QWidget):
                 'visible': not bool(GlobalConfig.get("geo_hide_roi_labels"))
             }
             
-            layer.features = {
+            new_features = {
                 'label': labels,
                 'frame_range': range_list,
                 'frame_info': info_list
             }
-            
+            # [Issue #1/#3] 把 preview_* 列(含 gamma/clahe)对齐到当前 ROI 数量后并回写
+            for _col, _default in (('preview_min', np.nan), ('preview_max', np.nan), ('preview_lut', ''),
+                                   ('preview_gamma', 1.0), ('preview_clahe', False)):
+                if _col in _preview_cols:
+                    _vals = list(_preview_cols[_col])
+                    while len(_vals) < n_shapes:
+                        _vals.append(_default)
+                    new_features[_col] = _vals[:n_shapes]
+            layer.features = new_features
+
         finally:
             self._is_updating = False
 
@@ -1784,7 +2243,7 @@ class GeometryWidget(QWidget):
                 "roi_count": len(rois_snapshot),
                 "rois": rois_snapshot
             })
-        except: pass
+        except Exception: pass
         
         # ===【增强】处理完成后，保存当前状态作为下一次变更的"前状态" ===
         self._save_prev_state()
@@ -2001,14 +2460,14 @@ class GeometryWidget(QWidget):
                     "view_layer": view_layer_name,
                     "data_layer": data_layer_name
                 })
-            except: pass
+            except Exception: pass
             
             self.status_label.setText(msg)
-            QMessageBox.information(self, "Success", msg)
+            QMessageBox.information(self, tr("Success"), msg)
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-    
+            QMessageBox.critical(self, tr("Error"), str(e))
+
     def _save_reference_snapshot(self, img_layer, roi_layer, save_path):
         try:
             current_step = self.viewer.dims.current_step[0]
@@ -2077,7 +2536,7 @@ class GeometryWidget(QWidget):
     # === [核心逻辑升级] 智能加载 ROI (探测报告 + 用户确认 + 手动回退) ===
     def _load_rois_from_json(self):
         start_dir = QSettings("NapariUser", "Global").value("archive_path", str(Path.home()))
-        path_str, _ = QFileDialog.getOpenFileName(self, "Load ROI JSON", start_dir, "JSON (*.json)")
+        path_str, _ = QFileDialog.getOpenFileName(self, tr("Load ROI JSON"), start_dir, "JSON (*.json)")
         if not path_str: return
         
         json_path = Path(path_str)
@@ -2199,7 +2658,7 @@ class GeometryWidget(QWidget):
                 self._restore_rois_to_layer(data_dump)
 
         except Exception as e:
-            QMessageBox.critical(self, "JSON Load Error", str(e))
+            QMessageBox.critical(self, tr("JSON Load Error"), str(e))
     
     def _on_single_image_loaded(self, data, name, role):
         """
@@ -2214,7 +2673,9 @@ class GeometryWidget(QWidget):
             # 1. 将数据添加到 Napari 视图中
             # colormap='gray' 是默认设置，您可以根据需要调整
             new_layer = self.viewer.add_image(data, name=name, colormap='gray')
-            
+            gc.collect()
+            trim_working_set()
+
             # 2. 根据 role 自动选中下拉框
             # 这样用户就不用手动去 ComboBox 里再选一次了
             self._refresh_layers()  # 先刷新图层列表
@@ -2630,6 +3091,480 @@ class GeometryWidget(QWidget):
             self.status_label.setText(f"❌ {tr('Auto propose failed:')} {e}")
             QMessageBox.critical(self, tr("Auto Propose ROI Error"), str(e))
 
+    # =========================================================================
+    # Liquid Cell Mask
+    # =========================================================================
+    _MASK_LAYER_NAME = "Liquid_Cell_Mask"
+
+    def _get_mask_array(self) -> np.ndarray | None:
+        if self._MASK_LAYER_NAME in self.viewer.layers:
+            return (self.viewer.layers[self._MASK_LAYER_NAME].data > 0).astype(np.uint8)
+        return None
+
+    def _create_or_update_mask(self):
+        data_layer_name = self.batch_data_combo.currentData()
+        if not data_layer_name or data_layer_name not in self.viewer.layers:
+            QMessageBox.warning(self, tr("Mask"), tr("Please select a data layer first."))
+            return
+
+        stack = self.viewer.layers[data_layer_name].data
+        if stack.ndim != 3:
+            QMessageBox.warning(self, tr("Mask"), tr("Data layer must be a 3D stack (T, H, W)."))
+            return
+
+        self.status_label.setText(tr("Detecting liquid cell boundary..."))
+        from qtpy.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        from utils.auto_suggest_rois import auto_detect_roi_mask
+        skip = min(15, stack.shape[0] // 5)
+        usable = stack[skip:] if skip < stack.shape[0] else stack
+        mask = auto_detect_roi_mask(usable)
+
+        if self._MASK_LAYER_NAME in self.viewer.layers:
+            self.viewer.layers[self._MASK_LAYER_NAME].data = mask
+        else:
+            self.viewer.add_labels(
+                mask, name=self._MASK_LAYER_NAME,
+                opacity=0.3, color={1: "cyan"},
+            )
+
+        self.status_label.setText(f"✅ {tr('Mask detected.')} {tr('Edit Mask to refine.')}")
+
+    def _edit_mask(self):
+        if self._MASK_LAYER_NAME not in self.viewer.layers:
+            data_layer_name = self.batch_data_combo.currentData()
+            if data_layer_name and data_layer_name in self.viewer.layers:
+                shape = self.viewer.layers[data_layer_name].data.shape[-2:]
+            else:
+                QMessageBox.warning(self, tr("Mask"), tr("Please auto-detect or load a data layer first."))
+                return
+            blank = np.zeros(shape, dtype=np.int32)
+            self.viewer.add_labels(blank, name=self._MASK_LAYER_NAME, opacity=0.3, color={1: "cyan"})
+
+        layer = self.viewer.layers[self._MASK_LAYER_NAME]
+        self.viewer.layers.selection.active = layer
+        layer.mode = "paint"
+        layer.selected_label = 1
+        layer.brush_size = 30
+        self.status_label.setText(tr("Painting mask. Use paint (label=1) and erase (label=0)."))
+
+    def _clear_mask(self):
+        if self._MASK_LAYER_NAME in self.viewer.layers:
+            self.viewer.layers.remove(self._MASK_LAYER_NAME)
+            self.status_label.setText(tr("Mask cleared."))
+
+    # =========================================================================
+    # ROI Crop Preview
+    # =========================================================================
+    def _preview_selected_roi(self):
+        """Open a new napari viewer showing the cropped stack for the selected ROI."""
+        if "Batch_ROI" not in self.viewer.layers:
+            QMessageBox.warning(self, tr("Preview"), tr("No ROIs defined."))
+            return
+
+        roi_layer = self.viewer.layers["Batch_ROI"]
+        selected = list(roi_layer.selected_data)
+        if not selected:
+            QMessageBox.warning(self, tr("Preview"), tr("Please select an ROI first (click on a rectangle)."))
+            return
+
+        data_layer_name = self.batch_data_combo.currentData()
+        if not data_layer_name or data_layer_name not in self.viewer.layers:
+            QMessageBox.warning(self, tr("Preview"), tr("Please select a data layer first."))
+            return
+
+        stack = self.viewer.layers[data_layer_name].data
+        roi_idx = selected[0]
+        roi = roi_layer.data[roi_idx]
+        features = roi_layer.features
+        label = list(features.get("label", []))[roi_idx] if roi_idx < len(features.get("label", [])) else f"NP{roi_idx + 1}"
+
+        ys, xs = roi[:, 0], roi[:, 1]
+        y1, y2 = int(min(ys)), int(max(ys))
+        x1, x2 = int(min(xs)), int(max(xs))
+        y1, x1 = max(0, y1), max(0, x1)
+        if stack.ndim == 3:
+            y2, x2 = min(stack.shape[1], y2), min(stack.shape[2], x2)
+            cropped = stack[:, y1:y2, x1:x2].copy()
+        else:
+            y2, x2 = min(stack.shape[0], y2), min(stack.shape[1], x2)
+            cropped = stack[y1:y2, x1:x2].copy()
+
+        if cropped.size == 0:
+            QMessageBox.warning(self, tr("Preview"), tr("Selected ROI has zero area."))
+            return
+
+        # Also crop view layer if available
+        view_layer_name = self.batch_view_combo.currentData()
+        cropped_view = None
+        if view_layer_name and view_layer_name in self.viewer.layers:
+            view_stack = self.viewer.layers[view_layer_name].data
+            if view_stack.ndim == 3:
+                cropped_view = view_stack[:, y1:y2, x1:x2].copy()
+            else:
+                cropped_view = view_stack[y1:y2, x1:x2].copy()
+
+        # Auto-levels: percentile-based contrast (same as Enhancement tab)
+        flat = cropped.ravel() if cropped.ndim == 2 else cropped.reshape(-1)
+        auto_min = float(np.percentile(flat, 0.5))
+        auto_max = float(np.percentile(flat, 99.5))
+        if auto_max <= auto_min:
+            auto_min, auto_max = float(cropped.min()), float(cropped.max())
+
+        h, w = cropped.shape[-2], cropped.shape[-1]
+        n_frames = cropped.shape[0] if cropped.ndim == 3 else 1
+        title = f"Preview {label} ({w}×{h}, {n_frames}f)"
+
+        import napari as _napari
+        preview_viewer = _napari.Viewer(title=title, show=True)
+        preview_viewer.add_image(
+            cropped, name=f"{label}_origin",
+            contrast_limits=(auto_min, auto_max),
+        )
+        if cropped_view is not None:
+            flat_v = cropped_view.ravel() if cropped_view.ndim == 2 else cropped_view.reshape(-1)
+            v_min = float(np.percentile(flat_v, 0.5))
+            v_max = float(np.percentile(flat_v, 99.5))
+            preview_viewer.add_image(
+                cropped_view, name=f"{label}_contrasted",
+                contrast_limits=(v_min, v_max), visible=False,
+            )
+        preview_viewer.window.resize(max(400, w * 3), max(350, h * 3 + 80))
+
+        export_widget = self._build_preview_export_widget(preview_viewer, label)
+        preview_viewer.window.add_dock_widget(export_widget, name=tr("Export"), area="bottom")
+
+        self.status_label.setText(f"✅ {tr('Preview opened:')} {label} ({w}×{h})")
+
+    def _build_preview_export_widget(self, preview_viewer, label):
+        from qtpy.QtWidgets import QPushButton as _QPB, QWidget as _QW, QHBoxLayout as _QHL, QFileDialog as _QFD
+        container = _QW()
+        layout = _QHL(container)
+
+        def auto_contrast():
+            active = preview_viewer.layers.selection.active
+            if active is None:
+                return
+            flat = active.data.ravel()
+            c_min = float(np.percentile(flat, 0.5))
+            c_max = float(np.percentile(flat, 99.5))
+            if c_max <= c_min:
+                c_min, c_max = float(active.data.min()), float(active.data.max())
+            active.contrast_limits = (c_min, c_max)
+            preview_viewer.status = f"Auto: [{c_min:.0f}, {c_max:.0f}]"
+
+        def reset_contrast():
+            active = preview_viewer.layers.selection.active
+            if active is None:
+                return
+            active.contrast_limits = (float(active.data.min()), float(active.data.max()))
+
+        def _burn_export(data, contrast_limits, out_dir, pad=4):
+            """Export with contrast limits burned into pixel values."""
+            import cv2
+            c_min, c_max = contrast_limits
+            frames = [data] if data.ndim == 2 else [data[i] for i in range(data.shape[0])]
+            for i, frame in enumerate(frames):
+                f = frame.astype(np.float32)
+                f = (f - c_min) / (c_max - c_min + 1e-8)
+                f = np.clip(f, 0, 1)
+                f = (f * 255).astype(np.uint8)
+                ok, buf = cv2.imencode(".png", f)
+                if ok:
+                    buf.tofile(str(out_dir / f"{i:0{pad}d}.png"))
+
+        def do_export():
+            active = preview_viewer.layers.selection.active
+            if active is None:
+                return
+            folder = _QFD.getExistingDirectory(container, tr("Select export folder"))
+            if not folder:
+                return
+            out_dir = Path(folder) / f"{label}_enhanced_contrasted"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _burn_export(active.data, active.contrast_limits, out_dir)
+            preview_viewer.status = f"Exported to {out_dir}"
+
+        btn_auto = _QPB(f"🔆 Auto")
+        btn_auto.setToolTip(tr("Auto-adjust contrast (percentile)"))
+        btn_auto.clicked.connect(auto_contrast)
+        btn_reset = _QPB(f"↩ Reset")
+        btn_reset.clicked.connect(reset_contrast)
+        btn_export = _QPB(f"💾 {tr('Export current layer')}")
+        btn_export.clicked.connect(do_export)
+        layout.addWidget(btn_auto)
+        layout.addWidget(btn_reset)
+        layout.addWidget(btn_export)
+        return container
+
+    def _open_roi_magnifier(self):
+        """Open a Magnifier bound to the currently selected ROI.
+
+        Behavior:
+          - If a single ROI is selected → open (or raise) the Magnifier bound to that ROI.
+            Multiple selected ROIs open one window each.
+          - If no ROI is selected → fall back to legacy follow-selection mode
+            (only one such window can exist at a time).
+        """
+        from widgets.roi_magnifier import ROIMagnifierWindow
+
+        # Determine which ROI indices to spawn windows for
+        target_indices = []
+        if "Batch_ROI" in self.viewer.layers:
+            roi_layer = self.viewer.layers["Batch_ROI"]
+            sel = roi_layer.selected_data
+            if sel:
+                target_indices = [i for i in sel if 0 <= i < len(roi_layer.data)]
+            self._magnifier_count_baseline = len(roi_layer.data)
+
+        if not target_indices:
+            # No ROI selected → open one legacy follow-selection window
+            target_indices = [None]
+
+        for idx in target_indices:
+            key = idx if idx is not None else '_follow'
+            # Reuse if a live window already exists for this key
+            existing = self._magnifiers.get(key)
+            if existing is not None:
+                try:
+                    if existing.isVisible():
+                        existing.raise_()
+                        existing.activateWindow()
+                        continue
+                except RuntimeError:
+                    self._magnifiers.pop(key, None)
+
+            w = ROIMagnifierWindow(self.viewer, roi_idx=idx)
+            w._owner_dict = self._magnifiers
+            w._owner_key = key
+            w._geom = self   # [Issue 3] let the magnifier read the global Slider Range Lock
+            self._magnifiers[key] = w
+            w.show()
+            w.raise_()
+            w.activateWindow()
+
+    def _invalidate_magnifiers_on_count_drop(self):
+        """Close all fixed-idx Magnifiers when Batch_ROI count drops.
+
+        A middle-deletion shifts subsequent indices, so we can't reliably keep
+        existing windows pointing at the right ROI. Close them all on shrink;
+        the user can reopen what they need. Adds don't trigger this.
+        """
+        if not self._magnifiers:
+            return
+        if "Batch_ROI" not in self.viewer.layers:
+            cur_count = 0
+        else:
+            cur_count = len(self.viewer.layers["Batch_ROI"].data)
+        if cur_count < self._magnifier_count_baseline:
+            for key, w in list(self._magnifiers.items()):
+                if key == '_follow':
+                    continue  # follow-mode window is robust to index shifts
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            # closeEvent removes them from dict; if any survived, drop them
+            self._magnifiers = {k: v for k, v in self._magnifiers.items() if k == '_follow'}
+        self._magnifier_count_baseline = cur_count
+
+    def _export_roi_videos(self):
+        """Open the ROI video export dialog (per-ROI local contrast + H.264 video)."""
+        if "Batch_ROI" not in self.viewer.layers:
+            QMessageBox.warning(self, tr("Export ROI Videos"),
+                                tr("No ROIs defined. Please draw or load ROIs first."))
+            return
+        if not len(self.viewer.layers["Batch_ROI"].data):
+            QMessageBox.warning(self, tr("Export ROI Videos"),
+                                tr("No ROIs defined. Please draw or load ROIs first."))
+            return
+        data_layer_name = self.batch_data_combo.currentData()
+        if not data_layer_name or data_layer_name not in self.viewer.layers:
+            QMessageBox.warning(self, tr("Export ROI Videos"),
+                                tr("Please select a Data Layer first."))
+            return
+        view_layer_name = self.batch_view_combo.currentData()
+        if view_layer_name and view_layer_name not in self.viewer.layers:
+            view_layer_name = None
+
+        archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+        default_output_dir = Path(archive_path) if archive_path and Path(archive_path).exists() else None
+
+        from widgets.roi_video_export_dialog import ROIVideoExportDialog
+        dlg = ROIVideoExportDialog(
+            parent=self,
+            viewer=self.viewer,
+            data_layer_name=data_layer_name,
+            view_layer_name=view_layer_name,
+            default_output_dir=default_output_dir,
+        )
+        dlg.exec_()
+
+    def _yolo_detect(self):
+        """Run YOLO particle detection within the liquid cell mask."""
+        model_path = Path(r"D:\Revolution_Sample_Claude\02_Data_analysis\yolo_roi_pool\best.pt")
+        if not model_path.exists():
+            QMessageBox.information(self, "YOLO", tr("YOLO model not yet trained. Accumulate 300+ ROIs first."))
+            return
+
+        data_layer_name = self.batch_data_combo.currentData()
+        if not data_layer_name or data_layer_name not in self.viewer.layers:
+            QMessageBox.warning(self, "YOLO", tr("Please select a data layer first."))
+            return
+
+        stack = self.viewer.layers[data_layer_name].data
+        frame_idx = self.viewer.dims.current_step[0] if stack.ndim == 3 else 0
+        frame = stack[frame_idx] if stack.ndim == 3 else stack
+
+        self.status_label.setText(tr("Running YOLO detection..."))
+        from qtpy.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            from ultralytics import YOLO
+            model = YOLO(str(model_path))
+            results = model(frame, verbose=False)
+
+            mask_arr = self._get_mask_array()
+            bboxes = []
+            for r in results:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    conf = float(box.conf[0])
+                    if conf < 0.3:
+                        continue
+                    if mask_arr is not None:
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        if cy < mask_arr.shape[0] and cx < mask_arr.shape[1] and mask_arr[cy, cx] == 0:
+                            continue
+                    bboxes.append([x1, y1, x2, y2])
+
+            if not bboxes:
+                self.status_label.setText(tr("No candidates found."))
+                return
+
+            if "Batch_ROI" not in [l.name for l in self.viewer.layers]:
+                self._start_batch_mode()
+
+            roi_layer = self.viewer.layers["Batch_ROI"]
+            existing_count = len(roi_layer.data)
+            new_rects, new_labels, new_ranges, new_infos = [], [], [], []
+            global_range = self.global_filter_input.text().strip() if hasattr(self, 'global_filter_input') else ""
+
+            for i, (x1, y1, x2, y2) in enumerate(bboxes):
+                rect = np.array([[y1, x1], [y1, x2], [y2, x2], [y2, x1]], dtype=float)
+                new_rects.append(rect)
+                new_labels.append(f"NP{existing_count + i + 1}")
+                new_ranges.append(global_range)
+                new_infos.append(global_range if global_range else "all")
+
+            import pandas as pd
+            current_features = roi_layer.features
+            all_data = list(roi_layer.data) + new_rects
+            roi_layer.data = all_data
+            roi_layer.features = pd.DataFrame({
+                'label': list(current_features.get('label', [])) + new_labels,
+                'frame_range': list(current_features.get('frame_range', [])) + new_ranges,
+                'frame_info': list(current_features.get('frame_info', [])) + new_infos,
+            })
+            roi_layer.mode = 'select'
+            self.status_label.setText(f"✅ YOLO: {len(bboxes)} {tr('candidates detected')}")
+
+        except ImportError:
+            QMessageBox.warning(self, "YOLO", "ultralytics package not installed.\npip install ultralytics")
+        except Exception as e:
+            self.status_label.setText(f"❌ YOLO: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _auto_suggest_temporal_spatial(self):
+        """Auto-suggest ROIs using temporal motion map + spatial DoG analysis."""
+        try:
+            data_layer_name = self.batch_data_combo.currentData()
+            if not data_layer_name or data_layer_name not in self.viewer.layers:
+                QMessageBox.warning(self, tr("Auto-suggest"), tr("Please select a data layer first."))
+                return
+
+            stack = self.viewer.layers[data_layer_name].data
+            if stack.ndim != 3:
+                QMessageBox.warning(self, tr("Auto-suggest"), tr("Data layer must be a 3D stack (T, H, W)."))
+                return
+
+            self.status_label.setText(tr("Auto-suggesting ROIs (this may take ~10-30s)..."))
+            from qtpy.QtWidgets import QApplication
+            QApplication.processEvents()
+
+            from utils.auto_suggest_rois import suggest_rois
+
+            def on_status(msg):
+                self.status_label.setText(f"🔬 {msg}")
+                QApplication.processEvents()
+
+            bboxes = suggest_rois(
+                stack,
+                roi_mask=self._get_mask_array(),
+                skip_frames=min(15, stack.shape[0] // 5),
+                progress_callback=on_status,
+            )
+
+            if not bboxes:
+                self.status_label.setText(tr("No candidates found."))
+                QMessageBox.information(self, tr("Auto-suggest"), tr("No particle candidates found."))
+                return
+
+            # Ensure Batch_ROI layer exists
+            if "Batch_ROI" not in [l.name for l in self.viewer.layers]:
+                self._start_batch_mode()
+
+            roi_layer = self.viewer.layers["Batch_ROI"]
+            existing_count = len(roi_layer.data)
+
+            new_rects = []
+            new_labels = []
+            new_ranges = []
+            new_infos = []
+
+            global_range = self.global_filter_input.text().strip() if hasattr(self, 'global_filter_input') else ""
+
+            for i, bbox in enumerate(bboxes):
+                x1, y1, x2, y2 = bbox
+                rect = np.array([[y1, x1], [y1, x2], [y2, x2], [y2, x1]], dtype=float)
+                new_rects.append(rect)
+                label_str = f"NP{existing_count + i + 1}"
+                new_labels.append(label_str)
+                new_ranges.append(global_range)
+                new_infos.append(global_range if global_range else "all")
+
+            import pandas as pd
+            current_features = roi_layer.features
+            all_labels = list(current_features.get('label', [])) + new_labels
+            all_ranges = list(current_features.get('frame_range', [])) + new_ranges
+            all_infos = list(current_features.get('frame_info', [])) + new_infos
+
+            all_data = list(roi_layer.data) + new_rects
+            roi_layer.data = all_data
+            roi_layer.features = pd.DataFrame({
+                'label': all_labels,
+                'frame_range': all_ranges,
+                'frame_info': all_infos,
+            })
+
+            roi_layer.mode = 'select'
+            self.status_label.setText(f"✅ {tr('Added')} {len(bboxes)} {tr('auto-suggested ROIs')}")
+
+            QMessageBox.information(
+                self,
+                tr("Auto-suggest Complete"),
+                tr("Added %d ROI candidates.\n\nYou can now:\n• Delete wrong ones (select + Del)\n• Adjust positions by dragging\n• Add missing ones with Start Draw") % len(bboxes),
+            )
+
+        except Exception as e:
+            self.status_label.setText(f"❌ {tr('Auto-suggest failed')}")
+            QMessageBox.critical(self, tr("Auto-suggest Error"), str(e))
+            import traceback
+            traceback.print_exc()
+
     def restore_from_processing_log(self, log_path):
         """
         从 processing_log.json 恢复 ROI (核心方法)
@@ -2775,9 +3710,11 @@ class GeometryWidget(QWidget):
                 features={'label': [], 'frame_range': [], 'frame_info': []}
             )
             roi_layer.events.data.connect(self._on_batch_data_change)
-        
+            # [Issue #3] 恢复路径也要绑定智能模式/释放提交，否则在此层上绘制不享有 commit_on_release
+            self._bind_smart_mode_switch(roi_layer)
+
         layer = self.viewer.layers["Batch_ROI"]
-        
+
         new_data, new_lbl, new_rng, new_inf = [], [], [], []
         for item in data_dump.get("rois", []):
             new_data.append(np.array(item["coordinates"]))
@@ -2799,6 +3736,9 @@ class GeometryWidget(QWidget):
         self.status_label.setText(f"✅ Loaded {len(new_data)} ROIs.")
 
     def _export_batch_crops(self):
+        if hasattr(self, 'export_thread') and self.export_thread.isRunning():
+            self.status_label.setText(f"⚠️ {tr('Export already in progress.')}")
+            return
         # 1. 基础校验
         data_layer_name = self.batch_data_combo.currentData()
         view_layer_name = self.batch_view_combo.currentData()
@@ -2809,14 +3749,57 @@ class GeometryWidget(QWidget):
 
         # 2. 准备数据
         data_stack = self.viewer.layers[data_layer_name].data
-        view_stack = self.viewer.layers[view_layer_name].data 
-        
+        if view_layer_name and view_layer_name in self.viewer.layers:
+            view_stack = self.viewer.layers[view_layer_name].data
+        else:
+            view_stack = None
+
         layer = self.viewer.layers["Batch_ROI"]
-        rois = layer.data 
-        
+        rois = layer.data
+
         roi_features = layer.features
         frame_ranges_list = list(roi_features.get('frame_range', [""] * len(rois)))
         global_range_text = self.batch_frame_edit.text().strip()
+        is_tiff_format = "TIFF" in self.batch_format_combo.currentText()
+
+        # Phase 1 (2026-05-29): show confirm dialog for ROI selection + preview-contrast opt-in
+        from widgets.batch_export_confirm_dialog import BatchExportConfirmDialog
+        confirm_dlg = BatchExportConfirmDialog(
+            parent=self,
+            viewer=self.viewer,
+            data_layer_name=data_layer_name,
+            rois=rois,
+            roi_features=roi_features,
+            global_range_text=global_range_text,
+            is_tiff=is_tiff_format,
+            has_view_layer=view_stack is not None,
+        )
+        if confirm_dlg.exec_() != QDialog.Accepted:
+            self.status_label.setText(tr("Export canceled."))
+            return
+
+        selected_indices = confirm_dlg.get_selected_indices()
+        if not selected_indices:
+            self.status_label.setText(f"❌ {tr('No ROI selected for export.')}")
+            return
+        preview_overrides_full = confirm_dlg.get_preview_overrides()
+        apply_preview_contrast = confirm_dlg.apply_preview_contrast       # = preview 级
+        export_origin_flag = confirm_dlg.export_origin                    # origin 级
+        export_contrasted_flag = confirm_dlg.export_contrasted           # contrasted 级 (= 旧 export_view)
+        include_overview = confirm_dlg.include_overview
+
+        # [Enhancement] per-NP 帧范围以对话框里(可编辑)的值为准
+        dialog_ranges = confirm_dlg.get_effective_ranges()
+        # Filter rois / frame_ranges / preview_overrides per selection
+        filtered_rois = [rois[i] for i in selected_indices]
+        filtered_frame_ranges = [dialog_ranges[i] if i < len(dialog_ranges) else ""
+                                 for i in selected_indices]
+        filtered_preview_overrides = [preview_overrides_full[i] for i in selected_indices]
+        roi_label_ids = [i + 1 for i in selected_indices]
+
+        # Replace `rois` / `frame_ranges_list` so subsequent code sees the filtered set
+        rois = filtered_rois
+        frame_ranges_list = filtered_frame_ranges
 
         # 3. 路径与元数据提取
         # [Req 6.1] 优先从 UI 输入框获取日期，如果为空则使用当前日期
@@ -2836,7 +3819,7 @@ class GeometryWidget(QWidget):
                 start_dir = str(Path(last_import_folder).parent)
             else:
                 start_dir = str(Path.home())
-            d = QFileDialog.getExistingDirectory(self, "Select Output Directory", start_dir)
+            d = QFileDialog.getExistingDirectory(self, tr("Select Output Directory"), start_dir)
             if not d: return
             
             # 使用包含 dataset 编号的文件夹名称
@@ -2857,8 +3840,9 @@ class GeometryWidget(QWidget):
             'dataset_id': ds_id,
             'sub_name': sub_name,
             
-            # [View Export] - User Feature
-            'export_view': self.export_view_check.isChecked(),
+            # [Tiered export] contrasted=View 层导出, origin=原始, 均由确认对话框分级控制
+            'export_view': export_contrasted_flag,
+            'export_origin': export_origin_flag,
             'view_stack': view_stack,
             'view_suffix_main': self.export_view_suffix.text().strip() or "_contrasted",
             
@@ -2868,17 +3852,23 @@ class GeometryWidget(QWidget):
                 'lrtem': str(GlobalConfig.get("geo_suffix_lrtem")),
                 'hrtem': str(GlobalConfig.get("geo_suffix_hrtem")),
                 'mask': str(GlobalConfig.get("geo_suffix_mask")),
-                'mask_new': str(GlobalConfig.get("geo_suffix_mask_new"))
+                'mask_refined': str(GlobalConfig.get("geo_suffix_mask_refined")),
             },
             
             # Flags
             'create_denoise': self.check_denoise.isChecked(),
             'create_refine': self.check_refine.isChecked(),
+            'create_enhanced': self.check_enhanced.isChecked(),
             
-            'is_tiff': "TIFF" in self.batch_format_combo.currentText(),
+            'is_tiff': is_tiff_format,
             'keep_idx': self.keep_index_check.isChecked(),
             'pad': self.padding_spin.value(),
-            'data_layer_name': data_layer_name 
+            'data_layer_name': data_layer_name,
+
+            # Phase 1 (2026-05-29): Magnifier preview override
+            'apply_preview_contrast': apply_preview_contrast,
+            'preview_overrides': filtered_preview_overrides,
+            'roi_label_ids': roi_label_ids,
         }
 
         # 5. UI 进度
@@ -2895,38 +3885,93 @@ class GeometryWidget(QWidget):
         # [Req 6] 获取当前帧数
         current_frame_idx = self.viewer.dims.current_step[0]
         
-        # 获取 Overview Map 用户配置
-        ov_frame_text = self.overview_frame_edit.text().strip()
-        ov_frame_idx = int(ov_frame_text) if ov_frame_text.isdigit() else current_frame_idx
+        # 获取 Overview Map 用户配置 — [Enhancement] 概览帧以导出对话框的预览滑条为准
+        ov_frame_idx = confirm_dlg.get_overview_frame()
         box_c = self.btn_box_color.property("color_val")
         text_c = self.btn_text_color.property("color_val")
         f_size = self.overview_font_spin.value()
         t_pos = self.overview_text_pos.currentText()
         
-        export_view_flag = self.export_view_check.isChecked()
+        export_view_flag = export_contrasted_flag  # [Tiered export] 用对话框的 Contrasted 级
         view_suffix = self.export_view_suffix.text().strip() or "_contrasted"
         data_suffix = self.suffix_edit.text().strip() or "_origin"
         
+        # Phase 1: thread include_overview flag through the lambda
         self.export_thread.finished.connect(lambda c, path: self._on_export_finished(
             c, path, data_stack, view_stack, rois, sub_name, output_dir, current_frame_idx,
-            export_view_flag, data_suffix, view_suffix, ov_frame_idx, box_c, text_c, f_size, t_pos
+            export_view_flag, data_suffix, view_suffix, ov_frame_idx, box_c, text_c, f_size, t_pos,
+            include_overview, roi_label_ids
         ))
         self.export_thread.error.connect(self._on_export_error)
         self.export_thread.start()
-        
+
     def _on_export_cancel(self):
         if self.export_thread.isRunning():
             self.export_thread.requestInterruption()
             self.status_label.setText(f"⚠️ {tr('Export canceled.')}")
 
-    def _on_export_finished(self, count, path_name, data_stack, view_stack, rois, sub_name, output_dir, frame_idx, export_view_flag, data_suffix, view_suffix, ov_frame, box_c, text_c, f_size, t_pos):
+    def _on_export_finished(self, count, path_name, data_stack, view_stack, rois, sub_name, output_dir, frame_idx,
+                             export_view_flag, data_suffix, view_suffix, ov_frame, box_c, text_c, f_size, t_pos,
+                             include_overview=True, roi_label_ids=None):
         self.batch_progress.close()
-        
-        # [Req 6] 使用指定的 frame_idx 分别导出数据层和视图层的概览图
-        self._create_overview_map(data_stack, rois, sub_name, output_dir, ov_frame, suffix=data_suffix, box_color=box_c, font_size=f_size, font_color=text_c, text_pos=t_pos)
-        if export_view_flag and view_stack is not None:
-            self._create_overview_map(view_stack, rois, sub_name, output_dir, ov_frame, suffix=view_suffix, box_color=box_c, font_size=f_size, font_color=text_c, text_pos=t_pos)
-        
+
+        if include_overview:
+            self._create_overview_map(
+                data_stack, rois, sub_name, output_dir, ov_frame,
+                suffix=data_suffix, box_color=box_c, font_size=f_size,
+                font_color=text_c, text_pos=t_pos, label_ids=roi_label_ids,
+            )
+            if export_view_flag and view_stack is not None:
+                self._create_overview_map(
+                    view_stack, rois, sub_name, output_dir, ov_frame,
+                    suffix=view_suffix, box_color=box_c, font_size=f_size,
+                    font_color=text_c, text_pos=t_pos, label_ids=roi_label_ids,
+                )
+
+        # Save liquid cell mask if it exists
+        mask_arr = self._get_mask_array()
+        mask_filename = ""
+        if mask_arr is not None:
+            mask_filename = "liquid_cell_mask.png"
+            try:
+                from PIL import Image as _PILImage
+                _PILImage.fromarray((mask_arr * 255).astype(np.uint8)).save(output_dir / mask_filename)
+            except Exception as e:
+                print(f"[Mask] Failed to save: {e}")
+                mask_filename = ""
+
+        # Update manifest.json with overview + mask info
+        manifest_path = output_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    manifest = json.load(f)
+                date_str = self.date_edit.text().strip() or datetime.datetime.now().strftime("%Y%m%d")
+                manifest["overview"] = {
+                    "origin": f"{date_str}_{sub_name}_Overview_Frame{ov_frame}{data_suffix}.png",
+                }
+                if export_view_flag:
+                    manifest["overview"]["contrasted"] = f"{date_str}_{sub_name}_Overview_Frame{ov_frame}{view_suffix}.png"
+                if mask_filename:
+                    manifest["liquid_cell_mask"] = mask_filename
+                with open(manifest_path, 'w', encoding='utf-8') as f:
+                    json.dump(manifest, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"[Manifest] Failed to update overview info: {e}")
+
+        # Auto-export YOLO annotations for ROI accumulation
+        try:
+            from pathlib import Path as _P
+            yolo_script = _P(r"D:\Revolution_Sample_Claude\tools\export_yolo_annotations.py")
+            if yolo_script.exists() and manifest_path.exists():
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("export_yolo", str(yolo_script))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.export_yolo(output_dir)
+        except Exception as e:
+            print(f"[YOLO] Auto-export skipped: {e}")
+
         self.status_label.setText(f"✅ {tr('Exported %s crops.') % count}")
         self._force_view_active = False
         QMessageBox.information(self, tr("Success"), tr("Exported %s crops!\nSaved to: %s") % (count, path_name))
@@ -2936,19 +3981,19 @@ class GeometryWidget(QWidget):
         self.status_label.setText(f"❌ {tr('Error:')} {err}")
         QMessageBox.critical(self, tr("Export Error"), str(err))
 
-    def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx, suffix="", box_color="yellow", font_size=24, font_color="yellow", text_pos="Top"):
-        """保存 Overview Map"""
+    def _create_overview_map(self, image_stack, rois, sample_name, output_dir, frame_idx, suffix="", box_color="yellow", font_size=24, font_color="yellow", text_pos="Top", label_ids=None):
+        """保存 Overview Map. label_ids: 可选 1-based id 列表, 用于 NP{N} 命名 (post-filter 时保持原编号)。"""
         if len(image_stack) == 0: return None
-        
+
         # 使用传入的 frame_idx，防止越界
         idx = max(0, min(frame_idx, len(image_stack)-1))
         bg_img = image_stack[idx]
-        
+
         if bg_img.dtype != np.uint8:
             mn, mx = bg_img.min(), bg_img.max()
             if mx > mn: bg_img = ((bg_img - mn)/(mx - mn)*255).astype(np.uint8)
             else: bg_img = bg_img.astype(np.uint8)
-            
+
         pil_img = Image.fromarray(bg_img).convert("RGB")
         draw = ImageDraw.Draw(pil_img)
         try: font = ImageFont.truetype("arial.ttf", font_size)
@@ -2958,8 +4003,9 @@ class GeometryWidget(QWidget):
             ys, xs = roi[:, 0], roi[:, 1]
             x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
             draw.rectangle([x1, y1, x2, y2], outline=box_color, width=3)
-            
-            text_str = f"NP{i+1}"
+
+            nid = label_ids[i] if (label_ids is not None and i < len(label_ids)) else (i + 1)
+            text_str = f"NP{nid}"
             try:
                 left, top, right, bottom = draw.textbbox((0, 0), text_str, font=font)
                 t_w, t_h = right - left, bottom - top
@@ -2988,7 +4034,7 @@ class GeometryWidget(QWidget):
                     if "batch_crop" in log_data:
                         log_data["batch_crop"]["overview_frame"] = idx
                     with open(json_path, 'w') as f: json.dump(log_data, f, indent=2)
-                except: pass
+                except Exception: pass
         return pil_img
 
     def _pick_box_color(self):
@@ -3125,8 +4171,8 @@ class GeometryWidget(QWidget):
     def _load_params_from_config(self):
         """热更新：从配置读取状态"""
         # Block signals
-        widgets = [self.enlarge_check, self.keep_index_check, self.force_square_check, 
-                   self.check_denoise, self.check_refine, self.export_view_check, self.suffix_edit, self.padding_spin]
+        widgets = [self.enlarge_check, self.keep_index_check, self.force_square_check,
+                   self.check_denoise, self.check_refine, self.check_enhanced, self.export_view_check, self.suffix_edit, self.padding_spin]
         if hasattr(self, 'overview_use_view_check'):
             widgets.append(self.overview_use_view_check)
             
@@ -3137,6 +4183,7 @@ class GeometryWidget(QWidget):
         self.force_square_check.setChecked(bool(GlobalConfig.get("geo_force_square")))
         self.check_denoise.setChecked(bool(GlobalConfig.get("geo_create_denoise")))
         self.check_refine.setChecked(bool(GlobalConfig.get("geo_create_refine")))
+        self.check_enhanced.setChecked(bool(GlobalConfig.get("geo_export_enhanced")))
         self.export_view_check.setChecked(bool(GlobalConfig.get("geo_export_view")))
         self.suffix_edit.setText(str(GlobalConfig.get("geo_suffix")))
         self.padding_spin.setValue(int(GlobalConfig.get("geo_padding")))
@@ -3192,14 +4239,18 @@ class GeometryWidget(QWidget):
                 from qtpy.QtWidgets import QMessageBox
                 QMessageBox.warning(self, tr("Error"), tr("Could not read any valid images."))
                 return
-                
-            stack = np.array(frames)
+
+            # Phase 7 (2026-05-29): preallocated stack (memmap-safe)
+            from utils.memory_utils import stack_frames_preallocated
+            stack = stack_frames_preallocated(frames)
             name = f"PNG_{folder_path.name}"
             if len(name) > 30:
                 name = name[:15] + "..." + name[-10:]
             
             new_layer = self.viewer.add_image(stack, name=name, colormap='gray')
-            
+            gc.collect()
+            trim_working_set()
+
             # 自动选中新加载的图层
             self._refresh_layers()
             idx1 = self.batch_view_combo.findData(new_layer.name)
@@ -3244,7 +4295,9 @@ class GeometryWidget(QWidget):
                 name = name[:15] + "..." + name[-10:]
             
             new_layer = self.viewer.add_image(stack, name=name, colormap='gray')
-            
+            gc.collect()
+            trim_working_set()
+
             # 自动选中新加载的图层
             self._refresh_layers()
             idx1 = self.batch_view_combo.findData(new_layer.name)
@@ -3273,7 +4326,7 @@ class GeometryWidget(QWidget):
     def _perform_stamp(self, click_y, click_x):
         """在指定位置盖章一个新 ROI"""
         if self._last_roi_size is None:
-            self.status_label.setText("⚠️ No previous ROI size for stamp.")
+            self.status_label.setText(tr("⚠️ No previous ROI size for stamp."))
             return
         
         h, w = self._last_roi_size
@@ -3545,7 +4598,7 @@ class GeometryWidget(QWidget):
         # 获取参考图像尺寸
         view_layer_name = self.batch_view_combo.currentData()
         if not view_layer_name or view_layer_name not in self.viewer.layers:
-            self.status_label.setText("⚠️ Select a view layer first.")
+            self.status_label.setText(tr("⚠️ Select a view layer first."))
             return
         
         img_layer = self.viewer.layers[view_layer_name]
@@ -3555,7 +4608,7 @@ class GeometryWidget(QWidget):
         
         lines = generate_grid_lines(img_h, img_w, rows, cols)
         if not lines:
-            self.status_label.setText("⚠️ 1×1 grid has no lines.")
+            self.status_label.setText(tr("⚠️ 1×1 grid has no lines."))
             return
         
         grid_layer = self.viewer.add_shapes(

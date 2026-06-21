@@ -13,6 +13,8 @@ from qtpy.QtCore import Qt
 from pathlib import Path
 import json
 from widgets.settings_widget import GlobalConfig, tr
+import gc
+from utils.memory_utils import trim_working_set
 
 
 class RecoveryDialog(QDialog):
@@ -293,29 +295,35 @@ class RecoveryDialog(QDialog):
         
         if not frames:
             raise ValueError("Could not read any valid images")
-        
-        stack = np.array(frames)
+
+        # Phase 7 (2026-05-29): preallocated stack (memmap-safe)
+        from utils.memory_utils import stack_frames_preallocated
+        stack = stack_frames_preallocated(frames)
         name = f"Recovered_PNG_{folder.name}"
         
         # 获取 viewer (从 parent)
         if hasattr(self.parent(), 'viewer'):
             self.parent().viewer.add_image(stack, name=name, colormap='gray')
-    
+            gc.collect()
+            trim_working_set()
+
     def _load_tiff_stack(self, file_path: str):
         """加载 TIFF Stack"""
         import tifffile
         import numpy as np
-        
+
         stack = tifffile.imread(file_path)
         if stack.ndim == 2:
             stack = stack[np.newaxis, ...]
         elif stack.ndim == 4:
             stack = stack[..., 0]
-        
+
         name = f"Recovered_TIFF_{Path(file_path).stem}"
-        
+
         if hasattr(self.parent(), 'viewer'):
             self.parent().viewer.add_image(stack, name=name, colormap='gray')
+            gc.collect()
+            trim_working_set()
     
     def _select_all(self, select: bool):
         """全选/取消全选"""

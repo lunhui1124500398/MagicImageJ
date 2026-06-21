@@ -487,7 +487,7 @@ def main():
             print(f"Recovery check failed: {e}")
     
     QTimer.singleShot(500, check_recovery)
-    
+
     app.run()
 
 if __name__ == '__main__':

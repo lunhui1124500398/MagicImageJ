@@ -19,6 +19,8 @@ import datetime
 from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
 from utils.ui_utils import setup_safe_scroll_all
+import gc
+from utils.memory_utils import trim_working_set
 
 # 导入核心算法
 from core.drift_correction import (calculate_drift_curve, 
@@ -442,6 +444,9 @@ class DriftCorrectionWidget(QWidget):
                 oldest_layer = self.correction_history.pop(0)
                 if oldest_layer in self.viewer.layers:
                     self.viewer.layers.remove(oldest_layer)
+
+            gc.collect()
+            trim_working_set()
             
             undo_key = GlobalConfig.get_napari_shortcut("shortcut_undo_drift")
             @new_layer.bind_key(undo_key)
@@ -505,7 +510,10 @@ class DriftCorrectionWidget(QWidget):
                 "max_shift_y": float(max_drift[1])
             }
             
-            action_id = get_logger().log_action("drift", "apply_correction", params)
+            # Phase 5 (2026-05-29): drift apply_correction is an exploratory operation
+            # (user often iterates kernel_size / ROI / template_frame). Log as `trial`
+            # so the replay engine only re-runs the last attempt per chapter.
+            action_id = get_logger().log_action_trial("drift", "apply_correction", params)
             return action_id
         except Exception as e:
             print(f"Failed to log drift: {e}")

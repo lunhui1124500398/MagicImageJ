@@ -18,6 +18,8 @@ from pathlib import Path
 import datetime
 from widgets.settings_widget import GlobalConfig, tr
 from utils.utils import elide_text
+import gc
+from utils.memory_utils import trim_working_set
 from utils.ui_utils import setup_safe_scroll_all
 
 # JSON Encoder
@@ -27,6 +29,17 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, (np.floating, float)): return float(obj)
         elif isinstance(obj, np.ndarray): return obj.tolist()
         return super().default(obj)
+
+def _sample_array(data, max_frames=10, pixel_step=100):
+    """Sample pixels from an array without loading the entire thing into RAM.
+    Safe for memmap-backed data: only pages in the sampled frames."""
+    if data.ndim == 3 and data.shape[0] > max_frames:
+        indices = np.linspace(0, data.shape[0] - 1, max_frames, dtype=int)
+        chunks = [data[int(i)].ravel()[::pixel_step] for i in indices]
+        return np.concatenate(chunks)
+    if data.size > 1_000_000:
+        return data.ravel()[::pixel_step]
+    return data.ravel()
 
 class EnhanceThread(QThread):
     """增强处理线程 (带进度条)"""
@@ -60,42 +73,29 @@ class ContrastBurnThread(QThread):
 
     def run(self):
         try:
-            self.progress.emit(10)
-            # 1. 转换类型 (Float32) 以便计算
-            # 如果数据量极大，这里也可以分块，但通常 numpy 整体运算够快，
-            # 主要是搬移到子线程不卡 UI
-            data_f = self.data.astype(np.float32, copy=False)
-            
-            self.progress.emit(30)
+            from utils.memory_utils import create_huge_array, release_memmap_pages
             range_width = self.c_max - self.c_min
             if range_width < 1e-9: range_width = 1e-9
-            
-            # 2. 归一化
-            normalized = (data_f - self.c_min) / range_width
-            self.progress.emit(60)
-            
-            # 3. Clip
-            normalized = np.clip(normalized, 0, 1)
-            self.progress.emit(80)
-            
-            # 4. 映射回 uint8 (通常 burn 都是为了可视化导出，转为 8bit 最通用)
-            # 如果原图是 16bit，这里也可以保留，但通常 ImageJ 风格的 Adjust Contrast 
-            # 意味着 "Apply Window/Level"，结果通常预期是视觉一致的 8bit。
-            # 这里我们根据原图类型智能判断：如果是整数类型，通常映射回相同类型或 uint8
-            
-            dtype = self.data.dtype
-            if np.issubdtype(dtype, np.integer):
-                # 如果原图是整数，我们映射到该类型的最大值
-                # 但通常 Apply Contrast 后的目的是为了看清楚，转 uint8 (0-255) 是最常用的
-                # 这里为了稳妥，映射到 0-255 uint8，这也是 "Burn" 的通常含义
-                res = (normalized * 255).astype(np.uint8)
+            is_int = np.issubdtype(self.data.dtype, np.integer)
+            out_dtype = np.uint8 if is_int else np.float32
+
+            if self.data.ndim == 3:
+                n = self.data.shape[0]
+                res, _ = create_huge_array(self.data.shape, out_dtype)
+                for i in range(n):
+                    frame_f = self.data[i].astype(np.float32)
+                    frame_f = np.clip((frame_f - self.c_min) / range_width, 0, 1)
+                    res[i] = (frame_f * 255).astype(np.uint8) if is_int else frame_f
+                    self.progress.emit(10 + int(i / n * 85))
+                release_memmap_pages(res)
             else:
-                # 浮点图保持浮点
-                res = normalized.astype(np.float32)
-                
+                data_f = self.data.astype(np.float32)
+                normalized = np.clip((data_f - self.c_min) / range_width, 0, 1)
+                res = (normalized * 255).astype(np.uint8) if is_int else normalized.astype(np.float32)
+
             self.progress.emit(100)
             self.finished.emit(res)
-            
+
         except Exception as e:
             self.error.emit(str(e))
 
@@ -396,8 +396,6 @@ class EnhanceWidget(QWidget):
             layer_name = self.layer_combo.currentData()
             input_layer = self.viewer.layers[layer_name]
             
-            if not enhanced_stack.flags['C_CONTIGUOUS']:
-                enhanced_stack = np.ascontiguousarray(enhanced_stack)
             new_layer_name = f"Enh_{layer_name}"
             new_layer = self.viewer.add_image(enhanced_stack, name=new_layer_name, colormap='gray', metadata={'source_layer': layer_name})
             
@@ -408,6 +406,8 @@ class EnhanceWidget(QWidget):
             })
             new_layer.metadata['action_id'] = action_id
 
+            gc.collect()
+            trim_working_set()
             self.status_label.setText(f"✅ {tr('Done. Layer: %s.') % new_layer_name}")
             if layer_name in self.viewer.layers:
                 self.viewer.layers[layer_name].visible = False
@@ -462,8 +462,7 @@ class EnhanceWidget(QWidget):
         else:
             display_data = layer.data
         
-        if display_data.size > 1000000: sample = display_data.ravel()[::100]
-        else: sample = display_data.ravel()
+        sample = _sample_array(display_data)
         
         self.hist_ax.clear()
         self.hist_ax.hist(sample, bins=64, color='#888888', alpha=0.6, density=True)
@@ -488,8 +487,7 @@ class EnhanceWidget(QWidget):
         layer = self.viewer.layers.selection.active
         if not isinstance(layer, napari.layers.Image): return
         data = layer.data
-        if data.size > 1000000: sample = data.ravel()[::100]
-        else: sample = data.ravel()
+        sample = _sample_array(data)
         if len(sample) == 0: return
         
         current_lims = list(layer.contrast_limits)
@@ -594,8 +592,10 @@ class EnhanceWidget(QWidget):
             })
             new_layer.metadata['action_id'] = action_id
 
+            gc.collect()
+            trim_working_set()
             self.status_label.setText(f"✅ {tr('Applied. New layer: %s') % new_layer_name}")
-            
+
             # 隐藏原图层
             original_layer.visible = False
             self.viewer.layers.selection.active = new_layer

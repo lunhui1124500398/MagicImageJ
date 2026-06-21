@@ -9,7 +9,7 @@ import cv2
 from scipy.signal import medfilt
 from typing import Tuple, Optional
 import concurrent.futures
-from utils.memory_utils import create_huge_array
+from utils.memory_utils import create_huge_array, release_memmap_pages
 import os
 
 def calculate_drift_single_frame(frame: np.ndarray, 
@@ -106,10 +106,7 @@ def apply_drift_correction(image_stack: np.ndarray,
                 if progress_callback:
                     progress_callback(completed_count, T)
         
-        # 如果是 memmap，强制刷新到磁盘
-        if hasattr(result, 'flush'):
-            result.flush()
-            
+        release_memmap_pages(result)
         return result
 
     except Exception as e:

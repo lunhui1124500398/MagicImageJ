@@ -258,6 +258,65 @@ def cleanup_session_files():
 # 注册退出清理
 atexit.register(cleanup_session_files)
 
+def trim_working_set():
+    """
+    [Windows] 释放进程 Working Set 中的文件缓存页。
+    memmap 写入/读取后，Windows 会将页面缓存在物理内存中。
+    调用此函数告诉 OS 可以回收这些页面。数据仍在磁盘上，再次访问时按需重新加载。
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetProcessWorkingSetSize.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t
+        ]
+        kernel32.SetProcessWorkingSetSize.restype = ctypes.c_bool
+        handle = kernel32.GetCurrentProcess()
+        kernel32.SetProcessWorkingSetSize(handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+    except Exception:
+        pass
+
+def release_memmap_pages(arr):
+    """
+    memmap 写入完成后调用：flush → GC → trim Working Set。
+    释放 OS 为 memmap 页面缓存的物理内存。
+    """
+    if hasattr(arr, 'flush'):
+        arr.flush()
+    gc.collect()
+    trim_working_set()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 (2026-05-29): preallocated stacking helper
+# ---------------------------------------------------------------------------
+def stack_frames_preallocated(frames):
+    """Stack a list of same-shape 2D/3D frames into a single ndarray using
+    pre-allocation (avoids the doubled allocation that np.array(frames) and
+    np.stack(frames) trigger on memmap or other lazy sources).
+
+    Falls through to np.array on empty inputs (returns shape (0,)).
+    """
+    if not frames:
+        return np.empty((0,), dtype=np.uint8)
+    first = frames[0]
+    T = len(frames)
+    if first.ndim == 2:
+        H, W = first.shape
+        out = np.empty((T, H, W), dtype=first.dtype)
+        for i, f in enumerate(frames):
+            out[i] = f
+    elif first.ndim == 3:
+        H, W, C = first.shape
+        out = np.empty((T, H, W, C), dtype=first.dtype)
+        for i, f in enumerate(frames):
+            out[i] = f
+    else:
+        # Unexpected ndim — fall back to np.array (will allocate intermediate)
+        out = np.array(frames)
+    return out
+
 def create_huge_array(shape, dtype, fill_zeros=False):
     """
     智能数组分配器

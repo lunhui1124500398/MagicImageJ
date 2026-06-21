@@ -7,7 +7,7 @@
 import numpy as np
 import cv2
 import concurrent.futures
-from utils.memory_utils import create_huge_array
+from utils.memory_utils import create_huge_array, release_memmap_pages
 import os
 
 def gaussian_blur_stack(image_stack: np.ndarray,
@@ -29,7 +29,7 @@ def gaussian_blur_stack(image_stack: np.ndarray,
                 progress_callback(i + 1, total)
                 
         if progress_callback: progress_callback(total, total)
-        if hasattr(blurred, 'flush'): blurred.flush()
+        release_memmap_pages(blurred)
         return blurred
         
     except Exception as e:
@@ -113,7 +113,7 @@ def rolling_average(image_stack: np.ndarray,
                 if progress_callback:
                     progress_callback(completed, len(futures))
 
-        if hasattr(avg_stack, 'flush'): avg_stack.flush()
+        release_memmap_pages(avg_stack)
         return avg_stack
 
     except Exception as e:
