@@ -464,6 +464,17 @@ class BatchExportThread(QThread):
             with open(manifest_path, 'w', encoding='utf-8') as f:
                 json.dump(manifest, f, indent=2, ensure_ascii=False)
 
+            # [Revolution D4] best-effort: crop 导出后刷新 overview.html (不阻塞, 失败不影响导出)
+            try:
+                import sys as _sys
+                _rev_tools = r"D:\Revolution_Sample_Claude\tools"
+                if _rev_tools not in _sys.path:
+                    _sys.path.insert(0, _rev_tools)
+                from overview_refresh import regenerate_overview_async
+                regenerate_overview_async(output_dir)
+            except Exception:
+                pass
+
             self.finished.emit(count, str(output_dir.name))
 
         except Exception as e:
