@@ -1,6 +1,6 @@
 [project]
 name = "magic-imagej"
-version = "0.1.0"
+version = "3.6.0"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "dm4==1.0.3",
