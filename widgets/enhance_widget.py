@@ -251,6 +251,12 @@ class EnhanceWidget(QWidget):
         self.apply_contrast_btn = QPushButton(f"🔥 {tr('Apply (Burn to New Layer)')}")
         self.apply_contrast_btn.clicked.connect(self._apply_contrast_burn)
         contrast_layout.addWidget(self.apply_contrast_btn)
+
+        # 调完对比度顺手导出整层: data 层(原始)+view 层(对比度) 整帧 PNG, 供下次直接 Import PNG
+        self.export_full_btn = QPushButton(f"💾 {tr('Export Full Layer (Data+View) as PNG')}")
+        self.export_full_btn.setToolTip(tr("Export the whole uncropped data + contrasted view as a PNG sequence for fast re-import next session"))
+        self.export_full_btn.clicked.connect(self._export_full_layers)
+        contrast_layout.addWidget(self.export_full_btn)
         contrast_group.setLayout(contrast_layout)
         layout.addWidget(contrast_group)
 
@@ -568,6 +574,30 @@ class EnhanceWidget(QWidget):
         #     self.status_label.setText(f"❌ Error: {str(e)}")
         # finally:
         #     self.progress_bar.setVisible(False)
+    def _export_full_layers(self):
+        """独立导出整层 data+view (PNG), 供下次直接 Import PNG 而非巨大 dm4。
+        data = 原始层(pick_crop_source_layer, 绝不选增强/对比度层); view = 当前对比度层。"""
+        from widgets.full_layer_export import run_full_layer_export
+        from core.geometry_helpers import pick_crop_source_layer
+        cand = [l.name for l in self.viewer.layers
+                if getattr(l, 'data', None) is not None and getattr(l.data, 'ndim', 0) >= 3]
+        data_name = pick_crop_source_layer(cand)
+        # view: 当前激活的 Contrast_/Enh_ 层, 否则找 metadata source_layer==data 的派生层
+        view_name = None
+        active = self.viewer.layers.selection.active
+        if active is not None and (active.name.startswith("Contrast_") or active.name.startswith("Enh_")):
+            view_name = active.name
+        if view_name is None and data_name:
+            for l in self.viewer.layers:
+                if (l.name.startswith("Contrast_") or l.name.startswith("Enh_")) and \
+                   (getattr(l, 'metadata', None) or {}).get("source_layer") == data_name:
+                    view_name = l.name
+                    break
+        summary = run_full_layer_export(self, self.viewer, data_name, view_name, is_tiff=False)
+        if summary:
+            folders = [f for f in (summary.get('data_folder'), summary.get('view_folder')) if f]
+            self.status_label.setText(tr("Exported full layer(s): ") + ", ".join(folders))
+
     def _on_burn_finished(self, burnt_data, original_layer, c_min, c_max):
         self.progress_bar.setVisible(False)
         self.apply_contrast_btn.setEnabled(True)

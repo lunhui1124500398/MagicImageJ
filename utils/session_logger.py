@@ -37,6 +37,310 @@ class NumpyEncoder(json.JSONEncoder):
 IMPORT_ACTION_TYPES = {"load_dm4_sequence", "load_png_sequence", "load_tiff_stack"}
 
 
+# ---------------------------------------------------------------------------
+# Pure effective-actions computation (2026-07-01)
+#
+# Extracted from SessionLogger.compute_effective_actions so the recovery replay
+# path (recovery_widget._recover_selected / _select_all_actions) can reuse the
+# exact same filter without a live logger instance and without Qt. Keeping it
+# module-level and pure makes it unit-testable (_test_effective_replay.py).
+# ---------------------------------------------------------------------------
+
+# (widget, action) pairs that represent a *re-tunable* operation: the user often
+# applies them several times against the SAME input layer while dialing in a
+# parameter (drift kernel, enhance window, ROI polygons). Only the LAST attempt
+# per input layer survived into the downstream pipeline, so replay must collapse
+# repeated re-tunes of the same source to the last one. Distinct sources are a
+# genuine chain (rotate on Corrected_v1, crop on Rotated_...) and are all kept.
+_RETUNABLE_REPLAY = {
+    ("drift", "apply_correction"),
+    ("enhance", "filter_enhancement"),
+    # NOTE: the enhance widget logs contrast as action="contrast_adjustment"
+    # (enhance_widget.py). This table historically read "contrast", which never
+    # matched, so repeated contrast passes on the same source were NOT collapsed
+    # (replayed twice -> double-normalized pixels). Use the real action name.
+    ("enhance", "contrast_adjustment"),
+    ("geometry", "update_batch_rois"),
+    ("annotation", "update_params"),
+    ("annotation", "pre_burn_params"),
+}
+
+# (widget, action) pairs whose replay produces a NEW image layer. Kept module-level
+# so recovery_widget's eviction chain and the logged-output-name map share one
+# definition (contrast_adjustment must be here too — see note above).
+IMAGE_PRODUCER_ACTIONS = {
+    ("drift", "apply_correction"),
+    ("enhance", "filter_enhancement"),
+    ("enhance", "contrast_adjustment"),
+    ("geometry", "rotate"),
+    ("geometry", "flip"),
+    ("geometry", "crop"),
+}
+
+
+def replay_source_key(action):
+    """The source-layer identity an action re-tunes, or None. Used to tell a
+    'chain another op' (different source -> keep both) from a 're-tune the same
+    input' (same source -> keep only the last).
+
+    `source` is included because the enhance widget records its input layer under
+    that key (with the filter settings nested in `params.params`); without it every
+    enhance action returned None and distinct-source enhances were wrongly collapsed
+    to the last one."""
+    p = action.get("params", {}) or {}
+    for k in ("source_layer", "source_layer_name", "source", "data_layer", "layer_name"):
+        v = p.get(k)
+        if v:
+            return v
+    return None
+
+
+def _is_meta_action(a):
+    """Bookkeeping actions that must never be replayed: undo markers, session
+    resume/restore records (replaying session_restored would recursively re-load
+    a source session), chapter markers. Treated like the old system/undo skip."""
+    return (a.get("widget") in ("system", "recovery")
+            or a.get("action") in ("undo", "session_resumed",
+                                    "session_restored", "session_start"))
+
+
+def compute_actions_checksum(actions):
+    """SHA256 of the actions list with the mutable `state` field stripped.
+
+    The single source of truth for session integrity. `state` (current/trial/
+    committed/historical/...) changes as the user toggles rows in the Recovery UI
+    and must NOT invalidate the hash. Every writer of `checksum` (the logger, the
+    Recovery status/merge writeback) must use THIS so a file the tool just wrote
+    does not fail its own reload check."""
+    sanitized = [
+        {k: v for k, v in a.items() if k != "state"}
+        for a in (actions or [])
+    ]
+    actions_str = json.dumps(sanitized, sort_keys=True, cls=NumpyEncoder)
+    return hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
+
+
+def build_logged_output_map(effective_actions, image_producer_keys=IMAGE_PRODUCER_ACTIONS):
+    """Pure: producer action_id -> the layer name its output was LOGGED under.
+
+    A replay engine rebuilds layers under its own naming scheme (e.g.
+    `X_recovered_corrected`), but the log records each op's source under the LIVE
+    scheme (e.g. `Corrected_v2_X`). In a linear pipeline, producer[i]'s logged
+    output == producer[i+1]'s logged source, so we can recover the mapping without
+    knowing the live naming rule (including drift's variable `Corrected_vN_`). The
+    caller then records `map[logged_output] = actual_replay_layer` so a LATER,
+    separate partial-recovery click can resolve `Corrected_v2_X` to the real
+    drift-corrected replay layer instead of silently falling back to the original.
+
+    Last producer has no downstream consumer in the chain -> omitted (its output is
+    the final result; nothing needs to resolve it as a source)."""
+    producers = [a for a in (effective_actions or [])
+                 if (a.get("widget"), a.get("action")) in image_producer_keys]
+    out = {}
+    for i in range(len(producers) - 1):
+        nxt_src = replay_source_key(producers[i + 1])
+        if nxt_src:
+            aid = producers[i].get("id")
+            if aid:
+                out[aid] = nxt_src
+    return out
+
+
+def resolve_replay_source_name(target_name, last_result_layer, replay_map,
+                               aliases, image_layer_names):
+    """Pure: pick which EXISTING image-layer name a replay step should read from,
+    or None when it cannot be resolved unambiguously.
+
+    Priority: (1) chained previous result, (2) the persistent replay map
+    (logged-name -> actual replay layer, survives across partial-recovery clicks),
+    (3) exact name, (4) session layer alias, (5) fuzzy prefix (ignoring the
+    `_recovered` marker), (6) last resort ONLY if there is exactly one image layer.
+
+    Returning None on ambiguity (2+ candidates, no confident match) is deliberate:
+    the previous `image_layers[0]` fallback silently bound to the RAW original,
+    dropping drift/rotate/crop without any error. A loud failure is safer than a
+    wrong scientific result."""
+    import os
+    names = list(image_layer_names or [])
+    nameset = set(names)
+
+    # 1. chain: the layer the previous replay step just produced
+    if last_result_layer and last_result_layer in nameset:
+        return last_result_layer
+
+    # 2. persistent replay map (authoritative for cross-click chaining)
+    if target_name and replay_map:
+        mapped = replay_map.get(target_name)
+        if mapped and mapped in nameset:
+            return mapped
+
+    # 3. exact
+    if target_name and target_name in nameset:
+        return target_name
+
+    # 4. alias (session-recorded Original->PNG etc.)
+    if target_name and aliases:
+        aliased = aliases.get(target_name)
+        if aliased and aliased in nameset:
+            return aliased
+
+    # 5. fuzzy: strip the _recovered marker and prefix-match
+    if target_name:
+        clean_target = target_name.replace("_recovered", "").replace("__", "_")
+        best, best_score = None, -1
+        for n in names:
+            clean = n.replace("_recovered", "").replace("__", "_")
+            if clean == clean_target:
+                return n
+            if clean.startswith(clean_target) or clean_target.startswith(clean):
+                score = len(os.path.commonprefix([clean, clean_target]))
+                if score > best_score:
+                    best_score, best = score, n
+        if best is not None:
+            return best
+
+    # 6. last resort: only when there is no ambiguity
+    if len(names) == 1:
+        return names[0]
+    return None
+
+
+def compute_effective_actions_list(actions, chapters, edit_records):
+    """Pure form of SessionLogger.compute_effective_actions.
+
+    Apply edit_records on a copy of actions, then run the Phase 5 replay filter
+    (drop meta/undo/undone, historical/disabled/_deleted; keep committed/
+    current; for trials keep only the last non-undone trial of a
+    (chapter, widget, action) key when no committed/current supersedes it).
+    Non-mutating.
+    """
+    actions = actions or []
+    chapters = chapters or []
+    edit_records = edit_records or []
+
+    # Step 1: deep-ish copy actions (+ their params dict)
+    eff = [dict(a) for a in actions]
+    for a in eff:
+        if "params" in a and isinstance(a["params"], dict):
+            a["params"] = dict(a["params"])
+
+    # Step 2: apply edit_records in order
+    for er in edit_records:
+        tgt = er.get("target_action_id")
+        idx = next((i for i, a in enumerate(eff) if a.get("id") == tgt), -1)
+        if idx == -1:
+            continue
+        etype = er.get("edit_type")
+        if etype == "disable":
+            eff[idx]["state"] = "disabled"
+        elif etype == "enable":
+            eff[idx]["state"] = "current"
+        elif etype == "delete":
+            eff[idx]["state"] = "_deleted"
+        elif etype == "reset":
+            orig = next((a for a in actions if a.get("id") == tgt), None)
+            if orig is not None:
+                eff[idx]["state"] = orig.get("state", "current")
+                if isinstance(orig.get("params"), dict):
+                    eff[idx]["params"] = dict(orig["params"])
+        elif etype == "update_params":
+            eff[idx]["params"] = {**eff[idx].get("params", {}), **er.get("new_params", {})}
+
+    # Step 3: replay-style filter
+    undone = set()
+    for a in eff:
+        if a.get("action") == "undo":
+            t = a.get("params", {}).get("target")
+            if t:
+                undone.add(t)
+
+    sorted_chs = sorted(chapters, key=lambda c: c.get("start_action_index", 0))
+
+    def find_ch(i):
+        cur = None
+        for ch in sorted_chs:
+            if ch.get("start_action_index", 0) <= i:
+                cur = ch.get("id")
+            else:
+                break
+        return cur
+
+    # Actions in a chapter that was closed out by a later import (status
+    # "historical") must never replay onto the NEW dataset. The per-action state
+    # filter below catches current/trial (they are demoted on import) but NOT
+    # `committed` — a committed op in a superseded chapter would otherwise leak
+    # across datasets. Exclude by chapter status so already-written sessions
+    # (whose committed state was never demoted) are covered too.
+    historical_ch_ids = {c.get("id") for c in sorted_chs
+                         if c.get("status") == "historical"}
+
+    committed_keys = set()
+    last_trial_idx_by_key = {}
+    for i, a in enumerate(eff):
+        if _is_meta_action(a):
+            continue
+        if a.get("id") in undone:
+            continue
+        st = a.get("state", "current")
+        if st in ("historical", "disabled", "_deleted"):
+            continue
+        if find_ch(i) in historical_ch_ids:
+            continue
+        key = (find_ch(i), a.get("widget"), a.get("action"))
+        if st in ("committed", "current"):
+            committed_keys.add(key)
+        elif st == "trial":
+            last_trial_idx_by_key[key] = i
+
+    out = []
+    for i, a in enumerate(eff):
+        if _is_meta_action(a):
+            continue
+        if a.get("id") in undone:
+            continue
+        st = a.get("state", "current")
+        if st in ("historical", "disabled", "_deleted"):
+            continue
+        if find_ch(i) in historical_ch_ids:
+            continue
+        if st in ("committed", "current"):
+            out.append(a)
+            continue
+        key = (find_ch(i), a.get("widget"), a.get("action"))
+        if key in committed_keys:
+            continue
+        if last_trial_idx_by_key.get(key) == i:
+            out.append(a)
+    return out
+
+
+def effective_replay_actions(actions, chapters=None, edit_records=None):
+    """The action subset a replay engine should execute, in order.
+
+    = compute_effective_actions_list (undone/trial/edit filtering) followed by a
+    source-layer collapse: for each _RETUNABLE_REPLAY op, keep only the LAST
+    action per (widget, action, source_layer). This removes the enhance-of-
+    enhance / duplicate-drift / stale-ROI-update cases that the trial filter
+    misses when the repeats were logged as `current` rather than `trial`.
+    """
+    base = compute_effective_actions_list(actions, chapters, edit_records)
+
+    last_idx = {}
+    for i, a in enumerate(base):
+        key = (a.get("widget"), a.get("action"))
+        if key in _RETUNABLE_REPLAY:
+            last_idx[(key, replay_source_key(a))] = i
+
+    out = []
+    for i, a in enumerate(base):
+        key = (a.get("widget"), a.get("action"))
+        if key in _RETUNABLE_REPLAY:
+            if last_idx.get((key, replay_source_key(a))) != i:
+                continue  # superseded by a later re-tune of the same source
+        out.append(a)
+    return out
+
+
 class SessionLogger:
     """
     会话日志单例类
@@ -279,7 +583,10 @@ class SessionLogger:
                     ch["status"] = "historical"
                     start = ch.get("start_action_index", 0)
                     for a in self.actions[start:]:
-                        if a.get("state") in ("current", "trial"):
+                        # Include "committed": a committed op still belongs to the
+                        # closed-out chapter and must not replay onto the next
+                        # dataset (see historical_ch_ids in compute_effective_actions_list).
+                        if a.get("state") in ("current", "trial", "committed"):
                             a["state"] = "historical"
             self.chapters.append({
                 "id": f"ch_{uuid.uuid4().hex[:8]}",
@@ -432,88 +739,7 @@ class SessionLogger:
 
         NOTE: This is a pure / non-mutating computation. self.actions stays immutable.
         """
-        # Step 1: deep-copy actions
-        eff = [dict(a) for a in self.actions]
-        for a in eff:
-            if "params" in a and isinstance(a["params"], dict):
-                a["params"] = dict(a["params"])
-
-        # Step 2: apply edit_records in order
-        for er in self.edit_records:
-            tgt = er.get("target_action_id")
-            idx = next((i for i, a in enumerate(eff) if a.get("id") == tgt), -1)
-            if idx == -1:
-                continue
-            etype = er.get("edit_type")
-            if etype == "disable":
-                eff[idx]["state"] = "disabled"
-            elif etype == "enable":
-                eff[idx]["state"] = "current"
-            elif etype == "delete":
-                eff[idx]["state"] = "_deleted"
-            elif etype == "reset":
-                # Issue #6: 回到原始(章节自动判定)状态并还原参数，丢弃此前对该 action 的
-                # 所有编辑——这是让操作能重新回到 historical(羊皮纸) 的唯一途径。
-                orig = next((a for a in self.actions if a.get("id") == tgt), None)
-                if orig is not None:
-                    eff[idx]["state"] = orig.get("state", "current")
-                    if isinstance(orig.get("params"), dict):
-                        eff[idx]["params"] = dict(orig["params"])
-            elif etype == "update_params":
-                eff[idx]["params"] = {**eff[idx].get("params", {}), **er.get("new_params", {})}
-
-        # Step 3: run replay-style filter
-        undone = set()
-        for a in eff:
-            if a.get("action") == "undo":
-                t = a.get("params", {}).get("target")
-                if t:
-                    undone.add(t)
-
-        sorted_chs = sorted(self.chapters, key=lambda c: c.get("start_action_index", 0))
-        def find_ch(i):
-            cur = None
-            for ch in sorted_chs:
-                if ch.get("start_action_index", 0) <= i:
-                    cur = ch.get("id")
-                else:
-                    break
-            return cur
-
-        committed_keys = set()
-        last_trial_idx_by_key = {}
-        for i, a in enumerate(eff):
-            if a.get("widget") == "system" or a.get("action") == "undo":
-                continue
-            if a.get("id") in undone:
-                continue
-            st = a.get("state", "current")
-            if st in ("historical", "disabled", "_deleted"):
-                continue
-            key = (find_ch(i), a.get("widget"), a.get("action"))
-            if st in ("committed", "current"):
-                committed_keys.add(key)
-            elif st == "trial":
-                last_trial_idx_by_key[key] = i
-
-        out = []
-        for i, a in enumerate(eff):
-            if a.get("widget") == "system" or a.get("action") == "undo":
-                continue
-            if a.get("id") in undone:
-                continue
-            st = a.get("state", "current")
-            if st in ("historical", "disabled", "_deleted"):
-                continue
-            if st in ("committed", "current"):
-                out.append(a)
-                continue
-            key = (find_ch(i), a.get("widget"), a.get("action"))
-            if key in committed_keys:
-                continue
-            if last_trial_idx_by_key.get(key) == i:
-                out.append(a)
-        return out
+        return compute_effective_actions_list(self.actions, self.chapters, self.edit_records)
 
     def effective_actions_for_replay(self) -> List[Dict[str, Any]]:
         """Phase 5 (2026-05-29): smart replay filter.
@@ -548,7 +774,7 @@ class SessionLogger:
         committed_keys = set()
         last_trial_idx_by_key = {}
         for i, a in enumerate(self.actions):
-            if a.get("widget") == "system" or a.get("action") == "undo":
+            if _is_meta_action(a):
                 continue
             if a.get("id") in undone:
                 continue
@@ -564,7 +790,7 @@ class SessionLogger:
         # Pass 2: build result
         out = []
         for i, a in enumerate(self.actions):
-            if a.get("widget") == "system" or a.get("action") == "undo":
+            if _is_meta_action(a):
                 continue
             if a.get("id") in undone:
                 continue
@@ -704,12 +930,7 @@ class SessionLogger:
         NOT invalidate integrity. Old sessions had no `state` field so the
         filter is a no-op for them — same hash as before.
         """
-        sanitized = [
-            {k: v for k, v in a.items() if k != "state"}
-            for a in self.actions
-        ]
-        actions_str = json.dumps(sanitized, sort_keys=True, cls=NumpyEncoder)
-        return hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
+        return compute_actions_checksum(self.actions)
     
     def _to_dict(self) -> Dict[str, Any]:
         """转换为可序列化的字典"""
@@ -890,16 +1111,62 @@ class SessionLogger:
         return incomplete
     
     @staticmethod
+    def _read_starred_flag(path) -> bool:
+        """读取 session JSON 顶层 `starred` 标记, 任何错误都当 False。"""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return bool(json.load(f).get("starred", False))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_archive_path(path) -> bool:
+        """会话文件是否位于归档路径 (archive_path 或已保存搜索路径) 下。
+        与 get_session_summary 的归档判定共用一处, 保证列表保护集与显示 📦 一致。"""
+        try:
+            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
+            if archive_path and str(path).startswith(str(archive_path)):
+                return True
+            saved_paths = QSettings("NapariUser", "Recovery").value("saved_search_paths", []) or []
+            if isinstance(saved_paths, str):
+                saved_paths = [saved_paths]
+            path_str = str(path)
+            for saved in saved_paths:
+                if saved and path_str.startswith(str(saved)):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def partition_sessions_by_protection(entries, limit):
+        """纯函数: 把 (path, mtime, is_protected) 拆成
+        【全部受保护】(mtime 倒序) + 【最新 limit 个普通】(mtime 倒序)。
+        收藏/归档 (is_protected=True) 永不被 limit 截断。返回有序 path 列表。"""
+        protected = [(p, m) for (p, m, prot) in entries if prot]
+        normal = [(p, m) for (p, m, prot) in entries if not prot]
+        protected.sort(key=lambda t: t[1], reverse=True)
+        normal.sort(key=lambda t: t[1], reverse=True)
+        if limit is not None and limit >= 0:
+            normal = normal[:limit]
+        return [p for (p, _m) in protected] + [p for (p, _m) in normal]
+
+    @staticmethod
     def find_all_sessions(search_dir: Path = None, limit: int = 50) -> List[Path]:
         """
         查找所有会话日志（不限状态）
-        
+
+        收藏(starred)与归档(archive 路径下)的会话【无条件保留】, 不受 limit 截断;
+        只有普通会话按修改时间倒序取最新 limit 个。这样收藏/归档会话即使很旧也常驻
+        列表, 与磁盘清理 _cleanup_old_sessions 的保护策略一致 (之前只按 mtime 砍 [:limit],
+        导致收藏/归档虽不删盘却从列表消失)。
+
         Args:
             search_dir: 搜索目录，默认使用标准路径
-            limit: 最大返回数量
-        
+            limit: 普通会话的最大返回数量 (受保护会话不计入此上限)
+
         Returns:
-            会话日志文件路径列表，按修改时间倒序
+            会话日志文件路径列表 (受保护在前, 各自按修改时间倒序)
         """
         all_sessions = []
         
@@ -909,10 +1176,26 @@ class SessionLogger:
             for json_file in dir_path.glob("*_session.json"):
                 all_sessions.append(json_file)
         
-        # 按修改时间排序，最新的在前
-        all_sessions.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        
-        return all_sessions[:limit]
+        # 收藏/归档无条件保留, 只对普通会话按 mtime 截断 (与磁盘清理保护策略一致)
+        entries = []
+        seen = set()
+        for p in all_sessions:
+            try:
+                key = str(p.resolve()).lower()
+            except Exception:
+                key = str(p).lower()
+            if key in seen:
+                continue  # 多个搜索目录可能重叠, 去重
+            seen.add(key)
+            try:
+                mtime = p.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            protected = (SessionLogger._read_starred_flag(p)
+                         or SessionLogger._is_archive_path(p))
+            entries.append((p, mtime, protected))
+
+        return SessionLogger.partition_sessions_by_protection(entries, limit)
     
     @staticmethod
     def _get_search_dirs(search_dir: Path = None) -> List[Path]:
@@ -1119,13 +1402,7 @@ class SessionLogger:
             # 验证校验和 (Phase 3: state field stripped to keep checksum stable
             # across user-driven state toggles in Recovery UI)
             stored_checksum = data.get("checksum", "")
-            raw_actions = data.get("actions", [])
-            sanitized_actions = [
-                {k: v for k, v in a.items() if k != "state"}
-                for a in raw_actions
-            ]
-            actions_str = json.dumps(sanitized_actions, sort_keys=True, cls=NumpyEncoder)
-            computed_checksum = hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
+            computed_checksum = compute_actions_checksum(data.get("actions", []))
             
             if stored_checksum and stored_checksum != computed_checksum:
                 data["_checksum_valid"] = False
@@ -1192,19 +1469,8 @@ class SessionLogger:
             
             meta = data.get("metadata", {})
             
-            # 判断是否为归档路径下的会话
-            # 检查当前归档路径
-            archive_path = QSettings("NapariUser", "Global").value("archive_path", "")
-            is_archive = bool(archive_path and str(path).startswith(str(archive_path)))
-            
-            # 同时检查保存的搜索路径列表
-            if not is_archive:
-                saved_paths = QSettings("NapariUser", "Recovery").value("saved_search_paths", []) or []
-                path_str = str(path)
-                for saved in saved_paths:
-                    if path_str.startswith(str(saved)):
-                        is_archive = True
-                        break
+            # 判断是否为归档路径下的会话 (与 find_all_sessions 的保护判定共用一处)
+            is_archive = SessionLogger._is_archive_path(path)
             
             # 自动生成标签 (substance-ds[x])
             auto_label = ""

@@ -41,26 +41,24 @@ class DriftCalculationThread(QThread):
     progress = Signal(int, int)    # current, total
     error = Signal(str)
     
-    def __init__(self, image_stack, roi_bbox, template_idx, max_workers, kernel_size):
+    def __init__(self, image_stack, roi_bbox, template_idx, max_workers):
         super().__init__()
         self.image_stack = image_stack
         self.roi_bbox = roi_bbox
         self.template_idx = template_idx
         self.max_workers = max_workers
-        self.kernel_size = kernel_size
-        
+
     def run(self):
         try:
             # 进度回调适配器
             def cb(c, t):
                 self.progress.emit(c, t)
-                
+
             drifts = calculate_drift_curve(
                 self.image_stack,
                 self.roi_bbox,
                 self.template_idx,
                 self.max_workers,
-                self.kernel_size,
                 progress_callback=cb
             )
             self.finished.emit(drifts)
@@ -358,7 +356,7 @@ class DriftCorrectionWidget(QWidget):
         
         self.calc_thread = DriftCalculationThread(
             image_stack, roi_bbox, self.template_spin.value(),
-            self.max_workers_spin.value(), self.kernel_spin.value()
+            self.max_workers_spin.value()
         )
         self.calc_thread.progress.connect(lambda c, t: self.progress_bar.setValue(int(c/t*100)))
         self.calc_thread.finished.connect(self._on_drift_calculated)

@@ -7,6 +7,70 @@ import numpy as np
 
 
 # =====================================================================
+#   Data Layer (Crop Source) 自动选择
+# =====================================================================
+
+# 强度增强类派生关键词: 这些层改变了像素强度 (CLAHE / contrast / 烧录 / 预览 等)，
+# 绝不能当作裁剪源 —— 否则会把增强像素写进 "_origin" 导出污染模型输入。
+# 注意: 故意 *不* 含 "corrected" / "rotated" / "cropped" —— 漂移矫正/旋转/裁切都是
+# 几何操作, 像素强度不变, 是合法 origin。
+_DERIVED_INTENSITY = ("enh", "contrast", "burned", "clahe", "preview", "overview", "mask")
+
+
+def _is_intensity_derived(name: str) -> bool:
+    """名字里是否含强度增强关键词 (大小写无关)。"""
+    low = name.lower()
+    return any(d in low for d in _DERIVED_INTENSITY)
+
+
+def pick_crop_source_layer(layer_names):
+    """从候选 3D 图层名里挑「数据图层 (裁剪源)」默认项。
+
+    规则: 优先挑「处理得最深的几何层」(cropped / rotated / drift-corrected) 中
+    *未被强度增强* 的那个 —— 因为裁切/旋转/漂移矫正保留原始 origin 像素值, 而
+    增强/对比度会改变像素值。任何一级都排除强度增强层, 永不把增强层选为裁剪源
+    (见 memory feedback_data_layer_must_be_raw)。
+
+    Parameters
+    ----------
+    layer_names : list[str]
+        候选图层名 (调用方已筛成 3D ndarray 图层)。
+
+    Returns
+    -------
+    str | None
+        选中的图层名; 若无可接受候选 (例如全是增强层) 则返回 None。
+    """
+    if not layer_names:
+        return None
+    names = list(layer_names)
+
+    def ok(n):  # 非强度增强
+        return not _is_intensity_derived(n)
+
+    # Stage 1: cropped / cropped_rotated 几何层 (排除增强)
+    cands = [l for l in names
+             if ("cropped" in l.lower() or l.lower().startswith("cropped_rotated")) and ok(l)]
+    # Stage 2: rotated 几何层 (排除增强)
+    if not cands:
+        cands = [l for l in names if "rotated" in l.lower() and ok(l)]
+    # Stage 3: raw 导入层 (Original_/PNG_/TIFF_), 排除 "PNG_..._contrasted" 这种伪 raw
+    if not cands:
+        raw = [l for l in names
+               if l.lower().startswith(("original_", "png_", "tiff_")) and ok(l)]
+        if raw:
+            cands = [raw[0]]   # 第一个 = 最早导入 = 最真 origin
+    # Stage 4: 任何非强度增强层
+    if not cands:
+        non_derived = [l for l in names if ok(l)]
+        if non_derived:
+            cands = [non_derived[0]]
+    if not cands:
+        return None
+    return cands[-1]   # 与既有 data_candidates[-1] 行为一致 (取最新的几何层)
+
+
+# =====================================================================
 #   Feature 1: ROI 快速复制 (Clone & Stamp)
 # =====================================================================
 

@@ -6,7 +6,6 @@
 """
 import numpy as np
 import cv2
-from scipy.signal import medfilt
 from typing import Tuple, Optional
 import concurrent.futures
 from utils.memory_utils import create_huge_array, release_memmap_pages
@@ -28,7 +27,6 @@ def calculate_drift_curve(image_stack: np.ndarray,
                           roi_bbox: Tuple[int, int, int, int],
                           template_frame_idx: int,
                           max_workers: int = 32,
-                          kernel_size: int = 11,
                           progress_callback=None) -> np.ndarray:
     """
     计算整个序列的漂移曲线
@@ -63,7 +61,6 @@ def calculate_drift_curve(image_stack: np.ndarray,
                 progress_callback(completed_count, total_count)
     
     drifts = np.array(drifts)
-    drifts = np.apply_along_axis(lambda x: medfilt(x, kernel_size), 0, drifts)
     return drifts
 
 def apply_drift_correction(image_stack: np.ndarray,

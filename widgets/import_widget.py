@@ -55,19 +55,40 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, np.ndarray): return obj.tolist()
         return super().default(obj)
 
+def dir_size_bytes(path) -> int:
+    """递归统计目录大小。几百 GB 的 dm4 目录在机械盘上要扫很久, 只能在后台线程调用。"""
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file():
+                total += entry.stat().st_size
+            elif entry.is_dir():
+                total += dir_size_bytes(entry.path)
+    except Exception:
+        pass
+    return total
+
+
 class ArchiveThread(QThread):
-    """归档复制/移动线程"""
-    finished = Signal()
+    """归档复制/移动线程 (含目录大小统计与 move/copy 决策, 全部在后台完成)"""
+    mode_decided = Signal(bool, float)  # (move_mode, size_gb) 扫描完大小后立刻通知 UI
+    done = Signal(bool, float)          # (move_mode, size_gb)
     error = Signal(str)
-    
-    def __init__(self, src, dst, move_mode=False):
+
+    def __init__(self, src, dst, move_threshold_gb=30.0):
         super().__init__()
         self.src = src
         self.dst = dst
-        self.move_mode = move_mode 
-        
+        self.move_threshold_gb = float(move_threshold_gb)
+        self.move_mode = False
+
     def run(self):
         try:
+            # 0. 统计大小并决定 Move vs Copy (以前在 GUI 线程做, 大目录会把界面冻住)
+            size_gb = dir_size_bytes(self.src) / (1024 ** 3)
+            self.move_mode = size_gb > self.move_threshold_gb
+            self.mode_decided.emit(self.move_mode, size_gb)
+
             # 1. 路径标准化
             src_abs = os.path.abspath(self.src)
             dst_abs = os.path.abspath(self.dst)
@@ -88,9 +109,9 @@ class ArchiveThread(QThread):
                 shutil.move(src_abs, dst_abs)
             else:
                 shutil.copytree(src_abs, dst_abs, dirs_exist_ok=True)
-                
-            self.finished.emit()
-            
+
+            self.done.emit(self.move_mode, size_gb)
+
         except Exception as e:
             self.error.emit(str(e))
 
@@ -658,8 +679,20 @@ class ImportWidget(QWidget):
         g_arc = QGroupBox(tr("4. Action")); g_arc.setStyleSheet("QGroupBox { border: 1px solid #FF9800; margin-top: 6px; } QGroupBox::title { color: #FF9800; }"); l_arc = QVBoxLayout(); l_arc.setSpacing(6); l_arc.setContentsMargins(8, 12, 8, 8)
         l_arc.addWidget(QLabel(tr("Preview Folder Name:"))); self.preview_label = QLabel("..."); self.preview_label.setWordWrap(True); self.preview_label.setStyleSheet("font-family: 'Segoe UI', sans-serif; font-size: 11px; color: #E0E0E0; background-color: #2D2D2D; padding: 8px; border: 1px solid #3E3E3E; border-radius: 4px;")
         l_arc.addWidget(self.preview_label)
-        self.create_archive_btn = QPushButton(f"📦 {tr('Create Archive Folder')}"); self.create_archive_btn.clicked.connect(self._create_archive); self.create_archive_btn.setStyleSheet("background-color: #E65100; color: white; font-weight: bold; padding: 8px;"); self.create_archive_btn.setEnabled(False)
+        self.create_archive_btn = QPushButton(f"📦 {tr('Create Archive Folder')}"); self.create_archive_btn.clicked.connect(self._create_archive)
+        # 禁用态必须显式给样式: 一旦设了 background-color, Qt 就不再用 palette 画 disabled,
+        # 否则按钮在禁用时看起来和可点时一模一样 (用户点了"没反应"的根因)。
+        self.create_archive_btn.setStyleSheet(
+            "QPushButton { background-color: #E65100; color: white; font-weight: bold; padding: 8px; }"
+            "QPushButton:disabled { background-color: #4A4A4A; color: #909090; }"
+        )
+        self.create_archive_btn.setEnabled(False)
+        self.create_archive_btn.setToolTip(tr("Disabled until 'Calc Dose' succeeds: the folder name needs date/dose/pixel size from the DM4 metadata."))
         l_arc.addWidget(self.create_archive_btn)
+        self.archive_hint = QLabel(f"⬆️ {tr('Run 2. Scan Metadata (Calc Dose) first to enable archiving.')}")
+        self.archive_hint.setWordWrap(True)
+        self.archive_hint.setStyleSheet("color: #FFB74D; font-size: 10px;")
+        l_arc.addWidget(self.archive_hint)
         self.archive_progress = QProgressBar(); self.archive_progress.setVisible(False); self.archive_progress.setRange(0, 0) # Indeterminate
         l_arc.addWidget(self.archive_progress)
         
@@ -837,8 +870,16 @@ class ImportWidget(QWidget):
         frame_idx = self.dose_idx_spin.value()
         self.thread_dose = DoseCalculationThread(self.current_folder, frame_idx=frame_idx)
         self.thread_dose.finished.connect(self._on_dose_done)
-        self.thread_dose.error.connect(lambda e: (self.status.setText(e), self.calc_dose_btn.setEnabled(True), self.pick_file_btn.setEnabled(True)))
+        self.thread_dose.error.connect(self._on_dose_error)
         self.thread_dose.start()
+
+    def _on_dose_error(self, err):
+        self.calc_dose_btn.setEnabled(True)
+        self.pick_file_btn.setEnabled(True)
+        # 归档按钮保持禁用: 没有元数据就拼不出归档文件夹名。明确说出来, 别让用户对着按钮空点。
+        self._set_archive_enabled(False)
+        self.status.setText(f"❌ {err}")
+        self.archive_hint.setText(f"⚠️ {tr('Metadata scan failed, archiving stays disabled:')} {err}")
 
     def _on_dose_done(self, dose, fname, info):
         self.meta_cache = info; self.meta_cache['dose'] = dose
@@ -856,7 +897,14 @@ class ImportWidget(QWidget):
         
         self.meta_info_label.setText(f"{tr('Date: %s, Exp: %ss') % (info.get('date_fmt', 'N/A'), info.get('exposure', 0))}\n{tr('Pixel: %.2f Å, Mean: %.1f') % (info.get('pixel_A', 0), info.get('mean', 0))}")
         self._update_preview()
-        self.create_archive_btn.setEnabled(True)
+        self._set_archive_enabled(True)
+
+    def _set_archive_enabled(self, enabled: bool):
+        """归档按钮的启用/禁用统一走这里, 保证提示文字和按钮状态永远一致。"""
+        self.create_archive_btn.setEnabled(enabled)
+        self.archive_hint.setVisible(not enabled)
+        if not enabled:
+            self.archive_hint.setText(f"⬆️ {tr('Run 2. Scan Metadata (Calc Dose) first to enable archiving.')}")
 
     def _fmt_num(self, val):
         if val is None: return "0"
@@ -901,17 +949,6 @@ class ImportWidget(QWidget):
         self.substance_edit.addItems(history)
         self.substance_edit.setCurrentText(current_text)
         self.substance_edit.blockSignals(False)
-
-    def _get_dir_size(self, path):
-        total = 0
-        try:
-            for entry in os.scandir(path):
-                if entry.is_file():
-                    total += entry.stat().st_size
-                elif entry.is_dir():
-                    total += self._get_dir_size(entry.path)
-        except Exception: pass
-        return total
 
     def _create_archive(self):
         if not self.current_folder: return
@@ -971,35 +1008,27 @@ class ImportWidget(QWidget):
         except Exception as e:
             print(f"SessionLogger sync failed: {e}")
 
-        # 4. [Req 2] 计算大小并决定 Move vs Copy
-        self.status.setText(tr("Checking size..."))
-        size_bytes = self._get_dir_size(str(self.current_folder))
-        size_gb = size_bytes / (1024**3)
-        move_mode = False
-        
-        # 阈值读取
-        move_threshold = float(GlobalConfig.get("sys_move_threshold_gb"))
-
-        if size_gb > move_threshold:
-            move_mode = True
-            # 注意：此处弹窗只是通知将要发生什么，不需要用户再次确认（因为已经在之前逻辑里确定了策略）
-            # 或者，如果之前需求是自动切换并提醒，这里只是标记
-            # 用户希望在 *完成后* 提醒，所以这里我们只记录状态
-        
-        # 5. [Req 1] 原始文件重命名逻辑
+        # 4. [Req 1] 原始文件重命名逻辑
         # 提取 dataset ID 数字部分
-        ds_num = re.sub(r'[^0-9]', '', ds_id) 
+        ds_num = re.sub(r'[^0-9]', '', ds_id)
         if not ds_num: ds_num = "1"
-        
+
         raw_folder_name = f"{date_str}_{self.sub_txt}_OriginalDataset{ds_num}"
         raw_dest = archive_path / raw_folder_name
-        
-        self.status.setText(tr("Moving raw data...") if move_mode else tr("Copying raw data..."))
-        self.archive_thread = ArchiveThread(str(self.current_folder), str(raw_dest), move_mode=move_mode)
-        # Pass move_mode and size_gb to callback
-        self.archive_thread.finished.connect(lambda: self._on_archive_done(move_mode, size_gb, raw_dest))
+
+        # 5. [Req 2] 大小统计 + Move/Copy 决策 + 搬运, 全在后台线程做。
+        #    (扫几百 GB 的 dm4 目录以前在 GUI 线程跑, 会把窗口卡死几十秒, 看起来像"点了没反应")
+        move_threshold = float(GlobalConfig.get("sys_move_threshold_gb"))
+        self.status.setText(tr("Checking size..."))
+        self.archive_thread = ArchiveThread(str(self.current_folder), str(raw_dest),
+                                            move_threshold_gb=move_threshold)
+        self.archive_thread.mode_decided.connect(self._on_archive_mode_decided)
+        self.archive_thread.done.connect(lambda moved, gb: self._on_archive_done(moved, gb, raw_dest))
         self.archive_thread.error.connect(self._on_archive_error)
         self.archive_thread.start()
+
+    def _on_archive_mode_decided(self, move_mode, size_gb):
+        self.status.setText(f"{tr('Moving raw data...') if move_mode else tr('Copying raw data...')} ({size_gb:.2f} GB)")
 
     def _on_archive_done(self, was_moved, size_gb, new_path):
         self.archive_progress.setVisible(False)

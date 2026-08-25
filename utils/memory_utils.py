@@ -317,10 +317,60 @@ def stack_frames_preallocated(frames):
         out = np.array(frames)
     return out
 
-def create_huge_array(shape, dtype, fill_zeros=False):
+def load_png_stack_memmap(png_files, read_fn=None, progress_cb=None):
+    """Read a list of PNG paths into ONE (memmap-for-large) stack, reading each
+    file straight into the preallocated output. Unlike building a Python list of
+    frames then np.stack()-ing it, this never holds the whole sequence in RAM at
+    once — key for 5000+ frame recovery loads that used to double-allocate ~24GB.
+
+    read_fn(path) -> 2D frame (or None to skip); defaults to cv2 grayscale read.
+    progress_cb(k) called with the 1-based index after each frame (optional).
+    Returns an empty uint8 array for empty input.
+    """
+    if not png_files:
+        return np.empty((0,), dtype=np.uint8)
+
+    if read_fn is None:
+        import cv2
+
+        def read_fn(p):
+            img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return None
+            if img.ndim == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            return img
+
+    first = read_fn(png_files[0])
+    if first is None:
+        raise ValueError("Could not read the first PNG frame")
+    T = len(png_files)
+    H, W = first.shape[:2]
+    stack, _ = create_huge_array((T, H, W), first.dtype)
+    stack[0] = first
+    n = 1
+    if progress_cb:
+        progress_cb(1)
+    for i in range(1, T):
+        img = read_fn(png_files[i])
+        if img is not None and img.shape[:2] == (H, W):
+            stack[n] = img
+            n += 1
+        if progress_cb:
+            progress_cb(i + 1)
+    if n < T:
+        stack = stack[:n]
+    release_memmap_pages(stack)
+    return stack
+
+
+def create_huge_array(shape, dtype, fill_zeros=False, force_disk=False):
     """
     智能数组分配器
     返回: (array, temp_path)
+
+    force_disk=True: 无论大小都走磁盘 memmap (用于恢复"全内存"模式把小中间层也写盘,
+    界住 RAM)。默认 False = 原行为 (按 sys_ram_threshold_gb 阈值判定)。
     """
     elements = np.prod(shape)
     itemsize = np.dtype(dtype).itemsize
@@ -365,7 +415,7 @@ def create_huge_array(shape, dtype, fill_zeros=False):
                 # 用户选择否，抛出异常中断操作
                 raise MemoryError("Operation cancelled by user to prevent system freeze.")
             
-    if nbytes > threshold:
+    if force_disk or nbytes > threshold:
         cache_dir = get_cache_dir()
         
         # 每次分配大内存前，顺手检查一下陈旧文件和磁盘占用

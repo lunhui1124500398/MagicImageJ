@@ -1,0 +1,32 @@
+[project]
+name = "magic-imagej"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "dm4==1.0.3",
+    "everytools==0.2.2",
+    "freetype-py==2.5.1",
+    "imageio==2.37.2",
+    "matplotlib==3.10.7",
+    "napari==0.6.6",
+    "ncempy==1.15",
+    "numpy==2.2.6",
+    "opencv-python==4.12.0.88",
+    "pandas==2.3.3",
+    "pillow==12.0.0",
+    "psutil==7.1.3",
+    "pyqt5==5.15.11",
+    "pyqt5-qt5==5.15.2",
+    "pyqt5-sip==12.17.1",
+    "qtpy==2.4.3",
+    "scipy==1.16.3",
+    "tifffile==2025.10.16",
+    "tqdm==4.67.1",
+]
+
+[project.optional-dependencies]
+auto-roi = ["ultralytics>=8,<9"]
+dev = ["pyinstaller>=6,<7", "pytest>=8,<9"]
+
+[tool.uv]
+package = false

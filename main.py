@@ -45,6 +45,11 @@ import numpy as np
 import math
 import ctypes
 from utils.utils import resource_path
+from utils.layer_selection import (
+    MEASURE_LAYER_NAME,
+    BATCH_ROI_LAYER_NAME,
+    resolve_layer_after_measure,
+)
 from napari.qt import get_qapp
 
 
@@ -53,7 +58,7 @@ class TEMWorkflow:
         if os.name == 'nt':
             myappid = 'WHKTZ.YSImageJ.TEMWORKFLOW.V1'  # 任意唯一的字符串
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-        self.viewer = napari.Viewer(title="TEM Data Processing Workflow-YSImageJ")
+        self.viewer = napari.Viewer(title="TEM Data Processing Workflow-MagicImageJ")
         QSettings("NapariUser", "Global").remove("archive_path")
         # === [新增代码] 启动时清除 Dataset ID，防止不归档时出现上次的 ID ===
         QSettings("NapariUser", "Global").remove("current_dataset_id")
@@ -130,6 +135,8 @@ class TEMWorkflow:
             QPushButton:hover { border-color: #666; }
         """)
         self.btn_ruler.clicked.connect(self._toggle_measurement_tool)
+        self._layer_before_measure = None
+        self.viewer.layers.events.removed.connect(self._on_layer_removed)
         h_bar.addWidget(self.btn_ruler)
         h_bar.addStretch()
 
@@ -360,10 +367,62 @@ class TEMWorkflow:
             layer.text.size = new_font_size
             layer.refresh()
 
+    def _restore_layer_after_measure(self):
+        """把活动图层还给进测量之前那个 (batch_crop 流程里通常是 Batch_ROI)。
+
+        不还的话 napari 在 remove 掉 Measurements 后会自己挑一个 (往往是底下的 Image 层)，
+        用户明明还在批量画框，却得先手点一下图层列表才能继续 —— 这就是这个函数存在的原因。
+        """
+        remembered = getattr(self, "_layer_before_measure", None)
+        self._layer_before_measure = None
+
+        target_name = resolve_layer_after_measure(
+            [l.name for l in self.viewer.layers],
+            remembered[0] if remembered else None,
+        )
+        if not target_name:
+            return
+
+        # napari 的 active setter 内部就是 select_only, 不用再单独设 selection
+        layer = self.viewer.layers[target_name]
+        self.viewer.layers.selection.active = layer
+
+        # 连模式一起还原: 用户进测量前是在画框还是在调框, 回来应该接着干那件事
+        target_mode = remembered[1] if remembered and remembered[0] == target_name else None
+        if target_mode is None and target_name == BATCH_ROI_LAYER_NAME:
+            target_mode = 'add_rectangle'
+        if target_mode is not None:
+            try:
+                layer.mode = target_mode
+            except Exception:
+                pass
+
+    def _on_layer_removed(self, event):
+        """别处删掉 Measurements 时 (如 _start_batch_mode 的 _clear_residue), 让 📏 按钮跟着弹起。
+
+        否则按钮还亮着"已开启"、图层却没了, 用户要连点两下才能重新开始测量。
+        """
+        layer = getattr(event, "value", None)
+        if layer is None or getattr(layer, "name", None) != MEASURE_LAYER_NAME:
+            return
+        self.measure_layer = None
+        if self.btn_ruler.isChecked():
+            # blockSignals: 只同步外观, 不要反过来再触发一次 _toggle_measurement_tool
+            self.btn_ruler.blockSignals(True)
+            self.btn_ruler.setChecked(False)
+            self.btn_ruler.blockSignals(False)
+            self._restore_layer_after_measure()
+
     def _toggle_measurement_tool(self, checked):
-        layer_name = "Measurements"
-        
+        layer_name = MEASURE_LAYER_NAME
+
         if checked:
+            # 记住此刻的活动图层, 关测量时原样还回去
+            prev = self.viewer.layers.selection.active
+            self._layer_before_measure = None
+            if prev is not None and prev.name != layer_name:
+                self._layer_before_measure = (prev.name, getattr(prev, 'mode', None))
+
             # 开启测量模式
             if layer_name not in self.viewer.layers:
                 color = GlobalConfig.get("style_measure_color")
@@ -404,11 +463,15 @@ class TEMWorkflow:
             self.viewer.status = f"📏 {tr('Measurement Mode: Draw lines to measure.(Ctrl+Z to Undo)')}"
             
         else:
-            # 关闭测量模式 (但不删除图层，只是切换回选择模式或隐藏)
+            # 关闭测量模式 = 看完即清: 自动移除 Measurements 图层, 省去手动删除。
+            # (napari 移除图层会清理其 events 绑定; 置 None 避免悬空引用。)
             if layer_name in self.viewer.layers:
-                self.viewer.layers[layer_name].mode = 'pan_zoom'
-                # 可选：是否隐藏图层？通常用户可能想保留测量结果，所以这里不隐藏
-            # 隐藏图层
+                try:
+                    self.viewer.layers.remove(layer_name)
+                except Exception:
+                    pass
+            self.measure_layer = None
+            self._restore_layer_after_measure()
             self.viewer.status = tr("End Measurement.")
 
     def _on_measure_data_change(self, event=None):

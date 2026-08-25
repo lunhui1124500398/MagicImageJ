@@ -23,3 +23,8 @@ build/
 builds/
 problems/
 test_dataset/
+
+# 根目录调试脚本与实验数据 (不随仓库发布)
+_test_*.py
+_*_shot.png
+experiments/

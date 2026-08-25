@@ -17,6 +17,20 @@ from utils.ui_utils import setup_safe_scroll_all
 # 国际化 (i18n) 翻译字典
 # =============================================================================
 TRANS_CN = {
+    # Recovery memory retention (F2) — 恢复时中间层保留策略
+    "Memory Retention:": "内存保留:",
+    "Lean (evict intermediates)": "省内存 (驱逐中间层)",
+    "Full (keep all, spill to disk)": "全内存 (全部保留·写盘)",
+    "Custom (choose steps to keep)": "自定义 (选择保留步骤)",
+    "Select intermediate steps to keep": "选择要保留的中间步骤",
+    "kept %d, spilled %d to disk, removed %d intermediates": "保留 %d 层, 写盘 %d 层, 移除 %d 个中间层",
+    # Full-layer export (F3) — 独立整层导出
+    "Export Full Layer (Data+View) as PNG": "导出整层(数据+视图) PNG",
+    "Export the whole uncropped data + contrasted view as a PNG sequence for fast re-import next session": "把未裁切的完整数据层+对比度视图层导出成 PNG 序列, 下次可直接导入而非巨大 dm4",
+    "No raw data layer found — import origin first.": "未找到原始数据层 —— 请先导入原始数据(origin)。",
+    "Select Output Folder": "选择输出文件夹",
+    "Format": "格式",
+    "Exported full layer(s): ": "已导出整层: ",
     # Main / Tabs
     "Workflow Tools": "工作流工具箱",
     "Measure": "测量",
@@ -69,6 +83,11 @@ TRANS_CN = {
     "Browse Folder": "浏览文件夹",
     "Calc Dose": "计算剂量",
     "Create Archive Folder": "创建归档文件夹",
+    "Disabled until 'Calc Dose' succeeds: the folder name needs date/dose/pixel size from the DM4 metadata.":
+        "需先成功执行「计算剂量」才可用: 归档文件夹名要用到 DM4 元数据里的日期/剂量/像素尺寸。",
+    "Run 2. Scan Metadata (Calc Dose) first to enable archiving.":
+        "请先在「2. 扫描元数据」点「计算剂量」, 归档按钮才会启用。",
+    "Metadata scan failed, archiving stays disabled:": "元数据扫描失败, 归档按钮保持禁用:",
     "Load Images": "加载图像",
     "Show Result Popup": "显示结果弹窗",
     "Pick file to auto-set.": "选择文件以自动设置",
@@ -190,6 +209,18 @@ TRANS_CN = {
     "Show Warning when Clearing Overlays": "清除覆盖层时显示警告",
     'Save ROIs':"保存ROIs",
     "Load ROIs":"加载ROIs",
+    # 几何 tab 按钮分组小标题
+    "ROI Files:": "ROI 文件:",
+    "ROI View:": "ROI 查看:",
+    "Auto Detect:": "自动识别:",
+    "Liquid Mask:": "液池蒙版:",
+    # 完整液池层导出 / 缺 view 提醒 (Fix 3)
+    "Frames:": "帧:",
+    "Also export full liquid-cell layers (full data + view, all frames)": "也导出完整液池层 (整帧 data + view)",
+    "Writes the WHOLE data + view layers (not cropped) to new '{layer}__{timestamp}' folders — the full liquid-cell movie for archive/viewing.": "把完整的 data 层和 view 层(不裁切)整帧导到新的 '{图层名}__{时间戳}' 文件夹 —— 整张液池影片, 便于留档/查看。",
+    "All (empty) or 0-100, 120": "全部帧(留空) 或 0-100, 120",
+    "Don't warn again": "不再提醒",
+    "No View (contrasted) layer selected — '_contrasted' will NOT be exported. Large liquid cells usually need both origin + contrasted.": "未选 View(contrasted) 层 —— 不会导出 _contrasted。大液池通常 origin + contrasted 都需要。",
     "Save ROI coordinates + Reference Map":"保存 ROI 坐标 + 参考图",
     "Load ROI JSON & Auto-load Image":"加载 ROI JSON & 自动加载图像",
     "Saving ROI JSON.\nDo you also want to save the reference image(s)?":"保存 ROI JSON。\n是否也要保存参考图像？",
@@ -1199,6 +1230,14 @@ TRANS_CN = {
         "未选择任何 trial 操作。请先在列表中选中 🧪 行。",
     "Nothing to commit.": "没有需要提交的操作。",
     "Committed %d trial action(s).": "已提交 %d 个 trial 操作。",
+    # 2026-07-16: Commit 语义澄清 + 恢复正确性提示
+    "Bookkeeping only: marks the selected trial as the CHOSEN version for future replay (writes state in the session JSON). It does NOT re-apply anything to the image — the result was already produced live when you clicked Apply. Nothing on the canvas changes.":
+        "仅记账：把所选 trial 标记为将来【回放采用】的版本（写入 session JSON 的 state）。"
+        "它不会把任何东西重新应用到图像——效果在你当初点 Apply 时就已实时产生。画布不会有任何变化。",
+    "This only records which version replay should use; it does not re-apply anything to the image (the canvas is unchanged).":
+        "这只是记录回放应采用哪个版本；不会把任何东西重新应用到图像（画布保持不变）。",
+    "All selected actions were superseded or undone — nothing to replay. Select the effective (non-grayed) rows.":
+        "所选操作全部已被取代或撤销——没有可回放的内容。请选中【有效（未变灰）】的行。",
 
     # Phase 6 (2026-05-29): edit_records right-click menu
     "Enable (clear disable/delete)": "启用（清除禁用/删除）",
@@ -1379,6 +1418,7 @@ class GlobalConfig:
         "session_auto_import_data": True,  # 恢复时是否尝试自动导入数据
         "session_max_keep": 20,  # 最大保留会话数
         "session_recovery_mode": "review",  # 恢复模式: "auto"(全自动) 或 "review"(每步确认)
+        "session_recovery_retention": "lean",  # 中间层保留: lean(省内存驱逐) / full(全保留·写盘) / custom(自选)
         "session_auto_detect_source": True,  # 恢复前自动检测数据源
         "session_confirm_export": True,  # 导出操作前询问用户
         "session_auto_continue_after_recovery": True,  # recovery 后自动续写

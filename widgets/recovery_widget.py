@@ -7,11 +7,11 @@ Recovery Widget - 独立的会话恢复组件
 - 数据源智能检测与导入
 - 选择性恢复操作
 """
-from qtpy.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+from qtpy.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                             QPushButton, QListWidget, QListWidgetItem,
                             QGroupBox, QMessageBox, QSplitter, QFrame,
                             QFileDialog, QScrollArea, QCheckBox, QDialog,
-                            QMenu, QAction)
+                            QMenu, QAction, QComboBox)
 from qtpy.QtCore import Qt, QTimer
 from pathlib import Path
 import json
@@ -20,8 +20,11 @@ import numpy as np
 import gc
 import hashlib
 import math
-from utils.memory_utils import trim_working_set
-from utils.session_logger import NumpyEncoder
+from utils.memory_utils import trim_working_set, create_huge_array, release_memmap_pages
+from utils.session_logger import (
+    NumpyEncoder, effective_replay_actions, compute_actions_checksum,
+    build_logged_output_map, IMAGE_PRODUCER_ACTIONS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +139,87 @@ def _action_display_class(action, undone_ids):
     if action.get("id") in undone_ids:
         return "undone_trial" if action.get("state") == "trial" else "hidden"
     return "normal"
+
+
+# ---------------------------------------------------------------------------
+# Replay memory bounding (2026-07-01)
+#
+# Chained replay used to add_image() every intermediate full stack and never
+# remove it (only .visible=False), so drift + 49GB rotate-expand + crop + enhance
+# all stayed resident and each add_image read the whole stack for auto-contrast.
+# These two pure helpers back the fix: evict each consumed intermediate, and give
+# add_image explicit sampled contrast_limits so it skips the whole-array read.
+# ---------------------------------------------------------------------------
+def plan_replay_evictions(produced_per_step):
+    """Given the ordered list of layer names each replay step *produced* (None for
+    steps that don't advance the image chain, e.g. ROI/annotation updates), return
+    the ordered list of intermediate layer names to evict.
+
+    Rule: when a step produces P, the previously-produced layer it consumed is no
+    longer needed and is evicted. The original source (never in this list) and the
+    final produced layer are never evicted. Pure + unit-testable."""
+    evict = []
+    produced = set()
+    last = None
+    for p in produced_per_step:
+        if not p:
+            continue
+        if last is not None and last in produced and last != p:
+            evict.append(last)
+        produced.add(p)
+        last = p
+    return evict
+
+
+def plan_replay_retention(produced_per_step, mode="lean", keep_set=None):
+    """给定各步产出的图层名 (None=不推进链条的步), 返回 (evict, spill):
+    随链条推进被消费掉的中间层里, 哪些【移除】(省内存) vs 哪些【保留但写盘】。
+    原始源层与最终产出层永不出现在两者中 (最终层保持 live)。
+
+      mode 'lean'   -> evict == plan_replay_evictions(...),  spill == []      (现行为)
+      mode 'full'   -> evict == [],  spill == 每个被消费中间层                 (全保留·写盘)
+      mode 'custom' -> keep_set 内的写盘, 其余移除 (未选=lean)
+    纯函数, 可单测。"""
+    consumed = plan_replay_evictions(produced_per_step)  # 所有被消费的中间层
+    if mode == "full":
+        return [], list(consumed)
+    if mode == "custom":
+        keep = set(keep_set or ())
+        evict = [c for c in consumed if c not in keep]
+        spill = [c for c in consumed if c in keep]
+        return evict, spill
+    # lean (默认)
+    return list(consumed), []
+
+
+def _sample_stack_pixels(data, max_frames=8, pixel_step=97):
+    """Sample pixels without paging in a whole memmap: a few evenly-spaced frames,
+    strided. Mirrors enhance_widget._sample_array."""
+    a = np.asarray(data) if not isinstance(data, np.ndarray) else data
+    if a.ndim >= 3 and a.shape[0] > max_frames:
+        idx = np.linspace(0, a.shape[0] - 1, max_frames, dtype=int)
+        return np.concatenate([np.asarray(a[int(i)]).ravel()[::pixel_step] for i in idx])
+    if a.size > 1_000_000:
+        return a.ravel()[::pixel_step]
+    return a.ravel()
+
+
+def compute_replay_contrast_limits(stack):
+    """Sampled (lo, hi) contrast limits for a possibly-huge/memmap stack, or None
+    if there is no meaningful range. Passing these to napari add_image avoids the
+    full-array auto-contrast scan that spikes RAM on big rotate-expand results."""
+    try:
+        sample = _sample_stack_pixels(stack)
+        if sample is None or sample.size == 0:
+            return None
+        lo, hi = np.percentile(sample, [0.5, 99.5])
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            lo, hi = float(np.min(sample)), float(np.max(sample))
+        if hi <= lo:
+            return None
+        return (float(lo), float(hi))
+    except Exception:
+        return None
 
 
 class ActionDetailDialog(QDialog):
@@ -628,8 +712,12 @@ class RecoveryWidget(QWidget):
                 session_data["_auto_label"] = summary.get("auto_label", "")
                 session_summaries.append((summary, session_data))
         
-        # 排序：归档优先，然后按修改时间倒序
-        session_summaries.sort(key=lambda x: (not x[0].get("is_archive_session", False), -x[0].get("modified_time", 0)))
+        # 排序：归档 > 收藏 > 其余(按修改时间倒序), 让常驻会话置顶
+        session_summaries.sort(key=lambda x: (
+            not x[0].get("is_archive_session", False),
+            not x[0].get("starred", False),
+            -x[0].get("modified_time", 0),
+        ))
         
         for summary, session_data in session_summaries:
             self.sessions.append(session_data)
@@ -861,8 +949,10 @@ class RecoveryWidget(QWidget):
         # Phase 5 (2026-05-29): Commit selected trials to committed
         btn_commit = QPushButton(f"✅ {tr('Commit Selected Trials')}")
         btn_commit.setToolTip(tr(
-            "Promote selected trial actions to committed (persists to session JSON). "
-            "Committed actions are always replayed."
+            "Bookkeeping only: marks the selected trial as the CHOSEN version for "
+            "future replay (writes state in the session JSON). It does NOT re-apply "
+            "anything to the image — the result was already produced live when you "
+            "clicked Apply. Nothing on the canvas changes."
         ))
         btn_commit.clicked.connect(self._commit_selected_trials)
         h_select.addWidget(btn_commit)
@@ -891,9 +981,25 @@ class RecoveryWidget(QWidget):
         h_mgmt.addStretch()
         self.details_layout.addLayout(h_mgmt)
         
+        # === 内存保留模式 (F2, 与 auto/review 正交): lean / full / custom ===
+        h_ret = QHBoxLayout()
+        h_ret.addWidget(QLabel(tr("Memory Retention:")))
+        self.retention_combo = QComboBox()
+        self.retention_combo.addItem(tr("Lean (evict intermediates)"), "lean")
+        self.retention_combo.addItem(tr("Full (keep all, spill to disk)"), "full")
+        self.retention_combo.addItem(tr("Custom (choose steps to keep)"), "custom")
+        _cur_ret = GlobalConfig.get("session_recovery_retention") or "lean"
+        _ret_idx = self.retention_combo.findData(_cur_ret)
+        self.retention_combo.setCurrentIndex(_ret_idx if _ret_idx >= 0 else 0)
+        self.retention_combo.currentIndexChanged.connect(
+            lambda _i: GlobalConfig.set("session_recovery_retention", self.retention_combo.currentData()))
+        h_ret.addWidget(self.retention_combo)
+        h_ret.addStretch()
+        self.details_layout.addLayout(h_ret)
+
         # === 5. 恢复/放弃按钮 ===
         h_btns = QHBoxLayout()
-        
+
         btn_abandon = QPushButton(f"🗑️ {tr('Abandon Session')}")
         btn_abandon.setStyleSheet("background-color: #8B0000;")
         btn_abandon.clicked.connect(self._abandon_session)
@@ -1132,6 +1238,15 @@ class RecoveryWidget(QWidget):
         edited_ids = {er.get("target_action_id") for er in session.get("edit_records", [])
                       if er.get("edit_type") == "update_params"}
 
+        # 默认勾选必须与真正会重放的"有效集"一致 (否则出现: 两条 enhance 都勾上但只
+        # 跑最后一条 / 点全选反而取消被取代的行 / 甚至勾了却"恢复 0 个")。用同一个
+        # effective_replay_actions 作为唯一真相; 失败则回退到旧的按 state 勾选。
+        try:
+            eff_ids = {a.get("id") for a in effective_replay_actions(
+                all_actions, session.get("chapters", []), session.get("edit_records", []))}
+        except Exception:
+            eff_ids = None
+
         # undone filter
         undone_ids = set()
         for a in all_actions:
@@ -1158,7 +1273,11 @@ class RecoveryWidget(QWidget):
         for i, action in enumerate(all_actions):
             widget_name = action.get("widget", "unknown")
             action_name = action.get("action", "unknown")
-            if widget_name == "system" or action_name == "undo":
+            # 隐藏纯记账动作 (system/undo/会话 resume/restore/recovery 链接) —— 它们不是
+            # 管线操作, 重放 session_restored 还会递归去加载源会话 (见 _is_meta_action)。
+            if (widget_name in ("system", "recovery")
+                    or action_name in ("undo", "session_resumed",
+                                        "session_restored", "session_start")):
                 continue
             disp_class = _action_display_class(action, undone_ids)
             if disp_class == "hidden":
@@ -1220,15 +1339,19 @@ class RecoveryWidget(QWidget):
                     item.setToolTip(tr("Reverted with Ctrl+Z (kept as history); "
                                        "not replayed unless you select it."))
                 else:
-                    # Light gray + selected only if last NON-undone trial of this key
+                    # Light gray + selected only if it's in the effective replay set
+                    # (falls back to the last-non-undone-trial heuristic if eff unavailable)
                     item.setForeground(QBrush(QColor("#AAAAAA")))
-                    item.setSelected(self._is_last_trial_of_key(all_actions, i, undone_ids))
+                    if eff_ids is not None:
+                        item.setSelected(action.get("id") in eff_ids)
+                    else:
+                        item.setSelected(self._is_last_trial_of_key(all_actions, i, undone_ids))
             elif state == "committed":
                 # Slight emphasis but readable
                 item.setForeground(QBrush(QColor("#4CAF50")))
-                item.setSelected(True)
+                item.setSelected(eff_ids is None or action.get("id") in eff_ids)
             else:  # current (legacy/default)
-                item.setSelected(True)
+                item.setSelected(eff_ids is None or action.get("id") in eff_ids)
 
             self.action_list.addItem(item)
             shown += 1
@@ -1490,7 +1613,9 @@ class RecoveryWidget(QWidget):
         # Refresh detail view (re-load session_data via _refresh_sessions)
         QMessageBox.information(
             self, tr("Commit Trials"),
-            tr("Committed %d trial action(s).") % changed
+            (tr("Committed %d trial action(s).") % changed) + "\n\n" +
+            tr("This only records which version replay should use; it does not "
+               "re-apply anything to the image (the canvas is unchanged).")
         )
         # Update in-memory current_session
         for a in self.current_session.get("actions", []):
@@ -1546,9 +1671,37 @@ class RecoveryWidget(QWidget):
         return last_trial_idx == action_idx
     
     def _select_all_actions(self, select: bool):
-        """全选/取消全选操作"""
+        """全选/取消全选操作。
+
+        全选时只勾选"有效重放集"内的行 —— 排除已撤销 / 被取代的 trial 与对同源图层的
+        重复 re-tune(如两次 drift、两次 enhance)——让勾选状态如实反映真正会重放的操作,
+        避免"全选"把探索性中间步骤也跑一遍(内存翻倍 + 结果错误)。取消全选照常清空。
+        """
+        if not select:
+            for i in range(self.action_list.count()):
+                self.action_list.item(i).setSelected(False)
+            return
+
+        eff_ids = None
+        try:
+            _sess = self.current_session or {}
+            _eff = effective_replay_actions(
+                _sess.get("actions", []),
+                _sess.get("chapters", []),
+                _sess.get("edit_records", []),
+            )
+            eff_ids = {a.get("id") for a in _eff}
+        except Exception as _eff_err:
+            print(f"[recovery] select-all effective filter skipped: {_eff_err}")
+            eff_ids = None
+
         for i in range(self.action_list.count()):
-            self.action_list.item(i).setSelected(select)
+            item = self.action_list.item(i)
+            if eff_ids is None:
+                item.setSelected(True)
+            else:
+                a = item.data(Qt.UserRole)
+                item.setSelected(bool(a) and a.get("id") in eff_ids)
     
     def _auto_import_source(self, idx: int):
         """自动导入数据源"""
@@ -1672,10 +1825,25 @@ class RecoveryWidget(QWidget):
         gc.collect()
         trim_working_set()
 
+    def _register_recovery_source_alias(self, loaded_name):
+        """恢复导入源后, 把每个记录里的 import 层名 -> 刚加载的源层名 写进
+        current_session['layer_aliases']。这样即便用户用导出的液池 PNG(层名 PNG_...)
+        来恢复, replay 的第一步(drift, source_layer=Original_...)也能经 alias 命中,
+        不再依赖模糊前缀匹配。后续 rotate/crop/enhance 走链式 last_result_layer。"""
+        if not loaded_name or not self.current_session:
+            return
+        aliases = self.current_session.setdefault("layer_aliases", {})
+        for a in self.current_session.get("actions", []):
+            if a.get("widget") != "import":
+                continue
+            rec = (a.get("params", {}) or {}).get("layer_name")
+            if rec and rec != loaded_name:
+                aliases[rec] = loaded_name
+
     def _auto_detect_and_import_sources(self) -> str:
         """
         自动检测并导入数据源
-        
+
         Returns:
             "success" - 成功导入
             "cancelled" - 用户取消
@@ -1774,14 +1942,17 @@ class RecoveryWidget(QWidget):
                     continue  # 跳过不存在的源
                 try:
                     if src["type"] == "PNG Sequence":
-                        self._load_png_sequence(src["path"])
+                        loaded = self._load_png_sequence(src["path"])
+                        self._register_recovery_source_alias(loaded)
                         return "success"
                     elif src["type"] == "TIFF Stack":
-                        self._load_tiff_stack(src["path"])
+                        loaded = self._load_tiff_stack(src["path"])
+                        self._register_recovery_source_alias(loaded)
                         return "success"
                     elif src["type"] in ("DM4 Archive", "DM4 Sequence"):
                         # 直接加载 DM4 序列 (带上导入时的选帧, 复现 0-20 这类范围)
-                        self._load_dm4_sequence(src["path"], src.get("frame_selection", ""))
+                        loaded = self._load_dm4_sequence(src["path"], src.get("frame_selection", ""))
+                        self._register_recovery_source_alias(loaded)
                         return "success"
                 except Exception as e:
                     QMessageBox.critical(self, tr("Error"), f"Import failed: {e}")
@@ -1813,12 +1984,12 @@ class RecoveryWidget(QWidget):
             if choice == btn_png:
                 folder = QFileDialog.getExistingDirectory(self, tr("Select PNG Sequence Folder"))
                 if folder:
-                    self._load_png_sequence(folder)
+                    self._register_recovery_source_alias(self._load_png_sequence(folder))
                     return "success"
             elif choice == btn_tiff:
                 file_path, _ = QFileDialog.getOpenFileName(self, tr("Select TIFF File"), "", "TIFF (*.tiff *.tif)")
                 if file_path:
-                    self._load_tiff_stack(file_path)
+                    self._register_recovery_source_alias(self._load_tiff_stack(file_path))
                     return "success"
         except Exception as e:
             QMessageBox.critical(self, tr("Error"), f"Import failed: {e}")
@@ -2003,7 +2174,43 @@ class RecoveryWidget(QWidget):
             elif export_choice == "skip":
                 # 从选中列表中移除 export 操作
                 selected_actions = [a for a in selected_actions if a.get("widget") != "export"]
-        
+
+        # === 权威过滤：只重放"有效重放集" ===
+        # 无论用户如何勾选(尤其"全选"), 都用 effective_replay_actions 收敛到真正会
+        # 影响最终结果的操作: 排除已撤销(undo)的动作、被后续试探取代的 trial、以及对
+        # 同一源图层的重复 re-tune(本会话的两次 drift、两次 enhance)。这是让"全选恢复
+        # 只跑第二次 drift"、且不会 enhance-of-enhance 的关键。
+        self._logged_output_name = {}
+        try:
+            _sess = self.current_session or {}
+            _eff = effective_replay_actions(
+                _sess.get("actions", []),
+                _sess.get("chapters", []),
+                _sess.get("edit_records", []),
+            )
+            _eff_ids = {a.get("id") for a in _eff}
+            selected_actions = [a for a in selected_actions if a.get("id") in _eff_ids]
+
+            # 持久重放映射 (跨多次分步恢复): logged 输出层名 -> 本次重放实际产层。
+            # 每个会话独立; 换会话则清空。map 内容在下方 replay 循环里逐步写入,
+            # 供 _find_best_matching_layer 的 step 1.5 消费, 让下一次(单独一次点击的)
+            # 分步恢复能把 "Corrected_v2_X" 正确解析到上次产生的漂移矫正层。
+            sid = _sess.get("session_id")
+            if getattr(self, "_replay_map_session_id", None) != sid:
+                self._replay_layer_map = {}
+                self._replay_map_session_id = sid
+            self._logged_output_name = build_logged_output_map(_eff, IMAGE_PRODUCER_ACTIONS)
+        except Exception as _eff_err:
+            print(f"[recovery] effective-replay filter skipped: {_eff_err}")
+
+        # 有效过滤后若一个都不剩 (勾选的全被撤销/取代)，明确告知而非静默"恢复 0 个"。
+        if not selected_actions:
+            QMessageBox.information(
+                self, tr("Session Recovery"),
+                tr("All selected actions were superseded or undone — nothing to replay. "
+                   "Select the effective (non-grayed) rows."))
+            return
+
         # === 智能处理：多次 update_batch_rois 只保留最后一次 ===
         # 找到最后一个 update_batch_rois 的索引
         last_roi_update_idx = -1
@@ -2058,15 +2265,42 @@ class RecoveryWidget(QWidget):
         skipped_actions = []
         aborted = False
         last_result_layer = None  # 跟踪上一个操作产生的图层名
-        
+
+        # 内存封顶 (2026-07-01): 记录 replay 自己产生的图像中间层, 每当链条推进就把上
+        # 一步刚被消费的中间层从 viewer 移除 —— 只保留原始源层 + 最新层, 避免整段
+        # drift/rotate/crop/enhance 的整帧栈同时驻留 (旧行为只 .visible=False, OOM 根因)。
+        # 只对"产生新图像层"的操作维护此链; ROI/annotation 等不推进也不驱逐。
+        # 用共享的 IMAGE_PRODUCER_ACTIONS (含 contrast_adjustment; 旧本地集写成
+        # "contrast" 与实际动作名不符, 导致对比度层不进驱逐链而泄漏)。
+        _IMAGE_PRODUCERS = IMAGE_PRODUCER_ACTIONS
+        replay_produced = set()
+        chain_last = None
+
+        # 中间层保留模式 (F2, 与 session_recovery_mode 的 auto/review 正交):
+        #   lean   = 驱逐已消费中间层 (省内存, 默认)
+        #   full   = 全部保留但写盘 (可逐步核对, RAM 有界)
+        #   custom = 用户选保留哪些步骤 (选中写盘, 其余驱逐)
+        retention = GlobalConfig.get("session_recovery_retention") or "lean"
+        keep_ids = set()
+        if retention == "custom":
+            keep_ids = self._prompt_custom_retention(selected_actions, _IMAGE_PRODUCERS)
+            if keep_ids is None:  # 用户取消
+                return
+        keep_by_layer = {}   # 产出层名 -> 是否保留(写盘)
+        kept_count = 0
+        spill_count = 0
+        evict_count = 0
+
         # UI 提示：开始重放
         self.viewer.status = "Starting session replay..."
-        
+
         for action in selected_actions:
             widget = action.get("widget", "")
             action_type = action.get("action", "")
             params = action.get("params", {})
-            
+            is_image_producer = (widget, action_type) in _IMAGE_PRODUCERS
+            consumed = chain_last if is_image_producer else None
+
             try:
                 # 传入上一个结果图层名，用于链式操作
                 result, result_layer = self._replay_action(widget, action_type, params, last_result_layer)
@@ -2074,6 +2308,29 @@ class RecoveryWidget(QWidget):
                     success_count += 1
                     if result_layer:
                         last_result_layer = result_layer  # 更新链式图层
+                        if is_image_producer:
+                            # 记录本步产出层的保留意图 (full=全留; custom=按 action id)
+                            keep_this = (retention == "full"
+                                         or (retention == "custom" and action.get("id") in keep_ids))
+                            keep_by_layer[result_layer] = keep_this
+                            # 处理刚被这一步消费掉的中间层 (仅限 replay 自产层, 从不动原始源)
+                            if consumed and consumed in replay_produced and consumed != result_layer:
+                                if keep_by_layer.get(consumed, False):
+                                    self._spill_layer_to_disk(consumed)
+                                    spill_count += 1
+                                    kept_count += 1
+                                else:
+                                    self._evict_replay_layer(consumed)
+                                    evict_count += 1
+                                replay_produced.discard(consumed)
+                            replay_produced.add(result_layer)
+                            chain_last = result_layer
+                            # 记录 logged 输出名 -> 实际产层, 供后续(可能是另一次分步
+                            # 恢复的)步骤按 logged 源名解析到本层。依赖 result_layer 为
+                            # napari 实际层名 (见各 _replay_* 返回 new_layer.name)。
+                            lo = self._logged_output_name.get(action.get("id"))
+                            if lo:
+                                self._replay_layer_map[lo] = result_layer
                 elif result == "skipped":
                     skipped_actions.append(f"[{widget}] {action_type}")
                 elif result == "abort":
@@ -2087,7 +2344,12 @@ class RecoveryWidget(QWidget):
         
         # 生成恢复报告
         report_lines = [f"✅ 成功恢复: {success_count} 个操作"]
-        
+
+        # 中间层保留结果 (无论哪种模式都显示, 让"图层消失"不再是谜)
+        report_lines.append(
+            tr("kept %d, spilled %d to disk, removed %d intermediates")
+            % (kept_count, spill_count, evict_count))
+
         if skipped_actions:
             report_lines.append(f"\n⏭️ 跳过 (需手动操作): {len(skipped_actions)} 个")
             for s in skipped_actions[:5]:
@@ -2154,7 +2416,18 @@ class RecoveryWidget(QWidget):
         # 设置激活图层并同步给 Geometry 面板
         if last_result_layer and last_result_layer in self.viewer.layers:
             self.viewer.layers.selection.active = self.viewer.layers[last_result_layer]
-            
+
+            # 恢复后只显示【最终结果层】, 隐藏所有其它图像层 —— 包括原始层、未被本
+            # 次链条消费的孤儿中间层、以及【上一次分步恢复】遗留的可见层。旧行为里
+            # 每步只 .visible=False 其直接源, 断链/跨调用的层会一直亮着, 导致"裁剪层
+            # 和别的层一起显示"。full/custom 保留模式下这些层仍在列表里(可手动重显)。
+            try:
+                for _l in self.viewer.layers:
+                    if self._is_image_layer_data(_l):
+                        _l.visible = (_l.name == last_result_layer)
+            except Exception as _vis_err:
+                print(f"[recovery] post-replay visibility cleanup skipped: {_vis_err}")
+
             # 手动同步 Geometry widget 的下拉框，确保重放后的数据被正确选中
             try:
                 view_target = last_result_layer
@@ -2323,6 +2596,15 @@ class RecoveryWidget(QWidget):
             if self._is_image_layer_data(cand):
                 return cand
 
+        # 1.5 持久重放映射: logged 源名 -> 实际重放层。跨多次【分步恢复】保留 ——
+        #     修复根因: 实时命名 (Corrected_v2_X) 与重放命名 (X_recovered_corrected)
+        #     不一致, 单靠名字匹配会桥接失败。见 build_logged_output_map。
+        replay_map = getattr(self, "_replay_layer_map", {}) or {}
+        if target_name and target_name in replay_map:
+            mapped = replay_map[target_name]
+            if mapped in self.viewer.layers and self._is_image_layer_data(self.viewer.layers[mapped]):
+                return self.viewer.layers[mapped]
+
         # 2. 精确匹配
         if target_name and target_name in self.viewer.layers:
             cand = self.viewer.layers[target_name]
@@ -2375,8 +2657,118 @@ class RecoveryWidget(QWidget):
             if best_layer:
                 return best_layer
 
-        # 4. Fallback：第一个存在的图像图层
-        return image_layers[0]
+        # 4. 兜底：仅当画布只有一个图像层（无歧义）时才用它。旧代码在多层时也
+        #    return image_layers[0]，会静默选中原始层（漂移矫正被丢弃且报 success）。
+        #    多层歧义现在返回 None → 该步"明确失败"进 failed 列表，而非给出错误结果。
+        if len(image_layers) == 1:
+            return image_layers[0]
+        return None
+
+    def _add_replay_image(self, array, name, colormap='gray', metadata=None):
+        """add_image for a replay result with explicit sampled contrast_limits so
+        napari skips its whole-array auto-contrast read (the RAM spike on big
+        rotate-expand stacks). Post-add gc + Working Set trim as before."""
+        cl = compute_replay_contrast_limits(array)
+        kwargs = {"name": name, "colormap": colormap}
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        if cl is not None:
+            kwargs["contrast_limits"] = list(cl)
+        layer = self.viewer.add_image(array, **kwargs)
+        gc.collect()
+        trim_working_set()
+        return layer
+
+    def _evict_replay_layer(self, name):
+        """Remove a consumed replay-intermediate layer to bound memory, then trim.
+        Only called on layers replay itself produced (never the original source)."""
+        if not name:
+            return
+        try:
+            if name in self.viewer.layers:
+                self.viewer.layers.remove(name)
+                gc.collect()
+                trim_working_set()
+        except Exception as e:
+            print(f"[recovery] evict intermediate '{name}' failed: {e}")
+
+    def _spill_layer_to_disk(self, name):
+        """保留图层但把其数组移到磁盘 memmap, 界住 RAM (恢复"全内存/自定义"模式用)。
+        已是 memmap 的大层 (replay 生产者对大数据本就用 create_huge_array) → 只释放缓存页;
+        小 RAM 数组 → 复制进强制磁盘 memmap 再换入 (先存 contrast_limits, 避免 napari 整读)。"""
+        if not name:
+            return
+        try:
+            if name not in self.viewer.layers:
+                return
+            layer = self.viewer.layers[name]
+            data = layer.data
+            if isinstance(data, np.memmap):
+                release_memmap_pages(data)  # 已在磁盘, 只需吐掉 OS 缓存页
+                return
+            cl = getattr(layer, "contrast_limits", None)
+            arr = np.asarray(data)
+            mm, _ = create_huge_array(arr.shape, arr.dtype, force_disk=True)
+            if arr.ndim >= 3:
+                for i in range(arr.shape[0]):
+                    mm[i] = arr[i]
+            else:
+                mm[...] = arr
+            release_memmap_pages(mm)
+            layer.data = mm  # 换成磁盘数组; napari 会重算对比度, 故下面复原
+            if cl is not None:
+                try:
+                    layer.contrast_limits = cl
+                except Exception:
+                    pass
+            del arr
+            gc.collect()
+            trim_working_set()
+        except Exception as e:
+            print(f"[recovery] spill intermediate '{name}' to disk failed: {e}")
+
+    def _prompt_custom_retention(self, selected_actions, image_producers):
+        """自定义模式: 弹框让用户勾选要【保留(写盘)】哪些中间步骤。
+        返回要保留的 action id 集合; 用户取消返回 None; 无中间步骤返回空集。
+        (最终结果层永远保留, 不在此列; 未勾选的中间层按省内存驱逐。)"""
+        _LABELS = {
+            ("drift", "apply_correction"): "Drift",
+            ("enhance", "filter_enhancement"): "Enhance (filter)",
+            ("enhance", "contrast_adjustment"): "Contrast",
+            ("geometry", "rotate"): "Rotate",
+            ("geometry", "flip"): "Flip",
+            ("geometry", "crop"): "Crop",
+        }
+        steps = []
+        for a in selected_actions:
+            key = (a.get("widget", ""), a.get("action", ""))
+            if key in image_producers:
+                steps.append((a.get("id"), _LABELS.get(key, f"{key[0]}:{key[1]}")))
+        if not steps:
+            return set()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("Select intermediate steps to keep"))
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(tr("Select intermediate steps to keep")))
+        checks = []
+        for aid, label in steps:
+            cb = QCheckBox(label)
+            v.addWidget(cb)
+            checks.append((aid, cb))
+        h = QHBoxLayout()
+        btn_cancel = QPushButton(tr("Cancel"))
+        btn_ok = QPushButton(tr("OK"))
+        btn_ok.setDefault(True)
+        h.addStretch()
+        h.addWidget(btn_cancel)
+        h.addWidget(btn_ok)
+        v.addLayout(h)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        if not dlg.exec():
+            return None
+        return {aid for aid, cb in checks if cb.isChecked()}
 
     def _replay_geometry(self, action_type: str, params: dict, recovery_mode: str, last_result_layer: str = None) -> tuple:
         """重放几何变换操作"""
@@ -2430,9 +2822,9 @@ class RecoveryWidget(QWidget):
                     progress.close()
                 
                 new_name = f"{source_layer.name}_recovered_rotated"
-                self.viewer.add_image(rotated, name=new_name, colormap='gray')
-                gc.collect()
-                trim_working_set()
+                # 用 napari 实际层名 (重名时会被自动改成 "X [1]") 覆盖请求名, 否则
+                # 二次恢复会把链/映射/驱逐都指到旧层 (见 build_logged_output_map)。
+                new_name = self._add_replay_image(rotated, new_name).name
 
                 # 隐藏源图层
                 source_layer.visible = False
@@ -2466,9 +2858,7 @@ class RecoveryWidget(QWidget):
                 
                 suffix = "FlipH" if direction == 'horizontal' else "FlipV"
                 new_name = f"{source_layer.name}_recovered_{suffix}"
-                self.viewer.add_image(flipped, name=new_name, colormap='gray')
-                gc.collect()
-                trim_working_set()
+                new_name = self._add_replay_image(flipped, new_name).name
 
                 # 隐藏源图层
                 source_layer.visible = False
@@ -2503,9 +2893,7 @@ class RecoveryWidget(QWidget):
                 cropped = crop_image_stack(image_stack, tuple(bbox))
                 
                 new_name = f"{source_layer.name}_recovered_cropped"
-                self.viewer.add_image(cropped, name=new_name, colormap='gray')
-                gc.collect()
-                trim_working_set()
+                new_name = self._add_replay_image(cropped, new_name).name
 
                 # 隐藏源图层
                 source_layer.visible = False
@@ -2672,7 +3060,6 @@ class RecoveryWidget(QWidget):
                     tuple(roi_bbox),
                     template_frame,
                     max_workers=8,
-                    kernel_size=kernel_size,
                     progress_callback=progress_cb
                 )
 
@@ -2700,14 +3087,11 @@ class RecoveryWidget(QWidget):
                 
                 # 添加结果图层
                 new_name = f"{source_layer.name}_recovered_corrected"
-                new_layer = self.viewer.add_image(
-                    corrected,
-                    name=new_name,
-                    colormap='gray',
+                new_layer = self._add_replay_image(
+                    corrected, new_name,
                     metadata=source_layer.metadata.copy() if hasattr(source_layer, 'metadata') else {}
                 )
-                gc.collect()
-                trim_working_set()
+                new_name = new_layer.name  # napari 实际层名 (重名自动改名时 != 请求名)
 
                 # Review 模式：显示结果确认
                 if recovery_mode == "review":
@@ -2746,8 +3130,9 @@ class RecoveryWidget(QWidget):
                 source_name = params.get("source", "")
                 inner_params = params.get("params", {})
             else:
-                # 旧格式：直接参数
-                source_name = params.get("source_layer", "")
+                # 旧格式/对比度：直接参数。对比度日志记的是 "source" (不是 source_layer),
+                # 之前只读 source_layer → 空目标 → 落到兜底选错层。回退读 source。
+                source_name = params.get("source_layer", "") or params.get("source", "")
                 inner_params = params
             
             source_layer = self._find_best_matching_layer(source_name, last_result_layer)
@@ -2812,9 +3197,7 @@ class RecoveryWidget(QWidget):
                     
                     # 添加新图层
                     new_name = f"Enh_{source_layer.name}"
-                    self.viewer.add_image(result, name=new_name, colormap='gray')
-                    gc.collect()
-                    trim_working_set()
+                    new_name = self._add_replay_image(result, new_name).name
 
                     source_layer.visible = False
 
@@ -2825,14 +3208,9 @@ class RecoveryWidget(QWidget):
             
             elif action_type == "contrast_adjustment":
                 # 对比度调整 - 日志格式为 {"source": ..., "min": c_min, "max": c_max}
-                # 注意：对比度日志不是嵌套格式
-                source_from_log = params.get("source", "")
-                
-                # 如果有指定源图层且存在，使用它
-                if source_from_log and source_from_log in self.viewer.layers:
-                    source_layer = self.viewer.layers[source_from_log]
-                    data = source_layer.data
-                
+                # 源图层已由上面的 prelude 经 _find_best_matching_layer 解析 (含持久
+                # 映射/别名/模糊)。此处不再用"精确名 in layers"覆盖它 —— 那会退回到
+                # 只认精确名, 在实时/重放命名不一致时反而选错层。
                 c_min = params.get("min", 0)
                 c_max = params.get("max", 255)
                 
@@ -2875,9 +3253,7 @@ class RecoveryWidget(QWidget):
                     QApplication.processEvents()
 
                     new_name = f"Contrast_{source_layer.name}"
-                    self.viewer.add_image(result, name=new_name, colormap='gray')
-                    gc.collect()
-                    trim_working_set()
+                    new_name = self._add_replay_image(result, new_name).name
 
                     source_layer.visible = False
 
@@ -3179,8 +3555,10 @@ class RecoveryWidget(QWidget):
             with open(log_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data["status"] = status
-            actions_str = json.dumps(data.get("actions", []), sort_keys=True, cls=NumpyEncoder)
-            data["checksum"] = hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
+            # 必须与 load_from_file/_compute_checksum 一致地【剥掉 state】再哈希, 否则
+            # 恢复时写回的 checksum 含 state, 下次加载(剥 state)重算必不一致 → 工具自
+            # 己写的文件被误报"可能被篡改"。
+            data["checksum"] = compute_actions_checksum(data.get("actions", []))
             with open(log_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, cls=NumpyEncoder)
         except Exception as e:
@@ -3250,10 +3628,9 @@ class RecoveryWidget(QWidget):
             name = f"Original_{Path(folder_path).name}"
             if len(name) > 30:
                 name = name[:15] + "..." + name[-10:]
-            
-            self.viewer.add_image(stack, name=name, metadata=metadata, colormap='gray')
-            gc.collect()
-            trim_working_set()
+
+            self._add_replay_image(stack, name, metadata=metadata)
+            return name
         except Exception as e:
             progress.close()
             raise e
@@ -3276,30 +3653,22 @@ class RecoveryWidget(QWidget):
         progress.show()
         
         try:
-            frames = []
-            for i, f in enumerate(png_files):
-                img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
-                if img is not None:
-                    if len(img.shape) == 3:
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    frames.append(img)
-                progress.setValue(i + 1)
-            
+            # 2026-07-01: 逐帧读入"预分配(大数据自动 memmap)"的栈, 不再先攒一个
+            # 全量 frames 列表再 stack —— 5000+ 帧恢复不再一次性 ~24GB×2 驻留 RAM。
+            from utils.memory_utils import load_png_stack_memmap
+            stack = load_png_stack_memmap(
+                png_files, progress_cb=lambda k: progress.setValue(k))
             progress.close()
-            
-            if not frames:
+
+            if stack is None or getattr(stack, "size", 0) == 0:
                 raise ValueError("Could not read any valid images.")
 
-            # Phase 7 (2026-05-29): preallocated stack (memmap-safe)
-            from utils.memory_utils import stack_frames_preallocated
-            stack = stack_frames_preallocated(frames)
             name = f"PNG_{folder.name}"
             if len(name) > 30:
                 name = name[:15] + "..." + name[-10:]
-            
-            self.viewer.add_image(stack, name=name, colormap='gray')
-            gc.collect()
-            trim_working_set()
+
+            self._add_replay_image(stack, name)
+            return name
         except Exception as e:
             progress.close()
             raise e
@@ -3307,22 +3676,25 @@ class RecoveryWidget(QWidget):
     def _load_tiff_stack(self, file_path: str):
         """加载 TIFF Stack 文件"""
         import tifffile
-        
-        stack = tifffile.imread(file_path)
-        
+
+        # 2026-07-01: 优先 memmap 打开 TIFF (大栈不整读进 RAM); 失败再 imread。
+        try:
+            stack = tifffile.memmap(file_path)
+        except Exception:
+            stack = tifffile.imread(file_path)
+
         # 确保是3D数组 (T, H, W)
         if stack.ndim == 2:
             stack = stack[np.newaxis, ...]
         elif stack.ndim == 4:
             stack = stack[..., 0]
-        
+
         name = f"TIFF_{Path(file_path).stem}"
         if len(name) > 30:
             name = name[:15] + "..." + name[-10:]
-        
-        self.viewer.add_image(stack, name=name, colormap='gray')
-        gc.collect()
-        trim_working_set()
+
+        self._add_replay_image(stack, name)
+        return name
 
     def _show_path_manager(self):
         """显示搜索路径管理器对话框"""
@@ -3786,8 +4158,7 @@ class RecoveryWidget(QWidget):
             target_data["layer_aliases"] = target_aliases
 
         # 重算 checksum
-        actions_str = json.dumps(target_data["actions"], sort_keys=True, cls=NumpyEncoder)
-        target_data["checksum"] = hashlib.sha256(actions_str.encode('utf-8')).hexdigest()
+        target_data["checksum"] = compute_actions_checksum(target_data["actions"])
 
         # 保存 target
         with open(target_path, 'w', encoding='utf-8') as f:

@@ -22,11 +22,11 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QFont
 from qtpy.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFrame, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QPushButton, QSizePolicy, QSlider, QSplitter,
+    QHeaderView, QLabel, QLineEdit, QPushButton, QSizePolicy, QSlider, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from widgets.settings_widget import tr
+from widgets.settings_widget import tr, GlobalConfig
 
 
 _LUT_NAMES = ('Gray', 'Inverted', 'Viridis', 'Inferno', 'Hot', 'Cool')
@@ -196,6 +196,24 @@ class BatchExportConfirmDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 8)
 
+        # [Fix 3b] 缺 view 提醒条: 没选 View 层 → contrasted 导不了。可勾「不再提醒」永久关闭。
+        if (not self._has_view_layer) and self._warn_missing_view_enabled():
+            warn_row = QHBoxLayout()
+            warn_lbl = QLabel(
+                "⚠ " + tr("No View (contrasted) layer selected — '_contrasted' will NOT be exported. "
+                          "Large liquid cells usually need both origin + contrasted.")
+            )
+            warn_lbl.setWordWrap(True)
+            warn_lbl.setStyleSheet(
+                "color: #FFB74D; font-size: 12px; padding: 6px; "
+                "border: 1px solid #FFB74D; border-radius: 4px; background-color: #3a2e1a;"
+            )
+            warn_row.addWidget(warn_lbl, stretch=1)
+            self.chk_dont_warn_view = QCheckBox(tr("Don't warn again"))
+            self.chk_dont_warn_view.toggled.connect(self._on_dont_warn_view_toggled)
+            warn_row.addWidget(self.chk_dont_warn_view)
+            root.addLayout(warn_row)
+
         # Top splitter: left table | right preview
         splitter = QSplitter(Qt.Horizontal)
 
@@ -349,6 +367,27 @@ class BatchExportConfirmDialog(QDialog):
             tr("Overview map uses napari's current display contrast (not Magnifier preview).")
         )
         ov.addWidget(self.chk_overview)
+
+        # [Fix 3a] 完整液池层: 整帧 data + view 各导到一个 {图层名}__{时间戳} 文件夹
+        full_row = QHBoxLayout()
+        self.chk_full_liquid = QCheckBox(
+            tr("Also export full liquid-cell layers (full data + view, all frames)")
+        )
+        self.chk_full_liquid.setChecked(self._full_liquid_default())
+        self.chk_full_liquid.setToolTip(
+            tr("Writes the WHOLE data + view layers (not cropped) to new '{layer}__{timestamp}' "
+               "folders — the full liquid-cell movie for archive/viewing.")
+        )
+        self.chk_full_liquid.toggled.connect(self._on_full_liquid_toggled)
+        full_row.addWidget(self.chk_full_liquid)
+        full_row.addWidget(QLabel(tr("Frames:")))
+        self.full_range_edit = QLineEdit()
+        self.full_range_edit.setPlaceholderText(tr("All (empty) or 0-100, 120"))
+        self.full_range_edit.setMaximumWidth(160)
+        full_row.addWidget(self.full_range_edit)
+        full_row.addStretch()
+        ov.addLayout(full_row)
+
         root.addWidget(opt_box)
 
         # Summary
@@ -658,3 +697,48 @@ class BatchExportConfirmDialog(QDialog):
     @property
     def include_overview(self) -> bool:
         return self.chk_overview.isChecked()
+
+    # ---------- [Fix 3] full liquid-cell export + missing-view warning ----------
+
+    @staticmethod
+    def _cfg_bool(val, default=True):
+        if val is None:
+            return default
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() not in ('false', '0', 'no', '')
+
+    def _full_liquid_default(self) -> bool:
+        try:
+            return self._cfg_bool(GlobalConfig.get("geo_export_full_liquid"), True)
+        except Exception:
+            return True
+
+    def _warn_missing_view_enabled(self) -> bool:
+        try:
+            return self._cfg_bool(GlobalConfig.get("geo_warn_missing_view"), True)
+        except Exception:
+            return True
+
+    def _on_full_liquid_toggled(self, val):
+        try:
+            GlobalConfig.set("geo_export_full_liquid", bool(val))
+        except Exception:
+            pass
+
+    def _on_dont_warn_view_toggled(self, val):
+        # 勾选「不再提醒」→ 关闭提醒
+        try:
+            GlobalConfig.set("geo_warn_missing_view", not bool(val))
+        except Exception:
+            pass
+
+    @property
+    def export_full_liquid(self) -> bool:
+        chk = getattr(self, 'chk_full_liquid', None)
+        return bool(chk is not None and chk.isChecked())
+
+    @property
+    def full_liquid_range(self) -> str:
+        e = getattr(self, 'full_range_edit', None)
+        return e.text().strip() if e is not None else ""

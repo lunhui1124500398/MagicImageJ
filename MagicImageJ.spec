@@ -2,8 +2,27 @@
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 import os
 import site
+import sysconfig
 
-site_packages = site.getsitepackages()[0]
+
+# 注意: 在 uv / virtualenv 创建的环境中, site.getsitepackages()[0] 返回的是 venv
+# 根目录而不是 Lib/site-packages, 会让下面的 freetype DLL 与 napari 插件 yaml
+# 收集被静默跳过 (打包能成功, 运行时才炸 FT_Exception / 插件缺失)。
+# 因此优先用 sysconfig 的 purelib, 并保留 site 的候选路径作为回退。
+def _resolve_site_packages():
+    candidates = [sysconfig.get_paths().get('purelib')]
+    try:
+        candidates += list(site.getsitepackages())
+    except Exception:
+        pass
+    for path in candidates:
+        if path and os.path.isdir(os.path.join(path, 'napari')):
+            return path
+    return candidates[0] or ''
+
+
+site_packages = _resolve_site_packages()
+print(f"[spec] site-packages = {site_packages}")
 
 block_cipher = None
 

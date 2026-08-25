@@ -8,10 +8,11 @@
 - [Req 6] Overview Map 使用当前显示帧。
 - [Fix Date] 新增日期输入框，默认从归档信息加载，导出时优先使用输入框中的日期。
 """
-from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton, 
-                            QLabel, QHBoxLayout, QComboBox, QGroupBox, 
-                            QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog, 
-                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication, QColorDialog, QDialog, QShortcut)
+from qtpy.QtWidgets import (QWidget, QVBoxLayout, QPushButton,
+                            QLabel, QHBoxLayout, QComboBox, QGroupBox,
+                            QDoubleSpinBox, QScrollArea, QLineEdit, QFileDialog,
+                            QMessageBox, QCheckBox, QProgressDialog, QSpinBox,QApplication, QColorDialog, QDialog, QShortcut,
+                            QGridLayout, QFrame)
 from qtpy.QtGui import QKeySequence
 from qtpy.QtCore import Qt, QTimer, QSettings, QThread, Signal
 import numpy as np
@@ -32,13 +33,18 @@ from widgets.settings_widget import GlobalConfig, tr
 from utils.session_logger import get_logger
 import gc
 from utils.memory_utils import trim_working_set
+from utils.layer_export import (
+    write_full_stack as _write_full_stack, _safe_folder_name,
+    export_layer_pair_to_disk,
+)
 from utils.auto_crop_session_locator import find_current_session_root
 from utils.utils import elide_text
 from core.geometry_helpers import (
     clone_roi_data, stamp_roi_data, get_roi_size,
     clamp_frame_index, compute_slider_gradient_css,
     compute_adaptive_font_size,
-    generate_grid_lines, find_grid_cell_bounds
+    generate_grid_lines, find_grid_cell_bounds,
+    pick_crop_source_layer
 )
 
 
@@ -387,6 +393,21 @@ class BatchExportThread(QThread):
                 })
                 self.progress.emit(i + 1)
             
+            # === [Fix 3] 连带导出完整液池层 (整帧 data + view, 各一个 {图层名}__{时间戳} 文件夹) ===
+            if not self.isInterruptionRequested() and self.p.get('export_full_liquid', False):
+                try:
+                    ts = self.p.get('timestamp', '') or ''
+                    full_indices = parse_indices_helper(self.p.get('full_liquid_range', '') or '', total_frames)
+                    d_name = self.p.get('data_layer_name', 'data')
+                    d_base = _safe_folder_name(f"{d_name}__{ts}")
+                    _write_full_stack(data_stack, full_indices, output_dir / d_base, d_base, is_tiff, pad)
+                    if view_stack is not None:
+                        v_name = self.p.get('view_layer_name', 'view')
+                        v_base = _safe_folder_name(f"{v_name}__{ts}")
+                        _write_full_stack(view_stack, full_indices, output_dir / v_base, v_base, is_tiff, pad)
+                except Exception as full_err:
+                    print(f"Full liquid-cell export error: {full_err}")
+
             # 写入日志
             json_path = output_dir / "processing_log.json"
             log_data = {}
@@ -500,6 +521,11 @@ def parse_indices_helper(text, total_frames):
         return sorted(list(indices))
     except:
         return list(range(total_frames))
+
+
+# _safe_folder_name / _write_full_stack 已提到 utils/layer_export.py (供 Enhance tab 复用),
+# 上方 import 保留私有别名, 本文件下游调用点零改动。
+
 
 class RotationThread(QThread):
     progress = Signal(int, int)
@@ -730,38 +756,39 @@ class GeometryWidget(QWidget):
         batch_layout.addLayout(layer_grid)
         batch_layout.addWidget(QLabel("<hr>")) 
 
-        # Naming & Format
-        name_layout = QHBoxLayout()
+        # Naming & Format —— 2×2 网格, 避免 4 个标签+输入框排一行把 tab 撑宽
+        name_layout = QGridLayout()
         
         # [Req 6.1] Date Input Field
-        name_layout.addWidget(QLabel(tr("Date:")))
+        name_layout.addWidget(QLabel(tr("Date:")), 0, 0)
         self.date_edit = QLineEdit()
         # 尝试从配置加载日期，否则默认今天
         default_date = QSettings("NapariUser", "Global").value("current_date", datetime.datetime.now().strftime("%Y%m%d"))
         self.date_edit.setText(default_date)
         self.date_edit.setFixedWidth(75) 
         self.date_edit.setToolTip(tr("Date prefix (YYYYMMDD). Loaded from Archive or Today."))
-        name_layout.addWidget(self.date_edit)
+        name_layout.addWidget(self.date_edit, 0, 1)
         
         # [Dataset Ext/Input] - Added Feature
-        name_layout.addWidget(QLabel(tr("Dataset:")))
+        name_layout.addWidget(QLabel(tr("Dataset:")), 0, 2)
         default_ds = QSettings("NapariUser", "Global").value("current_dataset_id", "ds1")
         self.dataset_edit = QLineEdit(default_ds)
         self.dataset_edit.setFixedWidth(50)
         self.dataset_edit.setToolTip(tr("Dataset ID (e.g. ds123). Mostly auto-extracted."))
-        name_layout.addWidget(self.dataset_edit)
+        name_layout.addWidget(self.dataset_edit, 0, 3)
 
-        name_layout.addWidget(QLabel(tr("Sub:")))
+        name_layout.addWidget(QLabel(tr("Sub:")), 1, 0)
         self.sample_name_edit = QLineEdit("CRY2")
         self.sample_name_edit.setFixedWidth(60)
-        name_layout.addWidget(self.sample_name_edit)
+        name_layout.addWidget(self.sample_name_edit, 1, 1)
 
         # [Req 3] Suffix Input (Flexible)
-        name_layout.addWidget(QLabel(tr("Suffix:")))
+        name_layout.addWidget(QLabel(tr("Suffix:")), 1, 2)
         self.suffix_edit = QLineEdit("_origin")
         self.suffix_edit.setPlaceholderText(tr("e.g. _origin"))
         self.suffix_edit.setMinimumWidth(80)
-        name_layout.addWidget(self.suffix_edit, 1)
+        name_layout.addWidget(self.suffix_edit, 1, 3)
+        name_layout.setColumnStretch(3, 1)
         batch_layout.addLayout(name_layout)
         
         view_export_layout = QHBoxLayout()
@@ -924,8 +951,7 @@ class GeometryWidget(QWidget):
         
         batch_layout.addLayout(tools_layout)
 
-        # === [新增] ROI 导入导出按钮行 ===
-        h_roi_io = QHBoxLayout()
+        # === [新增] ROI 导入导出按钮 (按功能分组多行, 避免撑宽 tab) ===
         btn_save_roi = QPushButton(f"💾 {tr('Save ROIs')}")
         btn_save_roi.clicked.connect(self._save_rois_to_json)
         btn_save_roi.setToolTip(tr("Save ROI coordinates + Reference Map"))
@@ -960,17 +986,19 @@ class GeometryWidget(QWidget):
         self._magnifiers = {}             # key: roi_idx or '_follow' -> ROIMagnifierWindow
         self._magnifier_count_baseline = 0  # last known len(Batch_ROI.data) for invalidation
 
-        h_roi_io.addWidget(btn_save_roi)
-        h_roi_io.addWidget(btn_load_roi)
-        h_roi_io.addWidget(self.preview_roi_btn)
-        h_roi_io.addWidget(self.magnifier_btn)
-        h_roi_io.addWidget(self.export_roi_video_btn)
-        h_roi_io.addWidget(self.auto_propose_roi_btn)
-        h_roi_io.addWidget(self.auto_suggest_temporal_btn)
-        batch_layout.addLayout(h_roi_io)
+        # 3 个功能分组行: 文件 / 查看 / 自动识别
+        batch_layout.addLayout(self._labeled_button_row(
+            tr("ROI Files:"), btn_save_roi, btn_load_roi))
+        batch_layout.addLayout(self._labeled_button_row(
+            tr("ROI View:"), self.preview_roi_btn, self.magnifier_btn, self.export_roi_video_btn))
+        batch_layout.addLayout(self._labeled_button_row(
+            tr("Auto Detect:"), self.auto_propose_roi_btn, self.auto_suggest_temporal_btn))
 
-        # === Liquid Cell Mask ===
-        h_mask = QHBoxLayout()
+        # === Liquid Cell Mask === (与上方 ROI 按钮组用细线分隔)
+        _mask_sep = QFrame()
+        _mask_sep.setFrameShape(QFrame.HLine)
+        _mask_sep.setFrameShadow(QFrame.Sunken)
+        batch_layout.addWidget(_mask_sep)
         self.mask_auto_btn = QPushButton(f"🎯 {tr('Auto-detect Mask')}")
         self.mask_auto_btn.setToolTip(tr("Detect liquid cell boundary from temporal variance. Used by Auto-suggest and YOLO."))
         self.mask_auto_btn.clicked.connect(self._create_or_update_mask)
@@ -987,11 +1015,11 @@ class GeometryWidget(QWidget):
         if not yolo_model_path.exists():
             self.yolo_detect_btn.setToolTip(tr("YOLO model not yet trained. Accumulate 300+ ROIs first."))
 
-        h_mask.addWidget(self.mask_auto_btn)
-        h_mask.addWidget(self.mask_edit_btn)
-        h_mask.addWidget(self.mask_clear_btn)
-        h_mask.addWidget(self.yolo_detect_btn)
-        batch_layout.addLayout(h_mask)
+        # 液池蒙版: 2 行 (检测/编辑 ; 清除/YOLO), 第二行空标题等宽占位对齐
+        batch_layout.addLayout(self._labeled_button_row(
+            tr("Liquid Mask:"), self.mask_auto_btn, self.mask_edit_btn))
+        batch_layout.addLayout(self._labeled_button_row(
+            "", self.mask_clear_btn, self.yolo_detect_btn))
         
         # === [新增] PNG/TIFF 快速导入按钮 ===
         h_quick_import = QHBoxLayout()
@@ -1085,6 +1113,13 @@ class GeometryWidget(QWidget):
         self.export_batch_btn.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; padding: 6px;")
         batch_layout.addWidget(self.export_batch_btn)
 
+        # 独立整层导出 (与批量裁切分开): data 层(原始→origin)+view 层(对比度→contrasted)
+        # 整帧 PNG/TIFF + manifest, 供下次直接 Import PNG 而非巨大 dm4。
+        self.export_full_layer_btn = QPushButton(f"💾 {tr('Export Full Layer (Data+View) as PNG')}")
+        self.export_full_layer_btn.setToolTip(tr("Export the whole uncropped data + contrasted view as a PNG sequence for fast re-import next session"))
+        self.export_full_layer_btn.clicked.connect(self._export_full_layers)
+        batch_layout.addWidget(self.export_full_layer_btn)
+
         batch_group.setLayout(batch_layout)
         layout.addWidget(batch_group)
 
@@ -1112,6 +1147,8 @@ class GeometryWidget(QWidget):
         layout.addWidget(self.status_label)
         layout.addStretch()
         content_widget.setLayout(layout)
+        # [排版] 内容随 dock 填满, 与其它 tab 一致 (setWidgetResizable 已开);
+        # 不再封顶 520px, 避免拖宽 dock 时右侧留白、用不上多出来的空间。
         scroll.setWidget(content_widget)
         main_layout.addWidget(scroll)
         self.setLayout(main_layout)
@@ -1126,6 +1163,20 @@ class GeometryWidget(QWidget):
             self.batch_data_combo, self.batch_view_combo, self.batch_format_combo,
             self.angle_spin, self.padding_spin
         )
+
+    def _labeled_button_row(self, label_text, *buttons):
+        """分组按钮行: 左侧固定宽小标题 + 若干按钮 + addStretch (左对齐不拉伸)。
+        按功能把按钮分成窄行, 避免一行塞太多把 tab 撑宽。"""
+        row = QHBoxLayout()
+        lbl = QLabel(label_text)
+        lbl.setFixedWidth(72)
+        lbl.setStyleSheet("color: #AAA; font-size: 11px;")
+        row.addWidget(lbl)
+        for b in buttons:
+            if b is not None:
+                row.addWidget(b)
+        row.addStretch()
+        return row
 
     # ---------- [Issue 5] collapsible section helpers ----------
 
@@ -1257,24 +1308,12 @@ class GeometryWidget(QWidget):
         self.batch_data_combo.blockSignals(True)
         self.batch_view_combo.blockSignals(True)
 
-        data_candidates = [l for l in layers if l.lower().startswith("cropped_rotated") or "cropped" in l.lower()]
-        if not data_candidates:
-             data_candidates = [l for l in layers if "rotated" in l.lower() and "enh" not in l.lower() and "contrast" not in l.lower() and "burned" not in l.lower()]
-        if not data_candidates:
-            # [Issue 4] No crop/rotate yet (plain import + enhance): fall back to the RAW
-            # import layer so the Crop Source is never silently the enhanced/view layer
-            # (which would write enhanced pixels into the "_origin" export). Matches the
-            # import prefixes for dm4 (Original_), PNG (PNG_) and TIFF (TIFF_).
-            raw = [l for l in layers if l.lower().startswith(("original_", "png_", "tiff_"))]
-            if raw:
-                data_candidates = [raw[0]]   # first = oldest import = the true origin
-            else:
-                _derived = ("enh", "contrast", "burned", "preview", "overview", "mask")
-                non_derived = [l for l in layers if not any(d in l.lower() for d in _derived)]
-                if non_derived:
-                    data_candidates = [non_derived[0]]
-        if data_candidates:
-            idx = self.batch_data_combo.findData(data_candidates[-1])
+        # [Issue 4 / Fix] 数据图层(裁剪源)自动选择: 永不选中强度增强层 —— 否则会把增强
+        # 像素写进 "_origin" 导出污染模型输入。几何层(cropped/rotated/corrected)保留。
+        # 逻辑抽进 core.geometry_helpers.pick_crop_source_layer (有单测覆盖)。
+        chosen_data = pick_crop_source_layer(layers)
+        if chosen_data:
+            idx = self.batch_data_combo.findData(chosen_data)
             if idx >= 0: self.batch_data_combo.setCurrentIndex(idx)
 
         view_candidates = [l for l in layers if l.lower().startswith("contrast_enh")]
@@ -3746,6 +3785,22 @@ class GeometryWidget(QWidget):
 
         self.status_label.setText(f"✅ Loaded {len(new_data)} ROIs.")
 
+    def _export_full_layers(self):
+        """独立导出整层 data+view (PNG/TIFF, 不依赖 ROI/裁切), 供下次直接 Import PNG。"""
+        from widgets.full_layer_export import run_full_layer_export
+        data_name = self.batch_data_combo.currentData()
+        # combo 空/失效 → 回退到原始层挑选 (绝不选增强/对比度派生层)
+        if not data_name or data_name not in self.viewer.layers:
+            cand = [l.name for l in self.viewer.layers
+                    if getattr(l, 'data', None) is not None and getattr(l.data, 'ndim', 0) >= 3]
+            data_name = pick_crop_source_layer(cand)
+        view_name = self.batch_view_combo.currentData()
+        is_tiff = "TIFF" in self.batch_format_combo.currentText()
+        summary = run_full_layer_export(self, self.viewer, data_name, view_name, is_tiff=is_tiff)
+        if summary:
+            folders = [f for f in (summary.get('data_folder'), summary.get('view_folder')) if f]
+            self.status_label.setText(tr("Exported full layer(s): ") + ", ".join(folders))
+
     def _export_batch_crops(self):
         if hasattr(self, 'export_thread') and self.export_thread.isRunning():
             self.status_label.setText(f"⚠️ {tr('Export already in progress.')}")
@@ -3798,6 +3853,9 @@ class GeometryWidget(QWidget):
         export_origin_flag = confirm_dlg.export_origin                    # origin 级
         export_contrasted_flag = confirm_dlg.export_contrasted           # contrasted 级 (= 旧 export_view)
         include_overview = confirm_dlg.include_overview
+        # [Fix 3] 完整液池层导出 (整帧 data + view → {图层名}__{时间戳} 文件夹)
+        export_full_liquid_flag = confirm_dlg.export_full_liquid
+        full_liquid_range = confirm_dlg.full_liquid_range
 
         # [Enhancement] per-NP 帧范围以对话框里(可编辑)的值为准
         dialog_ranges = confirm_dlg.get_effective_ranges()
@@ -3875,6 +3933,12 @@ class GeometryWidget(QWidget):
             'keep_idx': self.keep_index_check.isChecked(),
             'pad': self.padding_spin.value(),
             'data_layer_name': data_layer_name,
+
+            # [Fix 3] 完整液池层导出参数
+            'export_full_liquid': export_full_liquid_flag,
+            'full_liquid_range': full_liquid_range,
+            'view_layer_name': view_layer_name,
+            'timestamp': datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
 
             # Phase 1 (2026-05-29): Magnifier preview override
             'apply_preview_contrast': apply_preview_contrast,
